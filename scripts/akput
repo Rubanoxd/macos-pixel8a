@@ -1,0 +1,5 @@
+#!/bin/bash
+# Upload a file to the phone through the inetd shell (port 2325) in base64. Usage: akput <local> <remote>
+set -e
+( printf 'base64 -D > %s <<"AKEOF"\n' "$2"; base64 -i "$1" -b 76; printf 'AKEOF\nshasum -a 256 %s\nexit\n' "$2"; sleep ${3:-20} ) | nc -G 3 169.254.7.2 2325
+shasum -a 256 "$1"

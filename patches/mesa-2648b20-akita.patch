@@ -1,0 +1,655 @@
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/meson.build mesa-akita-main/meson.build
+--- mesa-main/meson.build	2026-11-07 16:02:02
++++ mesa-akita-main/meson.build	2026-11-07 16:02:18
+@@ -813,6 +813,10 @@
+       'amdgpu' : _libdrm_checks['amdgpu']['enabled'].to_string('enabled', 'disabled'),
+     },
+   )
++elif host_machine.system() == 'darwin' and with_panfrost_vk
++  # Darwin: PanVK talks Panthor ioctls and DRM syncobjs, which we serve from a userspace libdrm shim
++  # (darwin-drm) in front of the Mali IOKit user client. Found through the cross file's pkg-config.
++  dep_libdrm = dependency('libdrm', required : true)
+ else
+   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
+   # dependencies (such as vk-runtime) linking to it
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/meson.build mesa-akita-main/src/panfrost/lib/kmod/meson.build
+--- mesa-main/src/panfrost/lib/kmod/meson.build	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/lib/kmod/meson.build	2026-11-07 16:02:58
+@@ -6,9 +6,12 @@
+ libpankmod_lib_inc = []
+ libpankmod_lib_code = [
+   'pan_kmod.c',
+-  'panfrost_kmod.c',
+   'panthor_kmod.c',
+ ]
++# akita/Darwin: the Job Manager (panfrost) kmod needs eventfd; only the CSF (panthor) one is used there.
++if host_machine.system() != 'darwin'
++  libpankmod_lib_code += 'panfrost_kmod.c'
++endif
+ 
+ if with_panfrost_vdrm
+   libpankmod_lib_inc += [inc_virtio_gpu, inc_virtio_vdrm, include_directories('virtio')]
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/pan_kmod.c mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.c
+--- mesa-main/src/panfrost/lib/kmod/pan_kmod.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.c	2026-11-07 16:15:30
+@@ -12,7 +12,9 @@
+ #include "pan_kmod.h"
+ #include "pan_kmod_backend.h"
+ 
++#ifndef __APPLE__
+ extern const struct pan_kmod_ops panfrost_kmod_ops;
++#endif
+ extern const struct pan_kmod_ops panthor_kmod_ops;
+ #ifdef HAVE_PANFROST_VDRM
+ extern const struct pan_kmod_ops panfrost_virtio_gpu_ops;
+@@ -25,7 +27,11 @@
+ } backends[] = {
+    {
+       "panfrost",
++#ifndef __APPLE__
+       &panfrost_kmod_ops,
++#else
++      NULL,
++#endif
+    },
+    {
+       "panthor",
+@@ -173,6 +179,43 @@
+ 
+    return bo;
+ }
++
++#ifdef __APPLE__
++struct pan_kmod_bo *panthor_kmod_bo_import_handle_darwin(struct pan_kmod_dev *dev, uint32_t handle, size_t size);
++int drm_darwin_bo_create_host(int fd, void *ptr, size_t size, uint32_t *handle);
++
++struct pan_kmod_bo *
++pan_kmod_bo_import_host(struct pan_kmod_dev *dev, void *ptr, size_t size)
++{
++   struct pan_kmod_bo *bo = NULL;
++   struct pan_kmod_bo **slot;
++
++   simple_mtx_lock(&dev->handle_to_bo.lock);
++
++   uint32_t handle;
++   if (drm_darwin_bo_create_host(dev->fd, ptr, size, &handle))
++      goto err_unlock;
++
++   slot = util_sparse_array_get(&dev->handle_to_bo.array, handle);
++   if (!slot || *slot)
++      goto err_close_handle;
++
++   bo = panthor_kmod_bo_import_handle_darwin(dev, handle, size);
++   if (!bo)
++      goto err_close_handle;
++
++   *slot = bo;
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return bo;
++
++err_close_handle:
++   drmCloseBufferHandle(dev->fd, handle);
++
++err_unlock:
++   simple_mtx_unlock(&dev->handle_to_bo.lock);
++   return NULL;
++}
++#endif
+ 
+ void
+ pan_kmod_flush_bo_map_syncs_locked(struct pan_kmod_dev *dev)
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/pan_kmod.h mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.h
+--- mesa-main/src/panfrost/lib/kmod/pan_kmod.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.h	2026-11-07 16:13:37
+@@ -701,6 +701,12 @@
+ 
+ struct pan_kmod_bo *pan_kmod_bo_import(struct pan_kmod_dev *dev, int fd);
+ 
++#ifdef __APPLE__
++/* A BO over the caller's own pages (VK_EXT_external_memory_host); ptr and size are whole 4 KiB pages. */
++struct pan_kmod_bo *pan_kmod_bo_import_host(struct pan_kmod_dev *dev, void *ptr,
++                                            size_t size);
++#endif
++
+ static inline int
+ pan_kmod_bo_export(struct pan_kmod_bo *bo)
+ {
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/panthor_kmod.c mesa-akita-main/src/panfrost/lib/kmod/panthor_kmod.c
+--- mesa-main/src/panfrost/lib/kmod/panthor_kmod.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/lib/kmod/panthor_kmod.c	2026-11-07 16:15:30
+@@ -526,6 +526,16 @@
+    return NULL;
+ }
+ 
++#ifdef __APPLE__
++/* akita/Darwin: pan_kmod_bo_import_host() has a GEM handle from the shim, not a dma-buf fd. */
++struct pan_kmod_bo *panthor_kmod_bo_import_handle_darwin(struct pan_kmod_dev *dev, uint32_t handle, size_t size);
++struct pan_kmod_bo *
++panthor_kmod_bo_import_handle_darwin(struct pan_kmod_dev *dev, uint32_t handle, size_t size)
++{
++   return panthor_kmod_bo_import_handle(dev, handle, size);
++}
++#endif
++
+ static struct pan_kmod_bo *
+ panthor_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
+ {
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+--- mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c	2026-11-07 16:14:43
+@@ -2467,7 +2467,7 @@
+                      MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
+ 
+    if (fs) {
+-      out->rt_written = color_attachment_written_mask(fs, &dyns->cal);
++      out->rt_written = color_attachment_effective_written_mask(fs, dyns);
+       out->rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
+       shader_modifies_coverage = fs->info.fs.writes_coverage ||
+                                  fs->info.fs.can_discard || alpha_to_coverage;
+@@ -2506,7 +2506,9 @@
+             VK_IMAGE_ASPECT_COLOR_BIT;
+ 
+          cfg.allow_forward_pixel_to_kill =
+-            fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
++            fs->info.fs.can_fpk &&
++            (!cmdbuf->state.gfx.render.fpk_needs_all_rts ||
++             !(rt_mask & ~out->rt_written)) &&
+             !(out->rt_read & out->rt_written) && !alpha_to_coverage &&
+             !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
+ 
+@@ -2666,7 +2668,10 @@
+       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
+    bool dcd2_dirty = fs_user_dirty(cmdbuf) ||
+                      dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
+-                     dyn_gfx_state_dirty(cmdbuf, COLOR_ATTACHMENT_MAP);
++                     dyn_gfx_state_dirty(cmdbuf, COLOR_ATTACHMENT_MAP) ||
++                     /* the written mask leaves out the masked-off attachments */
++                     dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
++                     dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES);
+ #if PAN_ARCH >= 13
+    dcd2_dirty |= dyn_gfx_state_dirty(cmdbuf, MS_ALPHA_TO_COVERAGE_ENABLE) ||
+                  dyn_gfx_state_dirty(cmdbuf, DS_DEPTH_TEST_ENABLE) ||
+@@ -2710,6 +2715,8 @@
+       gfx_state_dirty(cmdbuf, IDVS) ||
+       gfx_state_dirty(cmdbuf, OQ) || dcd2_dirty;
+    bool dcd1_dirty = dyn_gfx_state_dirty(cmdbuf, MS_RASTERIZATION_SAMPLES) ||
++                     dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
++                     dyn_gfx_state_dirty(cmdbuf, CB_COLOR_WRITE_ENABLES) ||
+                      dyn_gfx_state_dirty(cmdbuf, MS_SAMPLE_MASK) ||
+                      /* line mode needs primitive topology */
+                      dyn_gfx_state_dirty(cmdbuf, RS_LINE_MODE) ||
+@@ -3734,6 +3741,7 @@
+    memset(&render->z_attachment, 0, sizeof(render->z_attachment));
+    memset(&render->s_attachment, 0, sizeof(render->s_attachment));
+    cmdbuf->state.gfx.render.bound_attachments = 0;
++   render->fpk_needs_all_rts = panvk_fpk_needs_all_rts_from_env();
+ 
+    render->view_mask = inheritance_info->viewMask;
+    render->layer_count = inheritance_info->viewMask ?
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_cmd_draw.h mesa-akita-main/src/panfrost/vulkan/panvk_cmd_draw.h
+--- mesa-main/src/panfrost/vulkan/panvk_cmd_draw.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_cmd_draw.h	2026-11-07 16:14:31
+@@ -10,6 +10,9 @@
+ #error "PAN_ARCH must be defined"
+ #endif
+ 
++#include <stdlib.h>
++#include <string.h>
++
+ #include "panvk_blend.h"
+ #include "panvk_cmd_desc_state.h"
+ #include "panvk_cmd_query.h"
+@@ -52,6 +55,22 @@
+    struct panvk_image_view *dst_iview;
+ };
+ 
++/* PANVK_FPK=bound: a draw may kill the fragments of earlier draws (forward pixel kill, FPK) only if it writes every
++ * color attachment that is bound, which is what this driver used to require of every draw. Without it a draw that
++ * leaves a bound attachment unwritten may kill too. On a Mali-G610 a fragment kills an earlier one only when its draw
++ * writes at least the attachments the earlier fragment's draw writes, so nothing a killed fragment wrote to an
++ * attachment the killer leaves alone is lost (measured for every pair of write sets of two attachments: a heavy draw
++ * writing attachment 1 survives four fills that write attachment 0 only, and those fills kill each other).
++ * Core Animation's passes bind a memoryless, write-masked second color attachment next to the one they fill, and with
++ * the old rule every one of their overdrawn opaque fills was shaded. */
++static inline bool
++panvk_fpk_needs_all_rts_from_env(void)
++{
++   const char *v = getenv("PANVK_FPK");
++
++   return v && !strcmp(v, "bound");
++}
++
+ struct panvk_rendering_state {
+    VkRenderingFlags flags;
+    uint32_t layer_count;
+@@ -59,6 +78,9 @@
+    enum u_tristate first_provoking_vertex;
+ 
+    enum vk_rp_attachment_flags bound_attachments;
++
++   /* PANVK_FPK=bound, read when the render pass instance begins (see panvk_fpk_needs_all_rts_from_env) */
++   bool fpk_needs_all_rts;
+    struct {
+       struct panvk_image_view *iviews[MAX_RTS];
+       /* If non-null, preload_iviews[i] overrides iviews[i] for preloads. */
+@@ -486,6 +508,30 @@
+    }
+ 
+    return catt_written_mask;
++}
++
++/* The color attachments a draw writes: those its fragment shader writes, less the
++ * ones its blend state masks off (colorWriteMask 0, or color writes disabled).
++ * A masked-off attachment written by the shader is claimed in the draw's render
++ * target mask (DCD flags 1, 2) and so counts as written to the hardware's tile
++ * tracking though its blend descriptor is OFF: a tile the draw fully covers then
++ * left that attachment's tile buffer as it was before the draw, which for a
++ * preload that skips such tiles is unloaded memory (zero): the tile stores out black. */
++static inline uint32_t
++color_attachment_effective_written_mask(
++   const struct panvk_shader_variant *fs,
++   const struct vk_dynamic_graphics_state *dyns)
++{
++   uint32_t mask = color_attachment_written_mask(fs, &dyns->cal);
++   const struct vk_color_blend_state *cb = &dyns->cb;
++
++   for (uint32_t i = 0; i < MAX_RTS && i < cb->attachment_count; i++) {
++      if (!(cb->color_write_enables & BITFIELD_BIT(i)) ||
++          !cb->attachments[i].write_mask)
++         mask &= ~BITFIELD_BIT(i);
++   }
++
++   return mask;
+ }
+ 
+ static inline uint32_t
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_device_memory.c mesa-akita-main/src/panfrost/vulkan/panvk_device_memory.c
+--- mesa-main/src/panfrost/vulkan/panvk_device_memory.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_device_memory.c	2026-11-07 16:13:37
+@@ -95,6 +95,33 @@
+    if (fd_info && !fd_info->handleType)
+       fd_info = NULL;
+ 
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host: a BO over the caller's own pages. */
++   const VkImportMemoryHostPointerInfoEXT *host_info =
++      vk_find_struct_const(pAllocateInfo->pNext,
++                           IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
++
++   if (host_info && !host_info->handleType)
++      host_info = NULL;
++
++   if (host_info) {
++      if (host_info->handleType !=
++             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++          (((uintptr_t)host_info->pHostPointer | pAllocateInfo->allocationSize) &
++           4095)) {
++         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++         goto err_destroy_mem;
++      }
++
++      mem->bo = pan_kmod_bo_import_host(device->kmod.dev,
++                                        (void *)host_info->pHostPointer,
++                                        pAllocateInfo->allocationSize);
++      if (!mem->bo) {
++         result = panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++         goto err_destroy_mem;
++      }
++   } else
++#endif
+    if (fd_info) {
+       assert(
+          fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+@@ -447,6 +474,35 @@
+    *pFd = prime_fd;
+    return VK_SUCCESS;
+ }
++
++#ifdef __APPLE__
++VKAPI_ATTR VkResult VKAPI_CALL
++panvk_GetMemoryHostPointerPropertiesEXT(
++   VkDevice _device, VkExternalMemoryHandleTypeFlagBits handleType,
++   const void *pHostPointer,
++   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
++{
++   VK_FROM_HANDLE(panvk_device, device, _device);
++   const struct panvk_physical_device *phys_dev =
++      to_panvk_physical_device(device->vk.physical);
++
++   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
++       ((uintptr_t)pHostPointer & 4095))
++      return panvk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++
++   /* The imported pages keep the owner's CPU mapping; the importer cleans and
++    * invalidates its own caches around the GPU's use (as an IOSurface's owner
++    * does), so they are offered as the host-visible coherent types. */
++   pMemoryHostPointerProperties->memoryTypeBits = 0;
++   for (uint32_t i = 0; i < phys_dev->memory.type_count; i++) {
++      const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++      if ((phys_dev->memory.types[i].propertyFlags & want) == want)
++         pMemoryHostPointerProperties->memoryTypeBits |= 1u << i;
++   }
++   return VK_SUCCESS;
++}
++#endif
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+ panvk_GetMemoryFdPropertiesKHR(VkDevice _device,
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_instance.c mesa-akita-main/src/panfrost/vulkan/panvk_instance.c
+--- mesa-main/src/panfrost/vulkan/panvk_instance.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_instance.c	2026-11-07 16:13:37
+@@ -223,7 +223,12 @@
+    }
+ 
+    unsigned build_id_len = build_id_length(note);
++#ifdef __APPLE__
++   /* A Mach-O LC_UUID is 16 bytes; copy_build_id_to_sha1() pads it to a SHA-1. */
++   if (build_id_len < 16) {
++#else
+    if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
++#endif
+       return panvk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
+                           "build-id too short.  It needs to be a SHA");
+    }
+@@ -325,3 +330,14 @@
+ {
+    return panvk_GetInstanceProcAddr(instance, pName);
+ }
++
++#ifdef __APPLE__
++/* There is no Khronos loader on iOS: a consumer that opens a Vulkan library by path (the metal2vulkan runtime behind the native Metal
++ * device) opens this one and looks up the loader's entry point. PanVK is the only driver there, so the loader's entry is its own. */
++PUBLIC
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++vkGetInstanceProcAddr(VkInstance instance, const char *pName)
++{
++   return panvk_GetInstanceProcAddr(instance, pName);
++}
++#endif
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_physical_device.c mesa-akita-main/src/panfrost/vulkan/panvk_physical_device.c
+--- mesa-main/src/panfrost/vulkan/panvk_physical_device.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_physical_device.c	2026-11-07 16:06:12
+@@ -77,7 +77,12 @@
+                 const struct panvk_instance *instance, drmDevicePtr drm_device)
+ {
+    const char *path = drm_device->nodes[DRM_NODE_RENDER];
++#ifdef __APPLE__
++   /* No device node on Darwin: the libdrm shim hands out an fd bound to the Mali IOKit user client. */
++   int fd = drm_darwin_open_render();
++#else
+    int fd = open(path, O_RDWR | O_CLOEXEC);
++#endif
+    if (fd < 0) {
+       return panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
+                           "failed to open device '%s'", path);
+@@ -110,6 +115,14 @@
+                    const struct panvk_instance *instance,
+                    drmDevicePtr drm_device)
+ {
++#ifdef __APPLE__
++   /* The shim's "render node" is not a file, there is no st_rdev to report. */
++   device->drm.render_rdev = 0;
++   device->drm.primary_rdev = 0;
++   (void)drm_device;
++   (void)instance;
++   return VK_SUCCESS;
++#else
+    struct stat st;
+ 
+    if (stat(drm_device->nodes[DRM_NODE_RENDER], &st)) {
+@@ -129,6 +142,7 @@
+    }
+ 
+    return VK_SUCCESS;
++#endif
+ }
+ 
+ static void
+@@ -953,7 +967,12 @@
+    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
+       features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+ 
+-   if (features != 0)
++   /* Block-compressed formats stay off the host copy path: on the Mali-G610 the
++    * CPU store into an ASTC 6x6 image's smaller mip levels (7x7 texels, 2x2
++    * blocks) ran past the end of the memory mapping (SIGSEGV in memmove,
++    * AegirPoster's atlas, gpu38); they are copied by a command like any other
++    * image that has no host transfer feature. */
++   if (features != 0 && !util_format_is_compressed(pfmt))
+       features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
+ 
+    return features;
+@@ -1536,6 +1555,41 @@
+    VkExternalMemoryHandleTypeFlagBits handleType,
+    VkExternalMemoryProperties *external_properties)
+ {
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host: a linear 2D image can be bound to the
++    * caller's own pages (the Metal front end's textures over IOSurfaces and
++    * no-copy buffers), so the framebuffer is rendered in place instead of
++    * through a shadow image copied in and out around every pass. Import only,
++    * and only for a linear layout: the pages hold the caller's rows, at the
++    * driver's pitch (VK_IMAGE_TILING_LINEAR) or at the caller's
++    * (DRM_FORMAT_MOD_LINEAR with an explicit plane layout). */
++   if (handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
++      const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
++         vk_find_struct_const(
++            pImageFormatInfo->pNext,
++            PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
++      const bool linear_layout =
++         pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR ||
++         (pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++          mod_info && mod_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR);
++
++      if (pImageFormatInfo->type != VK_IMAGE_TYPE_2D || !linear_layout) {
++         return panvk_errorf(
++            physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
++            "host allocations back only linear 2D images (VkImageTiling(%d))",
++            pImageFormatInfo->tiling);
++      }
++
++      *external_properties = (VkExternalMemoryProperties){
++         .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++         .exportFromImportedHandleTypes = 0,
++         .compatibleHandleTypes =
++            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++      };
++      return VK_SUCCESS;
++   }
++#endif
++
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+@@ -1891,6 +1945,23 @@
+                                            pExternalBufferProperties);
+       return;
+    }
++
++#ifdef __APPLE__
++   /* VK_EXT_external_memory_host: a buffer can be bound to the caller's own pages (the
++    * Metal front end's newBufferWithBytesNoCopy:). Import only; the handle type has no
++    * export, and it is compatible with nothing but itself. */
++   if (pExternalBufferInfo->handleType ==
++       VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) {
++      pExternalBufferProperties->externalMemoryProperties =
++         (VkExternalMemoryProperties){
++            .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
++            .exportFromImportedHandleTypes = 0,
++            .compatibleHandleTypes =
++               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
++         };
++      return;
++   }
++#endif
+ 
+    const VkExternalMemoryHandleTypeFlags supported_handle_types =
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+--- mesa-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c	2026-11-07 16:14:31
+@@ -616,6 +616,7 @@
+    memset(&render->s_attachment, 0, sizeof(render->s_attachment));
+    memset(&render->fb, 0, sizeof(render->fb));
+    render->bound_attachments = 0;
++   render->fpk_needs_all_rts = panvk_fpk_needs_all_rts_from_env();
+ 
+    const VkMultisampledRenderToSingleSampledInfoEXT *ms2ss_info =
+       vk_find_struct_const(pRenderingInfo,
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+--- mesa-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c	2026-11-07 16:14:14
+@@ -779,6 +779,14 @@
+ always_load(const struct pan_fb_load *load,
+             const struct panvk_frame_shader_key *key)
+ {
++   /* PANVK_PRELOAD_ALWAYS=1 (diagnostics): preload every tile of the render area, not
++    * only the tiles a primitive intersects. */
++   static int force = -1;
++   if (force < 0)
++      force = getenv("PANVK_PRELOAD_ALWAYS") != NULL;
++   if (force)
++      return true;
++
+    for (unsigned rt = 0; rt < PAN_MAX_RTS; rt++) {
+       if (pan_fb_shader_key_target_written(&key->key.rts[rt]) &&
+           load->rts[rt].always)
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_vX_physical_device.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_physical_device.c
+--- mesa-main/src/panfrost/vulkan/panvk_vX_physical_device.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_physical_device.c	2026-11-07 16:14:09
+@@ -169,6 +169,9 @@
+       .EXT_extended_dynamic_state3 = true,
+       .EXT_external_memory_acquire_unmodified = true,
+       .EXT_external_memory_dma_buf = true,
++#ifdef __APPLE__
++      .EXT_external_memory_host = true,
++#endif
+       .EXT_global_priority = true,
+       .EXT_global_priority_query = true,
+       .EXT_graphics_pipeline_library = true,
+@@ -999,6 +1002,8 @@
+       .viewportSubPixelBits = 0,
+       /* Align on a page. */
+       .minMemoryMapAlignment = os_page_size,
++      /* VK_EXT_external_memory_host: whole 4 KiB pages. */
++      .minImportedHostPointerAlignment = 4096,
+       /* The largest buffer texture format is 16B */
+       .minTexelBufferOffsetAlignment = 16,
+       /* Always aligned on a uniform slot (vec4). */
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/util/cache_ops_aarch64.c mesa-akita-main/src/util/cache_ops_aarch64.c
+--- mesa-main/src/util/cache_ops_aarch64.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/util/cache_ops_aarch64.c	2026-11-07 16:08:01
+@@ -26,12 +26,22 @@
+ #include "util/macros.h"
+ #include "util/u_atomic.h"
+ 
++#ifdef __APPLE__
++#include <libkern/OSCacheControl.h>
++#endif
++
+ static uint32_t
+ get_ctr_el0(void)
+ {
++#ifdef __APPLE__
++   /* XNU traps EL0 reads of CTR_EL0 (SIGILL). Tensor G3's A510/A715/X3 have 64-byte lines:
++    * CWG = DminLine = log2(64 / 4) = 4. */
++   return (4u << 24) | (4u << 16);
++#else
+    uint32_t ctr_el0;
+    __asm("mrs\t%x0, ctr_el0" : "=r"(ctr_el0));
+    return ctr_el0;
++#endif
+ }
+ 
+ static uint32_t
+@@ -95,15 +105,23 @@
+ static void
+ flush_l1_cacheline(UNUSED void *p)
+ {
++#ifdef __APPLE__
++   sys_dcache_flush(p, 64);   /* EL0 cache maintenance goes through the kernel on XNU */
++#else
+    /* Clean data cache. */
+    __asm volatile("dc cvac, %0" : : "r" (p) : "memory");
++#endif
+ }
+ 
+ static void
+ flush_inval_l1_cacheline(UNUSED void *p)
+ {
++#ifdef __APPLE__
++   sys_dcache_flush(p, 64);
++#else
+    /* Clean and Invalidate data cache, there is no separate Invalidate. */
+    __asm volatile("dc civac, %0" : : "r" (p) : "memory");
++#endif
+ }
+ 
+ static void
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/util/os_mman.h mesa-akita-main/src/util/os_mman.h
+--- mesa-main/src/util/os_mman.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/util/os_mman.h	2026-11-07 16:02:07
+@@ -51,7 +51,19 @@
+ #endif
+ 
+ 
+-#if DETECT_OS_ANDROID && !defined(__LP64__)
++#if DETECT_OS_APPLE
++/* Darwin: the "DRM fd" of PanVK is served by a libdrm stand-in (darwin-drm) that turns the mmap offset of a buffer object into an
++ * IOConnectMapMemory64 and falls back to mmap() for every other descriptor. */
++extern void *drm_darwin_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
++extern int drm_darwin_munmap(void *addr, size_t length);
++
++#  define os_mmap(addr, length, prot, flags, fd, offset) \
++             drm_darwin_mmap(addr, length, prot, flags, fd, offset)
++
++#  define os_munmap(addr, length) \
++             drm_darwin_munmap(addr, length)
++
++#elif DETECT_OS_ANDROID && !defined(__LP64__)
+ /* 32-bit needs mmap64 for 64-bit offsets */
+ #  define os_mmap(addr, length, prot, flags, fd, offset) \
+              mmap64(addr, length, prot, flags, fd, offset)
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/vulkan/runtime/vk_image.c mesa-akita-main/src/vulkan/runtime/vk_image.c
+--- mesa-main/src/vulkan/runtime/vk_image.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/vulkan/runtime/vk_image.c	2026-11-07 16:02:18
+@@ -23,7 +23,7 @@
+ 
+ #include "vk_image.h"
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ #include <drm-uapi/drm_fourcc.h>
+ #endif
+ 
+@@ -111,7 +111,7 @@
+       vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+    image->wsi_legacy_scanout = wsi_info && wsi_info->scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    image->drm_format_mod = ((1ULL << 56) - 1) /* DRM_FORMAT_MOD_INVALID */;
+ #endif
+ 
+@@ -196,7 +196,7 @@
+    vk_object_free(device, alloc, image);
+ }
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
+                                                  VkImage _image,
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/vulkan/runtime/vk_image.h mesa-akita-main/src/vulkan/runtime/vk_image.h
+--- mesa-main/src/vulkan/runtime/vk_image.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/vulkan/runtime/vk_image.h	2026-11-07 16:02:18
+@@ -80,7 +80,7 @@
+    /* wsi_image_create_info::scanout */
+    bool wsi_legacy_scanout;
+ 
+-#if DETECT_OS_LINUX || DETECT_OS_BSD
++#if DETECT_OS_LINUX || DETECT_OS_BSD || DETECT_OS_APPLE
+    /* VK_EXT_drm_format_modifier
+     *
+     * Initialized by vk_image_create/init() to DRM_FORMAT_MOD_INVALID.  It's

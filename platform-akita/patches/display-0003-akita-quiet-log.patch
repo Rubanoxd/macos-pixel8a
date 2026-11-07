@@ -1,0 +1,20 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -318,7 +318,7 @@
+     }
+     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
+         fStalled++;
+-    if (++fTicks % 625 == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 10 s while swaps arrive
++    if (++fTicks % 3750 == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 60 s while swaps arrive
+         fReported = fSubmitted + fFrames + fDropped + fStalled;
+         IOLog("NativeGOPDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu lit centre %#llx\n",
+               fSubmitted, fFrames, fDropped, fStalled, at<IOMFBSwapIORequest *>(this, kCurrentSwap), fLastLit, fLastCenter);
+@@ -582,7 +582,7 @@
+     fLastLit = lit;
+     fLastCenter = center;
+     fChangedPixels = changed;
+-    if (fFrames <= 8 || fFrames % 200 == 0)
++    if (fFrames <= 8 || fFrames % 2000 == 0)
+         IOLog("NativeGOPDisplay: frame %llu surface %p %s, %llu pixels changed\n", fFrames, surface,
+               !shadow ? "unshadowed" : fresh ? "fresh" : "diffed", changed);
+     if (format == kFormatRGhA && (fFrames <= 8 || fFrames % 50 == 0))

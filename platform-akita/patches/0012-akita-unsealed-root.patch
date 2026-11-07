@@ -1,0 +1,20 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -948,6 +948,17 @@ bsd_init(void)
+ 		require_rootauth = TRUE;
+ #endif // XNU_TARGET_OS_OSX && defined(__arm64__)
+ 
++#if SHENG
++		/*
++		 * akita: the full macOS system volume on this device is an unsealed development copy (no seal, no volume
++		 * group). With the boot-arg akita-unsealed-root, report the failed authentication instead of panicking.
++		 */
++		if (require_rootauth && PE_parse_boot_argn("akita-unsealed-root", NULL, 0)) {
++			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
++			printf("AKITA: root authentication %d (unsealed development root accepted)\n", autherr);
++			require_rootauth = FALSE;
++		}
++#endif
+ 		if (require_rootauth) {
+ 			/* enforce sealedness */
+ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());

@@ -1,0 +1,18 @@
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -313,6 +313,15 @@
+ static bool
+ akita_console_noise(const char *line, unsigned length)
+ {
++	/* Known loops of absent or crashing Recovery services: they would fill the ring the viewer shows. */
++	static const char *const always[] = {
++		"dock.fullscreen", "opendirectoryd", "com.apple.logd", "appleh16camerad", "mobileactivation",
++	};
++	for (unsigned i = 0; i < sizeof(always) / sizeof(always[0]); i++) {
++		if (akita_console_contains(line, length, always[i])) {
++			return true;
++		}
++	}
+ 	static const char *const keep[] = {
+ 		"exited due to", "exited with", "SIG", "crash", "Crash", "abort", "panic", "WindowServer",
+ 		"Language", "Recovery", "recoveryosd", "loginwindow", "deny", "Sandbox", "error = 1",

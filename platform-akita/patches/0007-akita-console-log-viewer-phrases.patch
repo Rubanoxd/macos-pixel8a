@@ -1,0 +1,52 @@
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -334,6 +334,38 @@
+ 		}
+ 	}
+ 	return true;
++}
++
++/*
++ * The boot firmware's log viewer leaves out lines with launchd's routine phrases. Lines kept here still carry
++ * them, so shorten those phrases on the way to the ring.
++ */
++static void
++akita_console_emit(const char *line, unsigned length)
++{
++	static const char *const from[] = {
++		"com.apple.xpc.launchd", "Successfully spawned", "service state", "internal event", "deferred event",
++		"failed lookup",
++	};
++	static const char *const to[] = {
++		"launchd", "spawned", "state", "event", "deferred", "lookup FAILED",
++	};
++	for (unsigned at = 0; at < length;) {
++		unsigned i = 0;
++		for (; i < sizeof(from) / sizeof(from[0]); i++) {
++			unsigned size = (unsigned)strlen(from[i]);
++			if (at + size <= length && memcmp(line + at, from[i], size) == 0) {
++				for (const char *c = to[i]; *c; c++) {
++					sheng_log_putc(*c);
++				}
++				at += size;
++				break;
++			}
++		}
++		if (i == sizeof(from) / sizeof(from[0])) {
++			sheng_log_putc(line[at++]);
++		}
++	}
+ }
+ 
+ static void
+@@ -353,9 +385,7 @@
+ 		}
+ 		if (c == '\n' || akita_console_length == sizeof(akita_console_line)) {
+ 			if (!akita_console_noise(akita_console_line, akita_console_length)) {
+-				for (unsigned i = 0; i < akita_console_length; i++) {
+-					sheng_log_putc(akita_console_line[i]);
+-				}
++				akita_console_emit(akita_console_line, akita_console_length);
+ 			}
+ 			akita_console_length = 0;
+ 		}

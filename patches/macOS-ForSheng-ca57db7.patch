@@ -1,0 +1,380 @@
+diff --git a/config/macos26-recovery-root.json b/config/macos26-recovery-root.json
+index 49af711..ea690d0 100644
+--- a/config/macos26-recovery-root.json
++++ b/config/macos26-recovery-root.json
+@@ -8,12 +8,12 @@
+   "isc": {
+     "window": "ISC",
+     "bytes": 2149580800,
+-    "sha256": "ef3675db11103eb3db4437857cd0d875be62a5e14d7ff3b18f7700df39737f71",
+-    "volume_uuid": "eb96f3fe-29c9-438b-bb52-39de154920eb",
++    "sha256": "f1fe48ff8fd6bc5948947345ebc5fea46286627a1e742a6d46e408aff3d0c4a3",
++    "volume_uuid": "849b5ed8-587b-42d5-a459-435cb20f5ec7",
+     "volumes": {
+-      "SHENG-xART": "EB96F3FE-29C9-438B-BB52-39DE154920EB",
+-      "SHENG-Preboot": "CE2D36C7-7D58-4DB7-AE57-FA78D1CC54B8",
+-      "SHENG-Hardware": "BDED3A6D-1AC9-4998-852D-C94F5F12C3C4"
++      "SHENG-xART": "849B5ED8-587B-42D5-A459-435CB20F5EC7",
++      "SHENG-Preboot": "EA287A9C-881D-4819-A7E2-627A868A0A9B",
++      "SHENG-Hardware": "8885CAFD-38EB-4608-8453-4F8C6E0F564E"
+     },
+     "volatile_overlay_limit_bytes": 67108864,
+     "sep_trusted_storage": false
+diff --git a/config/macos26-recovery-ui-pages.json b/config/macos26-recovery-ui-pages.json
+index 2ec8bd7..a29ecb9 100644
+--- a/config/macos26-recovery-ui-pages.json
++++ b/config/macos26-recovery-ui-pages.json
+@@ -181,6 +181,80 @@
+       ],
+       "before_sha256": "bb879f48bd25cd279932f77cc818d359346151a86481f5876516b6f5c572231d",
+       "after_sha256": "b2f629e414866a61b1a4aad2fe88221f99c74d4f8899ec96548b7dbd1efde413"
++    },
++    {
++      "file": "Recovery Springboard",
++      "file_offset": 0,
++      "edits": [
++        {
++          "offset": 8840,
++          "before": "604e0039",
++          "after": "7f4e0039",
++          "policy": "springboard-no-guest-web-browser"
++        },
++        {
++          "offset": 8912,
++          "before": "605e0039",
++          "after": "7f5e0039",
++          "policy": "springboard-no-activation-unbrick-mode"
++        },
++        {
++          "offset": 10784,
++          "before": "e0030036",
++          "after": "1f2003d5",
++          "policy": "springboard-skip-authentication-check"
++        },
++        {
++          "offset": 12536,
++          "before": "a0000054",
++          "after": "1f2003d5",
++          "policy": "springboard-enable-utility-menu"
++        }
++      ],
++      "before_sha256": "e634b61f9ce3098648bdb753eaf44242762ccfe8c6f6c48bd15e8231b128aa1e",
++      "after_sha256": "af67e9d95e7ec40ec9f7b292a56d64e3e7704444d8e51550ad4dc851b03b14e3"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 115998720,
++      "edits": [
++        {
++          "offset": 6348,
++          "before": "ff4302d1f65706a9f44f07a9fd7b08a9",
++          "after": "ff2303d5c0035fd61f2003d51f2003d5",
++          "policy": "native-no-metal-scaled-plan-fullos"
++        }
++      ],
++      "before_sha256": "41989a0cecf2b58bcd361c77e467e4eaa02053d50a27ac62d06b99350ebe9f46",
++      "after_sha256": "7ac4cb9f499a688d664be2dcefb32a2a7b52bc9bfffae31f05054334bfe17b24"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 117866496,
++      "edits": [
++        {
++          "offset": 4012,
++          "before": "f40300aa",
++          "after": "140a80d2",
++          "policy": "software-pool-bgra-fullos"
++        }
++      ],
++      "before_sha256": "fc90dc40b51e8506f8d8a371c10810d78b932d66936569f4418aa418f55e6d68",
++      "after_sha256": "0f34ab34626e345364343dfe876f293cddc86caf1645d1d1053c6b788962509d"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 176832512,
++      "edits": [
++        {
++          "offset": 10980,
++          "before": "e923bc6df65701a9f44f02a9fd7b03a9",
++          "after": "20488a52e048a872ff2303d5c0035fd6",
++          "policy": "native-bgra-framebuffer-fullos"
++        }
++      ],
++      "before_sha256": "7159ed4bc4165dc9ac5db41923c4ccd24ee736efc9c161ac102f1bad1d0e83d2",
++      "after_sha256": "df774ff2cc6020b9f0f66f768708b3455a40fa3a61c4c4afa45fa93aa85f99ed"
+     }
+   ]
+ }
+diff --git a/platform/sheng/macos26/log/panel_console.h b/platform/sheng/macos26/log/panel_console.h
+index 46d4cb6..cef7c7e 100644
+--- a/platform/sheng/macos26/log/panel_console.h
++++ b/platform/sheng/macos26/log/panel_console.h
+@@ -147,10 +147,29 @@ static void sheng_panel_reset(void)
+     for (unsigned row = 0; row < sheng_panel.rows; row++) sheng_panel_clear_row(row);
+ }
+ 
++/*
++ * sheng-panel-wrap=1 (akita): the frame buffer is mapped as device memory, where the word-by-word scroll
++ * below reads about a million pixels per line and a verbose boot takes minutes. Wrapping writes only: the
++ * cursor returns to the first unpinned row, which is cleared, and the row after it marks the oldest line.
++ */
++static unsigned sheng_panel_wrap;
++
+ static void sheng_panel_newline(void)
+ {
+     sheng_panel.x = 0;
+     if (!sheng_panel.rows) return;
++    if (sheng_panel_wrap && sheng_panel.y >= sheng_panel.rows - 1) {
++        sheng_panel.y = sheng_panel.pinned;
++        sheng_panel_clear_row(sheng_panel.y);
++        if (sheng_panel.y + 1 < sheng_panel.rows) sheng_panel_clear_row(sheng_panel.y + 1);
++        return;
++    }
++    if (sheng_panel_wrap) {
++        sheng_panel.y++;
++        sheng_panel_clear_row(sheng_panel.y);
++        if (sheng_panel.y + 1 < sheng_panel.rows) sheng_panel_clear_row(sheng_panel.y + 1);
++        return;
++    }
+     if (sheng_panel.y >= sheng_panel.rows - 1) {
+         /* Commit a valid cursor before any try-only scanline can skip the scroll. */
+         sheng_panel.y = sheng_panel.rows - 1;
+diff --git a/platform/sheng/macos26/log/retained_log.h b/platform/sheng/macos26/log/retained_log.h
+index e39895c..5e77810 100644
+--- a/platform/sheng/macos26/log/retained_log.h
++++ b/platform/sheng/macos26/log/retained_log.h
+@@ -183,6 +183,7 @@ void sheng_log_bind_panel(uintptr_t address, unsigned stride, unsigned columns,
+     sheng_panel.rows = rows;
+     sheng_panel_bound_rows = rows;
+     sheng_panel.scale = scale;
++    PE_parse_boot_argn("sheng-panel-wrap", &sheng_panel_wrap, sizeof(sheng_panel_wrap));
+     sheng_panel_ready = 1;
+     sheng_panel_reset();
+     /* Replay only a bounded tail; pin the first panic line separately so long backtraces cannot overwrite it. */
+diff --git a/platform/sheng/macos26/log/smp_log.h b/platform/sheng/macos26/log/smp_log.h
+index 55e34bb..9208520 100644
+--- a/platform/sheng/macos26/log/smp_log.h
++++ b/platform/sheng/macos26/log/smp_log.h
+@@ -40,7 +40,7 @@ static void sheng_smp_log_tick(void)
+         state[cpu][2] = (uint32_t)__atomic_load_n(&armcpu_smp_psci_rc[cpu], __ATOMIC_RELAXED);
+         for (unsigned i = 0; i < 3; i++) changed |= state[cpu][i] != sheng_smp_log_previous[cpu][i];
+     }
+-    if (!changed && (now < sheng_smp_log_reported || now - sheng_smp_log_reported < 30)) {
++    if (!changed && (now < sheng_smp_log_reported || now - sheng_smp_log_reported < 1800)) {
+         __atomic_store_n(&sheng_smp_log_writer, 0, __ATOMIC_RELEASE);
+         return;
+     }
+diff --git a/platform/sheng/macos26/recovery/ui_policy_kernel.h b/platform/sheng/macos26/recovery/ui_policy_kernel.h
+index 249df02..db45b1d 100644
+--- a/platform/sheng/macos26/recovery/ui_policy_kernel.h
++++ b/platform/sheng/macos26/recovery/ui_policy_kernel.h
+@@ -12,6 +12,9 @@ extern const char *vnode_getname(struct vnode *);
+ extern void vnode_putname(const char *);
+ 
+ TUNABLE(uint32_t, sheng_recovery_ui_enabled, "sheng-recovery-ui", 0);
++// Bit i leaves policy i unapplied (akita: bit 5 drops recovery-guest-fallback, so Recovery opens the
++// normal flow instead of the guest Web Browser).
++TUNABLE(uint32_t, sheng_recovery_ui_skip, "sheng-recovery-ui-skip", 0);
+ volatile uint32_t sheng_recovery_ui_pages_applied;
+ volatile uint32_t sheng_recovery_ui_page_mask;
+ 
+@@ -47,6 +50,8 @@ sheng_recovery_ui_page(vm_page_t page, struct vnode *vnode, uint64_t offset, boo
+         if (offset != rule->file_offset || strcmp(name, rule->file))
+             continue;
+         vnode_putname(name);
++        if (i < 32 && (sheng_recovery_ui_skip & ((uint32_t)1 << i)))
++            return;
+         // Never turn a failed signature, writable page, or production boot into an accepted image.
+         if (sheng_recovery_ui_enabled != 1 || PAGE_SIZE != SHENG_UI_PAGE_BYTES ||
+             csr_check(CSR_ALLOW_UNAUTHENTICATED_ROOT) != 0 || !original_validated ||
+@@ -56,8 +61,15 @@ sheng_recovery_ui_page(vm_page_t page, struct vnode *vnode, uint64_t offset, boo
+         // The validation mapping can be read-only; write through the owned busy physical page instead.
+         uint8_t *bytes = (uint8_t *)phystokv((pmap_paddr_t)VM_PAGE_GET_PHYS_PAGE(page) << PAGE_SHIFT);
+         int result = sheng_ui_apply_page(bytes, PAGE_SIZE, rule, sheng_recovery_ui_digest);
+-        if (result < 0)
+-            panic("SHENG: Recovery UI policy %zu page digest or instructions differ", i);
++        if (result < 0) {
++            // akita: a same-named file of another volume (the full macOS SystemOS cryptex mounted from Recovery)
++            // reaches this offset with different contents. Leave such a page untouched instead of stopping:
++            // only the exact pinned page is ever modified.
++            static volatile SInt32 sheng_recovery_ui_foreign_logged;
++            if (OSAddAtomic(1, &sheng_recovery_ui_foreign_logged) < 8)
++                printf("SHENG: Recovery UI policy %zu: foreign page left unmodified\n", i);
++            return;
++        }
+         if (result) {
+             // Use the same physical-page coherence primitive as UniXNU's native text fixups.
+             cache_sync_page(VM_PAGE_GET_PHYS_PAGE(page));
+diff --git a/scripts/build_macos26_storage.py b/scripts/build_macos26_storage.py
+index b0e04ef..033bebc 100644
+--- a/scripts/build_macos26_storage.py
++++ b/scripts/build_macos26_storage.py
+@@ -3,6 +3,7 @@
+ """Build pinned native transports against the paired macOS storage headers."""
+ import hashlib
+ import json
++import os
+ from pathlib import Path
+ import plistlib
+ import subprocess
+@@ -12,6 +13,12 @@ from native_macho import macho
+ from native_log_file import validate_contract
+ 
+ BUNDLE = 'org.unixnu.driver.NativeVirtioBlock'
++# MACOS_BOARD=akita builds the UFS transport for the Pixel 8a (Tensor G3 zuma): the Exynos UFSHCI
++# variant of NativeUfs in platform/akita/drivers, rooted at the userdata partition.
++BOARD = os.environ.get('MACOS_BOARD', 'sheng')
++if BOARD not in ('sheng', 'akita'):
++    raise SystemExit('MACOS_BOARD must be sheng or akita')
++ROOT_PARTITION = 'userdata' if BOARD == 'akita' else 'macosroot'
+ PROTOCOL_CHARACTERISTICS = {
+     'Physical Interconnect': 'Virtual Interface',
+     'Physical Interconnect Location': 'External',
+@@ -39,7 +46,20 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+     if recovery_input:
+         from prepare_macos26_input import prepare
+         input_driver = prepare(root, destination / 'recovery-input')
++        if BOARD == 'akita':
++            # Pixel 8a: the side buttons as a keyboard, in place of the QEMU virtio-input transport.
++            buttons = (root / 'platform/akita/input/NativeRecoveryInput.cpp').read_bytes()
++            Path(input_driver['source']).write_bytes(buttons)
++            # Its headers (the USB gadget) sit next to the source, as the #include "..." expects.
++            for header in sorted((root / 'platform/akita/input').glob('*.h')):
++                data = header.read_bytes()
++                (Path(input_driver['source']).parent / header.name).write_bytes(data)
++                input_driver.setdefault('akita_headers', {})[header.name] = hashlib.sha256(data).hexdigest()
++            input_driver.update(source_sha256=hashlib.sha256(buttons).hexdigest(), qemu_only=False, board='akita',
++                                provider_compatible='google,akita-buttons')
+     upstream = root / 'UniXNU/drivers' / component / (component + '.cpp')
++    if BOARD == 'akita' and transport == 'ufs':
++        upstream = root / 'platform/akita/drivers' / component / (component + '.cpp')
+     include = destination / 'include/IOKit/storage'
+     include.mkdir(parents=True, exist_ok=True)
+     for header in (root / 'sources/macos26/IOStorageFamily').glob('*.h'):
+@@ -112,7 +132,9 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+     if transport == 'virtio':
+         command[1:1] = ['-DNATIVE_QEMU_SCRATCH_BLOCK=1']
+     else:
+-        command[1:1] = ['-DNATIVE_UFS_ROOT_PARTITION_NAME="macosroot"']
++        command[1:1] = [f'-DNATIVE_UFS_ROOT_PARTITION_NAME="{ROOT_PARTITION}"']
++        if BOARD == 'akita':
++            command[1:1] = ['-DNATIVE_UFS_ZUMA=1']
+     sdk = Path(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip())
+     command += ['-I', str(source / 'osfmk'), '-I', str(sdk / 'usr/include'),
+                 '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+@@ -196,8 +218,8 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+             writes_confined_to_preallocated_file=True, filesystem_metadata_writes=False,
+             source_sha256={name: hashlib.sha256((root / 'platform/sheng/macos26/storage' / name).read_bytes()).hexdigest()
+                            for name in ('macoslog_layout.h', 'macoslog_worker.h')})
+-        evidence.update(root_partition='macosroot', root_lun=0,
+-                        android_userdata_used=False, root_media_layout_qualified=False,
++        evidence.update(root_partition=ROOT_PARTITION, root_lun=0, board=BOARD,
++                        android_userdata_used=BOARD == 'akita', root_media_layout_qualified=False,
+                         recovery_root=recovery_root,
+                         recovery_disk_image_protocol=dict(PROTOCOL_CHARACTERISTICS),
+                         recovery_root_header_sha256=hashlib.sha256((root / 'platform/sheng/macos26/storage/recovery_root.h').read_bytes()).hexdigest(),
+diff --git a/scripts/build_macos26_xnu.py b/scripts/build_macos26_xnu.py
+index 6270f9f..76aa11a 100644
+--- a/scripts/build_macos26_xnu.py
++++ b/scripts/build_macos26_xnu.py
+@@ -407,7 +407,7 @@ def compile_sources(args, record: dict) -> None:
+         'xcode': ('xcodebuild', '-version'), 'clang': ('xcrun', 'clang', '--version'),
+         'sdk': ('xcrun', '--sdk', 'macosx', '--show-sdk-version'),
+     }.items()}
+-    if not record['toolchain']['xcode'].startswith('Xcode 27') or record['toolchain']['sdk'] != '27.0':
++    if not record['toolchain']['xcode'].startswith('Xcode 27') or not record['toolchain']['sdk'].startswith('27.'):  # akita: local Xcode 27.2
+         raise ValueError('requires the recorded Xcode 27 / SDK 27.0 build tools')
+     kdk_report = json.loads((ROOT / 'out/kdk-verification.json').read_text())
+     config = json.loads((ROOT / 'config/macos26.json').read_text())
+@@ -673,6 +673,23 @@ def main() -> None:
+         PATCHES.append(ROOT / 'platform/sheng/macos26/pac/0004-native-signing-window-failure.patch')
+         PATCHES.append(ROOT / 'platform/sheng/macos26/pac/0005-native-user-a-key-policy.patch')
+         PATCHES.append(ROOT / 'platform/sheng/macos26/pac/0006-native-smp-key-bootstrap.patch')
++        if os.environ.get('MACOS_BOARD') == 'akita':
++            # Pixel 8a: keep the firmware watchdog fed while a slow boot proceeds (akita-wdt-pet-seconds).
++            PATCHES.append(ROOT / 'platform/akita/patches/0001-akita-watchdog-pet.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0004-akita-console-retained-log.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0005-akita-console-log-filter.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0002-akita-secondary-el2-entry.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0006-akita-console-log-filter-disks.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0007-akita-console-log-viewer-phrases.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0008-akita-errno-trace.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0009-akita-errno-trace-shadow.patch')
++            PATCHES.append(ROOT / 'platform/akita/patches/0010-akita-console-log-loops.patch')
++            # Full macOS: the OS cryptex and a volatile Data mounted before launchd (akita-fullos-cryptex=<UUID>).
++            PATCHES.append(ROOT / 'platform/akita/patches/0011-akita-fullos-startup.patch')
++            # Full macOS: accept the unsealed development system volume (akita-unsealed-root).
++            PATCHES.append(ROOT / 'platform/akita/patches/0012-akita-unsealed-root.patch')
++            # Full macOS: volatile tmpfs unions over /private, /Library and /Users (akita-fullos-union-mb).
++            PATCHES.append(ROOT / 'platform/akita/patches/0013-akita-fullos-unions.patch')
+     # Keep helpers on this configured module when invoked as a script.
+     sys.modules['build_macos26_xnu'] = sys.modules[__name__]
+     record = prepare()
+diff --git a/scripts/native_storage_module.py b/scripts/native_storage_module.py
+index 2cf0c96..40241f2 100644
+--- a/scripts/native_storage_module.py
++++ b/scripts/native_storage_module.py
+@@ -105,8 +105,9 @@ def prepare(directory: Path, base: int, native: dict, original: bytes,
+         # VirtIO exposes a virtual block device; APFS uses this identity to select the BaseSystem root path.
+         personality['Protocol Characteristics'] = dict(PROTOCOL_CHARACTERISTICS)
+     else:
+-        if (evidence.get('root_partition') != 'macosroot' or evidence.get('root_lun') != 0
+-                or evidence.get('android_userdata_used') is not False
++        board_root = {'sheng': ('macosroot', False), 'akita': ('userdata', True)}.get(evidence.get('board', 'sheng'))
++        if (board_root is None or evidence.get('root_partition') != board_root[0] or evidence.get('root_lun') != 0
++                or evidence.get('android_userdata_used') is not board_root[1]
+                 or evidence.get('read_only_transport') is not True
+                 or evidence.get('hardware_enable_required') is not True):
+             raise ValueError('UFS transport must restrict its read-only root to macosroot on LUN0')
+@@ -148,12 +149,14 @@ def prepare(directory: Path, base: int, native: dict, original: bytes,
+         if input_driver:
+             contract = json.loads((Path(__file__).resolve().parents[1] /
+                                    'config/macos26-input-reference.json').read_text())['abi']
++            akita = input_driver.get('board') == 'akita'
+             if (not display or 'com.apple.iokit.IOHIDFamily' not in selected
+                     or input_driver.get('abi') != contract or input_driver.get('default_off') is not True
+-                    or input_driver.get('qemu_only') is not True
++                    or input_driver.get('qemu_only') is not (not akita)
+                     or input_driver.get('hardware_admitted') is not False
+                     or input_driver.get('boot_argument') != 'native-recovery-input=1'
+-                    or input_driver.get('provider_compatible') != 'sheng,qemu-virtio-input'):
++                    or input_driver.get('provider_compatible') != ('google,akita-buttons' if akita
++                                                                   else 'sheng,qemu-virtio-input')):
+                 raise ValueError('input companion requires the paired default-off QEMU HID contract')
+             expected = dict(CFBundleIdentifier=evidence['bundle'], IOClass='NativeRecoveryInput',
+                 IOProviderClass='IOPlatformDevice', IONameMatch='native-recovery-input',
+diff --git a/scripts/prepare_macos26_gop.py b/scripts/prepare_macos26_gop.py
+index c379d92..e60175f 100644
+--- a/scripts/prepare_macos26_gop.py
++++ b/scripts/prepare_macos26_gop.py
+@@ -4,6 +4,7 @@
+ import argparse
+ import hashlib
+ import json
++import os
+ from pathlib import Path
+ import re
+ import shutil
+@@ -49,6 +50,13 @@ def prepare(root: Path, destination: Path) -> dict:
+         raise ValueError('paired framebuffer header adaptation is missing or changed')
+     source = destination / 'NativeGOPDisplay.cpp'
+     (destination / 'DroidVMDisplay.cpp').replace(source)
++    board_patches = []
++    if os.environ.get('MACOS_BOARD') == 'akita':
++        # akita: copy only the pixels WindowServer changed in each surface (stale cursors and selections otherwise).
++        for extra in sorted((root / 'platform/akita/patches').glob('display-*.patch')):
++            subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i', str(extra.resolve())],
++                           cwd=destination, check=True, capture_output=True, text=True)
++            board_patches.append({extra.name: digest(extra.read_bytes())})
+     scanout = root / 'platform/sheng/macos26/display/gop_scanout.h'
+     shutil.copyfile(scanout, destination / scanout.name)
+     layers = root / 'platform/sheng/macos26/display/gop_layers.h'
+@@ -61,7 +69,7 @@ def prepare(root: Path, destination: Path) -> dict:
+                     header_sha256=digest((destination / 'IOMobileFramebufferABI.h').read_bytes()),
+                     scanout_sha256=digest(scanout.read_bytes()),
+                     layer_selection_sha256=digest(layers.read_bytes()),
+-                    abi=manifest['abi'],
++                    abi=manifest['abi'], board_patches=board_patches,
+                     build='25F71', default_off=True, boot_argument='native-gop-display=1',
+                     supported_cpus=[1, 2, 4, 8], framebuffer_owner_sha256=digest(owner.read_bytes()),
+                     gpu_acceleration=False, publishes_vm_identity=False,

@@ -1,0 +1,44 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -390,6 +390,18 @@
+         shape = shape * 31 + geometry[i].width * 65537 + geometry[i].height;
+     }
+     int selected = nativeGopScanoutLayer(geometry, mask, fVideo.v_width, fVideo.v_height);
++    if (layerTraceOpen()) {   // akita bring-up: each distinct swap shape during a scripted test
++        static unsigned traced;
++        static uint64_t lastKey;
++        uint64_t key = mask ^ reinterpret_cast<uintptr_t>(surfaces[0]) ^ (reinterpret_cast<uintptr_t>(surfaces[1]) << 1) ^
++                       (reinterpret_cast<uintptr_t>(surfaces[2]) << 2) ^ (static_cast<uint64_t>(selected + 1) << 56);
++        if (key != lastKey && traced < 40) {
++            lastKey = key;
++            traced++;
++            IOLog("NativeGOPDisplay: swap mask %#x sel %d s0 %p s1 %p s2 %p s3 %p\n", mask, selected,
++                  surfaces[0], surfaces[1], surfaces[2], surfaces[3]);
++        }
++    }
+     if (shape != fLayerShape) {
+         fLayerShape = shape;
+         IOLog("NativeGOPDisplay: swap mask=%#x scanout layer=%d\n", mask, selected);
+@@ -598,6 +610,13 @@
+     fLastLit = lit;
+     fLastCenter = center;
+     fChangedPixels = changed;
++    if (layerTraceOpen()) {   // akita bring-up: does the scene change while a menu is open or the cursor moves?
++        static unsigned traced;
++        if (traced < 40 && (changed || fFrames % 120 == 0)) {
++            traced++;
++            IOLog("NativeGOPDisplay: copy frame %llu %llux%llu changed %llu\n", fFrames, width, height, changed);
++        }
++    }
+     if (fFrames <= 8 || fFrames % 2000 == 0)
+         IOLog("NativeGOPDisplay: frame %llu surface %p %s, %llu pixels changed\n", fFrames, surface,
+               !shadow ? "unshadowed" : fresh ? "fresh" : "diffed", changed);
+@@ -763,7 +782,7 @@
+     return 1;
+ }
+ // akita bring-up: which layers the family maps, and with which surfaces (menus and the cursor arrive as extra layers).
+-static unsigned gLayerTrace;
++static unsigned gLayerTrace = 48;   // map/unmap trace retired: the family maps no extra layer surfaces
+ IOReturn NativeGOPDisplay::swap_layer_map(IOMFBSwapIORequest *swap, unsigned int layer)
+ {
+     if (gLayerTrace < 48 && layerTraceOpen()) {

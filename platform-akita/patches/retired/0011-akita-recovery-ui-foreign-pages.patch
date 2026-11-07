@@ -1,0 +1,20 @@
+--- a/osfmk/vm/sheng_recovery_ui_kernel.h	2026-11-05 21:29:18
++++ b/osfmk/vm/sheng_recovery_ui_kernel.h	2026-11-05 21:29:18
+@@ -61,8 +61,15 @@
+         // The validation mapping can be read-only; write through the owned busy physical page instead.
+         uint8_t *bytes = (uint8_t *)phystokv((pmap_paddr_t)VM_PAGE_GET_PHYS_PAGE(page) << PAGE_SHIFT);
+         int result = sheng_ui_apply_page(bytes, PAGE_SIZE, rule, sheng_recovery_ui_digest);
+-        if (result < 0)
+-            panic("SHENG: Recovery UI policy %zu page digest or instructions differ", i);
++        if (result < 0) {
++            // akita: a same-named file of another volume (the full macOS SystemOS cryptex mounted from Recovery)
++            // reaches this offset with different contents. Leave such a page untouched instead of stopping:
++            // only the exact pinned page is ever modified.
++            static volatile uint32_t sheng_recovery_ui_foreign_logged;
++            if (OSAddAtomic(1, (volatile SInt32 *)&sheng_recovery_ui_foreign_logged) < 8)
++                printf("SHENG: Recovery UI policy %zu: foreign page left unmodified\n", i);
++            return;
++        }
+         if (result) {
+             // Use the same physical-page coherence primitive as UniXNU's native text fixups.
+             cache_sync_page(VM_PAGE_GET_PHYS_PAGE(page));

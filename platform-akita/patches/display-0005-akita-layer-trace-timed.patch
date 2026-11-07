@@ -1,0 +1,61 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -356,6 +356,22 @@
+ 
+ // Copy the compatible scene before completing the swap. Cursor-only updates
+ // leave scanout intact; no separate hardware cursor plane is advertised.
++// akita bring-up: native-gop-layer-trace-after=<s> holds the layer trace back until that much uptime (a scripted
++// menu or cursor test), so its lines land at the end of the retained log.
++#include <kern/clock.h>
++static bool layerTraceOpen()
++{
++    static unsigned after = ~0u;
++    if (after == ~0u) {
++        unsigned value = 0;
++        PE_parse_boot_argn("native-gop-layer-trace-after", &value, sizeof(value));
++        after = value;
++    }
++    uint64_t now;
++    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++    return now >= after * 1000000000ULL;
++}
++
+ void NativeGOPDisplay::program_hardware_gated()
+ {
+     IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kCurrentSwap);
+@@ -380,7 +396,7 @@
+         // akita bring-up: each layer's surface and the swap record words around the layer mask, to locate the
+         // per-layer rectangles (menus and the cursor arrive as extra layers).
+         static unsigned dumps;
+-        if ((mask & (mask - 1)) && dumps < 8) {
++        if ((mask & (mask - 1)) && dumps < 3 && layerTraceOpen()) {
+             dumps++;
+             for (unsigned i = 0; i < kNativeGopSwapLayerCount; i++)
+                 if (surfaces[i])
+@@ -750,7 +766,7 @@
+ static unsigned gLayerTrace;
+ IOReturn NativeGOPDisplay::swap_layer_map(IOMFBSwapIORequest *swap, unsigned int layer)
+ {
+-    if (gLayerTrace < 48) {
++    if (gLayerTrace < 48 && layerTraceOpen()) {
+         gLayerTrace++;
+         IOLog("NativeGOPDisplay: swap_layer_map swap %p layer %u mask %#x\n", swap, layer, at<uint8_t>(swap, kSwapLayers));
+     }
+@@ -758,7 +774,7 @@
+ }
+ IOReturn NativeGOPDisplay::surface_layer_map(IOMFB::AP::DisplayedData *data, unsigned int layer, IOSurface *surface)
+ {
+-    if (gLayerTrace < 48) {
++    if (gLayerTrace < 48 && layerTraceOpen()) {
+         gLayerTrace++;
+         IOLog("NativeGOPDisplay: surface_layer_map data %p layer %u surface %p %llux%llu %#x\n", data, layer, surface,
+               surface ? ioSurfaceWidth(surface) : 0, surface ? ioSurfaceHeight(surface) : 0,
+@@ -768,7 +784,7 @@
+ }
+ IOReturn NativeGOPDisplay::surface_layer_unmap(IOMFB::AP::DisplayedData *data, unsigned int layer)
+ {
+-    if (gLayerTrace < 48) {
++    if (gLayerTrace < 48 && layerTraceOpen()) {
+         gLayerTrace++;
+         IOLog("NativeGOPDisplay: surface_layer_unmap data %p layer %u\n", data, layer);
+     }

@@ -1,0 +1,89 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -41,6 +41,74 @@
+ extern void dtrace_systrace_syscall_return(unsigned short, int, int *);
+ #endif  /* CONFIG_DTRACE */
+ 
++#if defined(ARM64_BOARD_CONFIG_SHENG)
++#include <kern/startup.h>
++/*
++ * akita: sheng-errno-trace=<process name> keeps the last failing system calls of each run of that process and,
++ * at most every 20 s, prints those of the previous run as syscall:errno pairs. A daemon that keeps exiting
++ * while its own log has nowhere to go then leaves its failures at the end of the retained log.
++ */
++static TUNABLE_STR(sheng_errno_trace, MAXCOMLEN + 1, "sheng-errno-trace", "");
++#define SHENG_ERRNO_RING 40
++struct sheng_errno_run {
++	int pid;
++	unsigned count;
++	uint16_t code[SHENG_ERRNO_RING];
++	uint8_t error[SHENG_ERRNO_RING];
++};
++static struct sheng_errno_run sheng_errno_now, sheng_errno_last;
++static uint32_t sheng_errno_busy;
++static uint64_t sheng_errno_emitted;
++
++static void
++sheng_errno_emit(void)
++{
++	char line[96];
++	unsigned total = sheng_errno_last.count;
++	unsigned first = total > SHENG_ERRNO_RING ? total - SHENG_ERRNO_RING : 0;
++	unsigned n = 0;
++	for (unsigned i = first; i < total; i++) {
++		unsigned slot = i % SHENG_ERRNO_RING;
++		n += (unsigned)snprintf(line + n, sizeof(line) - n, " %u:%u",
++		    sheng_errno_last.code[slot], sheng_errno_last.error[slot]);
++		if (n > 60 || i + 1 == total) {
++			printf("SHENG-ERRNO: %s[%d] %u failed%s\n", sheng_errno_trace, sheng_errno_last.pid, total, line);
++			n = 0;
++		}
++	}
++}
++
++static void
++sheng_errno_record(struct proc *proc, int code, int error)
++{
++	if (strncmp(proc->p_comm, sheng_errno_trace, MAXCOMLEN) != 0) {
++		return;
++	}
++	uint32_t expected = 0;
++	if (!__atomic_compare_exchange_n(&sheng_errno_busy, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++		return;
++	}
++	int pid = proc_getpid(proc);
++	if (pid != sheng_errno_now.pid) {
++		if (sheng_errno_now.count) {
++			sheng_errno_last = sheng_errno_now;
++		}
++		sheng_errno_now.pid = pid;
++		sheng_errno_now.count = 0;
++	}
++	unsigned slot = sheng_errno_now.count++ % SHENG_ERRNO_RING;
++	sheng_errno_now.code[slot] = (uint16_t)code;
++	sheng_errno_now.error[slot] = (uint8_t)error;
++	uint64_t now;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++	if (sheng_errno_last.count && (!sheng_errno_emitted || now - sheng_errno_emitted > 20ULL * NSEC_PER_SEC)) {
++		sheng_errno_emitted = now;
++		sheng_errno_emit();
++	}
++	__atomic_store_n(&sheng_errno_busy, 0, __ATOMIC_RELEASE);
++}
++#endif /* ARM64_BOARD_CONFIG_SHENG */
++
+ extern void
+ unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * proc);
+ 
+@@ -180,6 +248,11 @@
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if defined(ARM64_BOARD_CONFIG_SHENG)
++	if (__improbable(error > 0 && sheng_errno_trace[0])) {
++		sheng_errno_record(proc, code, error);
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ skip_syscall:

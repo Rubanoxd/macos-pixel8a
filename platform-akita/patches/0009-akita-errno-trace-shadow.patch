@@ -1,0 +1,23 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -64,15 +64,15 @@
+ sheng_errno_emit(void)
+ {
+ 	char line[96];
+-	unsigned total = sheng_errno_last.count;
+-	unsigned first = total > SHENG_ERRNO_RING ? total - SHENG_ERRNO_RING : 0;
++	unsigned failed = sheng_errno_last.count;
++	unsigned first = failed > SHENG_ERRNO_RING ? failed - SHENG_ERRNO_RING : 0;
+ 	unsigned n = 0;
+-	for (unsigned i = first; i < total; i++) {
++	for (unsigned i = first; i < failed; i++) {
+ 		unsigned slot = i % SHENG_ERRNO_RING;
+ 		n += (unsigned)snprintf(line + n, sizeof(line) - n, " %u:%u",
+ 		    sheng_errno_last.code[slot], sheng_errno_last.error[slot]);
+-		if (n > 60 || i + 1 == total) {
+-			printf("SHENG-ERRNO: %s[%d] %u failed%s\n", sheng_errno_trace, sheng_errno_last.pid, total, line);
++		if (n > 60 || i + 1 == failed) {
++			printf("SHENG-ERRNO: %s[%d] %u failed%s\n", sheng_errno_trace, sheng_errno_last.pid, failed, line);
+ 			n = 0;
+ 		}
+ 	}

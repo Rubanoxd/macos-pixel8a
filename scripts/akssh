@@ -1,0 +1,2 @@
+#!/bin/bash
+exec ssh -F /Volumes/datos2/unixnu-akita/scratch/sshkeys/ssh_config_full -o BatchMode=yes akita-full "$@"

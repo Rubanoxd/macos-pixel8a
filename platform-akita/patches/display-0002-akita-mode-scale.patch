@@ -1,0 +1,53 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -133,6 +133,9 @@
+     static constexpr unsigned kSwapInfoRing = 6;
+ 
+     PE_Video fVideo{};
++    // akita: the published mode can be smaller than the panel (native-gop-mode-width); WindowServer then lays out a larger UI
++    // and copySurface enlarges its surfaces to the full scanout.
++    uint32_t fModeWidth = 0, fModeHeight = 0;
+     IOMemoryMap *fScanoutMap = nullptr;
+     uint8_t *fHalfToByte = nullptr;     // 'RGhA' surfaces: each half-float channel's 8-bit value, clamped to [0, 1]
+     uint16_t *fRow = nullptr;           // one 'RGhA' row
+@@ -197,6 +200,16 @@
+     }
+     fScanout = reinterpret_cast<uint8_t *>(fScanoutMap->getVirtualAddress());
+     IOLog("NativeGOPDisplay: scanout %#lx %lux%lu row %lu\n", fVideo.v_baseAddr, fVideo.v_width, fVideo.v_height, fVideo.v_rowBytes);
++    fModeWidth = static_cast<uint32_t>(fVideo.v_width);
++    fModeHeight = static_cast<uint32_t>(fVideo.v_height);
++    unsigned modeWidth = 0;
++    if (PE_parse_boot_argn("native-gop-mode-width", &modeWidth, sizeof(modeWidth)) && modeWidth &&
++        modeWidth < fVideo.v_width && modeWidth * 4ULL >= fVideo.v_width &&
++        (fVideo.v_height * modeWidth) % fVideo.v_width == 0) {
++        fModeWidth = modeWidth;
++        fModeHeight = static_cast<uint32_t>(fVideo.v_height * modeWidth / fVideo.v_width);
++    }
++    IOLog("NativeGOPDisplay: mode %ux%u\n", fModeWidth, fModeHeight);
+     if (!IOMobileFramebufferLegacy::start(provider)) {
+         IOLog("NativeGOPDisplay: IOMobileFramebufferLegacy::start failed\n");
+         OSSafeReleaseNULL(fScanoutMap);
+@@ -611,7 +624,7 @@
+ // 8-bit SDR color element. Chromaticities are sRGB's (16.16 fixed point, as the panel's EDID would give them).
+ bool NativeGOPDisplay::createDisplayAttributes()
+ {
+-    uint32_t width = static_cast<uint32_t>(fVideo.v_width), height = static_cast<uint32_t>(fVideo.v_height);
++    uint32_t width = fModeWidth, height = fModeHeight;
+     if (static_cast<uint64_t>(width + 160) * (height + 23) * kRefreshHz > UINT32_MAX)
+         return false;
+     bool done = false;
+@@ -708,10 +721,10 @@
+ {
+     if (colorID != kColorID || timingID != kTimingID)
+         return kIOReturnBadArgument;
+-    at<uint32_t>(this, kDisplayWidth) = static_cast<uint32_t>(fVideo.v_width);
+-    at<uint32_t>(this, kDisplayHeight) = static_cast<uint32_t>(fVideo.v_height);
+-    setProperty("DisplayWidth", fVideo.v_width, 32);
+-    setProperty("DisplayHeight", fVideo.v_height, 32);
++    at<uint32_t>(this, kDisplayWidth) = fModeWidth;
++    at<uint32_t>(this, kDisplayHeight) = fModeHeight;
++    setProperty("DisplayWidth", fModeWidth, 32);
++    setProperty("DisplayHeight", fModeHeight, 32);
+     setProperty("DPTimingModeId", timingID, 32);
+     return kIOReturnSuccess;
+ }

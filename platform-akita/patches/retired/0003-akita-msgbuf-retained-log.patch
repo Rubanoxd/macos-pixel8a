@@ -1,0 +1,28 @@
+--- a/bsd/kern/subr_log.c
++++ b/bsd/kern/subr_log.c
+@@ -79,6 +79,9 @@
+ #include <os/log_private.h>
+ #include <sys/ioctl.h>
+ #include <sys/msgbuf.h>
++#if SHENG
++#include <pexpert/pexpert.h>
++#endif
+ #include <sys/file_internal.h>
+ #include <sys/errno.h>
+ #include <sys/select.h>
+@@ -551,6 +554,15 @@
+ void
+ log_putc_locked(struct msgbuf *mbp, char c)
+ {
++#if SHENG
++	/*
++	 * akita (Pixel 8a): without -v the console stops receiving kernel messages once IOKit is up, and the retained
++	 * log (written to userdata for the next boot) is fed only by the console. Record the kernel message buffer too.
++	 */
++	if (mbp == msgbufp) {
++		sheng_log_putc(c);
++	}
++#endif
+ 	mbp->msg_bufc[mbp->msg_bufx++] = c;
+ 	if (mbp->msg_bufx >= mbp->msg_size) {
+ 		mbp->msg_bufx = 0;

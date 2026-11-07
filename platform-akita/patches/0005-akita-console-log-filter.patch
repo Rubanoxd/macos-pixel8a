@@ -1,0 +1,84 @@
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -287,13 +287,79 @@
+ /*
+  * akita (Pixel 8a): without -v, console output is disabled once IOKit is up, and with it the retained log that
+  * the next boot reads back from userdata. Keep recording what the console would have printed; nothing is drawn.
++ */
++/*
++ * The retained log keeps only its last 64 KiB, and without logd Recovery's launchd prints every job transition
++ * to the console. Lines are gathered and launchd's routine chatter is left out, unless it names a crash or one
++ * of the Recovery UI processes, so the ring keeps what matters. A line in progress on another thread is not
++ * waited for: its characters are recorded unfiltered.
+  */
++static char akita_console_line[256];
++static unsigned akita_console_length;
++static uint32_t akita_console_busy;
++
++static bool
++akita_console_contains(const char *line, unsigned length, const char *pattern)
++{
++	unsigned size = (unsigned)strlen(pattern);
++	for (unsigned at = 0; at + size <= length; at++) {
++		if (memcmp(line + at, pattern, size) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static bool
++akita_console_noise(const char *line, unsigned length)
++{
++	static const char *const keep[] = {
++		"exited due to", "exited with", "SIG", "crash", "Crash", "abort", "panic", "WindowServer",
++		"Language", "Recovery", "recoveryosd", "loginwindow", "deny", "Sandbox", "error = 1",
++	};
++	static const char *const drop[] = {
++		"com.apple.xpc.launchd", "xpcproxy", "shared region", "unnest", "footprint", "re-slid", "not abnormal",
++	};
++	bool noisy = false;
++	for (unsigned i = 0; i < sizeof(drop) / sizeof(drop[0]) && !noisy; i++) {
++		noisy = akita_console_contains(line, length, drop[i]);
++	}
++	if (!noisy) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(keep) / sizeof(keep[0]); i++) {
++		if (akita_console_contains(line, length, keep[i])) {
++			return false;
++		}
++	}
++	return true;
++}
++
+ static void
+ akita_console_record(const char *str, int size)
+ {
+-	while (size-- > 0) {
+-		sheng_log_putc(*str++);
++	uint32_t expected = 0;
++	if (!__atomic_compare_exchange_n(&akita_console_busy, &expected, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++		while (size-- > 0) {
++			sheng_log_putc(*str++);
++		}
++		return;
++	}
++	while (size-- > 0) {
++		char c = *str++;
++		if (akita_console_length < sizeof(akita_console_line)) {
++			akita_console_line[akita_console_length++] = c;
++		}
++		if (c == '\n' || akita_console_length == sizeof(akita_console_line)) {
++			if (!akita_console_noise(akita_console_line, akita_console_length)) {
++				for (unsigned i = 0; i < akita_console_length; i++) {
++					sheng_log_putc(akita_console_line[i]);
++				}
++			}
++			akita_console_length = 0;
++		}
+ 	}
++	__atomic_store_n(&akita_console_busy, 0, __ATOMIC_RELEASE);
+ }
+ #endif /* SHENG */
+ 

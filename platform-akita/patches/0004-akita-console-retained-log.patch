@@ -1,0 +1,50 @@
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -283,10 +283,27 @@
+  *             waiting for an interrupt when the hardware device isn't ready
+  * @param size The number of characters to print to the console.
+  */
++#if SHENG
++/*
++ * akita (Pixel 8a): without -v, console output is disabled once IOKit is up, and with it the retained log that
++ * the next boot reads back from userdata. Keep recording what the console would have printed; nothing is drawn.
++ */
++static void
++akita_console_record(const char *str, int size)
++{
++	while (size-- > 0) {
++		sheng_log_putc(*str++);
++	}
++}
++#endif /* SHENG */
++
+ static inline void
+ _cnputs(char *c, int size, bool poll)
+ {
+ 	if (disableConsoleOutput) {
++#if SHENG
++		akita_console_record(c, size);
++#endif
+ 		return;
+ 	}
+ 
+@@ -532,6 +549,9 @@
+ console_write(char *str, int size)
+ {
+ 	if (disableConsoleOutput) {
++#if SHENG
++		akita_console_record(str, size);
++#endif
+ 		return;
+ 	}
+ 
+@@ -617,6 +637,9 @@
+ console_write_unbuffered(char c)
+ {
+ 	if (disableConsoleOutput) {
++#if SHENG
++		akita_console_record(&c, 1);
++#endif
+ 		return;
+ 	}
+ 

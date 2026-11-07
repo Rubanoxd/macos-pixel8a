@@ -1,0 +1,10 @@
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -316,6 +316,7 @@
+ 	static const char *const keep[] = {
+ 		"exited due to", "exited with", "SIG", "crash", "Crash", "abort", "panic", "WindowServer",
+ 		"Language", "Recovery", "recoveryosd", "loginwindow", "deny", "Sandbox", "error = 1",
++		"disk", "Disk", "storage", "Storage", "apfs", "APFS", "failed lookup",
+ 	};
+ 	static const char *const drop[] = {
+ 		"com.apple.xpc.launchd", "xpcproxy", "shared region", "unnest", "footprint", "re-slid", "not abnormal",

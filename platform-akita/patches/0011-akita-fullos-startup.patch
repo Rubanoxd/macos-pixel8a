@@ -1,0 +1,112 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8076,6 +8076,95 @@ volatile uint32_t sheng_qemu_no_ignition_enabled;
+ volatile uint32_t sheng_development_no_ignition_enabled;
+ #endif
+ 
++#if SHENG
++/*
++ * akita: full macOS startup (boot-args akita-fullos-cryptex=<SystemOS volume UUID>, akita-fullos-data-mb=<MiB>).
++ * The full system volume is the root (root-matching in /chosen). Before launchd, which already needs the dyld shared
++ * cache of the OS cryptex, mount here what a Mac grafts from its Preboot volume and Data volume group:
++ *   tmpfs on /System/Volumes/Preboot, then the SystemOS cryptex volume read-only on its Cryptexes/OS directory,
++ *   and a tmpfs on /System/Volumes/Data (volatile; this container has no Data role volume).
++ * The cryptex volume's /dev node is looked up by UUID through a hook the NativeUfs kext installs. The mounts use the
++ * ordinary syscalls with arguments in init's scratch page (as UniXNU's owner startup does) and are logged.
++ */
++int (*akita_bsdname_for_uuid)(const char *uuid, char *path, size_t size, unsigned wait_ms);
++int akita_fullos_status[6] = {-1, -1, -1, -1, -1, -1};
++
++static int
++akita_fullos_mount(proc_t p, user_addr_t scratch, const char *type, const char *path, const void *data, size_t size,
++    int flags)
++{
++	struct mount_args request = {.type = scratch + 0xa00, .path = scratch + 0xa40, .flags = flags,
++		                     .data = scratch + 0xc00};
++	int32_t result = 0;
++	int error;
++	if ((error = copyout(type, request.type, strlen(type) + 1)) != 0 ||
++	    (error = copyout(path, request.path, strlen(path) + 1)) != 0 ||
++	    (error = copyout(data, request.data, size)) != 0) {
++		return error;
++	}
++	return mount(p, &request, &result);
++}
++
++static int
++akita_fullos_mkdir(proc_t p, user_addr_t scratch, const char *path)
++{
++	struct mkdir_args request = {.path = scratch + 0xa40, .mode = 0755};
++	int32_t result = 0;
++	int error = copyout(path, request.path, strlen(path) + 1);
++	if (error == 0) {
++		error = mkdir(p, &request, &result);
++	}
++	return error == EEXIST ? 0 : error;
++}
++
++static void
++akita_fullos_startup(proc_t p, user_addr_t scratch)
++{
++	char uuid[40] = {0};
++	char device[64] = {0};
++	unsigned data_mb = 0;
++	if (!PE_parse_boot_arg_str("akita-fullos-cryptex", uuid, sizeof(uuid)) || !uuid[0]) {
++		return;
++	}
++	PE_parse_boot_argn("akita-fullos-data-mb", &data_mb, sizeof(data_mb));
++	int *st = akita_fullos_status;
++	for (unsigned waited = 0; waited < 60000 && !akita_bsdname_for_uuid; waited += 100) {
++		delay(100 * 1000);
++	}
++	st[3] = akita_bsdname_for_uuid && akita_bsdname_for_uuid(uuid, device, sizeof(device), 60000) ? 0 : ENODEV;
++	if (st[3] == 0) {
++		uint8_t apfs[0x150] = {0};
++		user_addr_t spec = scratch + 0xe00;
++		uint64_t flags = MNT_RDONLY;
++		uint16_t mode = 1;
++		uint32_t owner = 99;
++		int cerr = copyout(device, spec, strlen(device) + 1);
++		memcpy(apfs, &spec, sizeof(spec));
++		memcpy(apfs + 8, &flags, sizeof(flags));
++		memcpy(apfs + 16, &mode, sizeof(mode));
++		memcpy(apfs + 0x144, &owner, sizeof(owner));
++		memcpy(apfs + 0x148, &owner, sizeof(owner));
++		if (cerr == 0) {
++			st[4] = akita_fullos_mount(p, scratch, "apfs", "/", apfs, sizeof(apfs), MNT_RDONLY | MNT_UNION);
++		} else {
++			st[4] = cerr;
++		}
++		if (st[4] != 0) {
++			uint64_t preboot[3] = {(64ULL << 20) / PAGE_SIZE, 65536, 0};
++			st[0] = akita_fullos_mount(p, scratch, "tmpfs", "/System/Volumes/Preboot", preboot, sizeof(preboot), 0);
++			st[1] = st[0] ? st[0] : akita_fullos_mkdir(p, scratch, "/System/Volumes/Preboot/Cryptexes");
++			st[2] = st[1] ? st[1] : akita_fullos_mkdir(p, scratch, "/System/Volumes/Preboot/Cryptexes/OS");
++			if (st[2] == 0) {
++				st[4] = akita_fullos_mount(p, scratch, "apfs", "/System/Volumes/Preboot/Cryptexes/OS", apfs, sizeof(apfs),
++				    MNT_RDONLY);
++			}
++		}
++	}
++	if (data_mb) {
++		uint64_t data[3] = {((uint64_t)data_mb << 20) / PAGE_SIZE, 1 << 20, 0};
++		st[5] = akita_fullos_mount(p, scratch, "tmpfs", "/System/Volumes/Data", data, sizeof(data), 0);
++	}
++	printf("AKITA: full macOS startup preboot=%d dirs=%d,%d device=%s(%d) cryptex=%d data=%d\n",
++	    st[0], st[1], st[2], device[0] ? device : "-", st[3], st[4], st[5]);
++}
++#endif /* SHENG */
++
+ void
+ load_init_program(proc_t p)
+ {
+@@ -8110,6 +8199,9 @@ load_init_program(proc_t p)
+ 
+ 	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
+ 	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
++#if SHENG
++	akita_fullos_startup(p, (user_addr_t)scratch_addr);
++#endif
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */

@@ -1,0 +1,3 @@
+#!/bin/bash
+# Run a shell command on the phone (fullos, launchd inetd shell on 2325). Usage: akx 'cmd' [timeout_s]
+( printf '%s\nexit\n' "$1"; sleep ${2:-30} ) | nc -G 3 169.254.7.2 2325

@@ -1,0 +1,23 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8162,6 +8162,20 @@ akita_fullos_startup(proc_t p, user_addr_t scratch)
+ 	}
+ 	printf("AKITA: full macOS startup preboot=%d dirs=%d,%d device=%s(%d) cryptex=%d data=%d\n",
+ 	    st[0], st[1], st[2], device[0] ? device : "-", st[3], st[4], st[5]);
++	/*
++	 * Without a Data volume (and so without firmlinks) the writable places of the system live on the read-only root.
++	 * akita-fullos-union-mb=<MiB>: a volatile tmpfs unioned over each of them, so the root's contents stay visible.
++	 */
++	unsigned union_mb = 0;
++	if (PE_parse_boot_argn("akita-fullos-union-mb", &union_mb, sizeof(union_mb)) && union_mb) {
++		static const char *const unions[] = {"/private", "/Library", "/Users"};
++		int ust[3] = {-1, -1, -1};
++		for (unsigned i = 0; i < 3; i++) {
++			uint64_t args[3] = {((uint64_t)union_mb << 20) / PAGE_SIZE, 1 << 20, 0};
++			ust[i] = akita_fullos_mount(p, scratch, "tmpfs", unions[i], args, sizeof(args), MNT_UNION);
++		}
++		printf("AKITA: full macOS unions private=%d Library=%d Users=%d\n", ust[0], ust[1], ust[2]);
++	}
+ }
+ #endif /* SHENG */
+ 

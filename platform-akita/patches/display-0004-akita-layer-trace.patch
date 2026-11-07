@@ -1,0 +1,40 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -746,9 +746,34 @@
+     }
+     return 1;
+ }
+-IOReturn NativeGOPDisplay::swap_layer_map(IOMFBSwapIORequest *, unsigned int) {return kIOReturnSuccess;}
+-IOReturn NativeGOPDisplay::surface_layer_map(IOMFB::AP::DisplayedData *, unsigned int, IOSurface *) {return kIOReturnSuccess;}
+-IOReturn NativeGOPDisplay::surface_layer_unmap(IOMFB::AP::DisplayedData *, unsigned int) {return kIOReturnSuccess;}
++// akita bring-up: which layers the family maps, and with which surfaces (menus and the cursor arrive as extra layers).
++static unsigned gLayerTrace;
++IOReturn NativeGOPDisplay::swap_layer_map(IOMFBSwapIORequest *swap, unsigned int layer)
++{
++    if (gLayerTrace < 48) {
++        gLayerTrace++;
++        IOLog("NativeGOPDisplay: swap_layer_map swap %p layer %u mask %#x\n", swap, layer, at<uint8_t>(swap, kSwapLayers));
++    }
++    return kIOReturnSuccess;
++}
++IOReturn NativeGOPDisplay::surface_layer_map(IOMFB::AP::DisplayedData *data, unsigned int layer, IOSurface *surface)
++{
++    if (gLayerTrace < 48) {
++        gLayerTrace++;
++        IOLog("NativeGOPDisplay: surface_layer_map data %p layer %u surface %p %llux%llu %#x\n", data, layer, surface,
++              surface ? ioSurfaceWidth(surface) : 0, surface ? ioSurfaceHeight(surface) : 0,
++              surface ? ioSurfacePixelFormat(surface) : 0);
++    }
++    return kIOReturnSuccess;
++}
++IOReturn NativeGOPDisplay::surface_layer_unmap(IOMFB::AP::DisplayedData *data, unsigned int layer)
++{
++    if (gLayerTrace < 48) {
++        gLayerTrace++;
++        IOLog("NativeGOPDisplay: surface_layer_unmap data %p layer %u\n", data, layer);
++    }
++    return kIOReturnSuccess;
++}
+ IOReturn NativeGOPDisplay::set_display_device(unsigned int) {return kIOReturnSuccess;}
+ IOReturn NativeGOPDisplay::get_gamma_table(IOMFBGammaTable *) {return kIOReturnUnsupported;}
+ IOReturn NativeGOPDisplay::set_gamma_table(IOMFBGammaTable *) {return kIOReturnSuccess;}

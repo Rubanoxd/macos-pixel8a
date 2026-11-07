@@ -1,0 +1,310 @@
+diff --git a/package/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c b/package/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c
+index 7d4def5..a06acae 100644
+--- a/package/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c
++++ b/package/UniXNUPkg/Driver/UniXNURamDiskDxe/UniXNURamDiskDxe.c
+@@ -33,6 +33,15 @@ ReadCells (
+   return Fdt32ToCpu (ReadUnaligned32 (Data));
+ }
+ 
++// Mu-Silicium SEC stores the address right behind the firmware volume in the
++// loaded kernel image here: a payload appended to the kernel field.
++STATIC CONST EFI_GUID mKernelPayloadHobGuid = {
++  0xED7FAD14, 0x5950, 0x4B58, { 0xBE, 0xB8, 0x0F, 0xF4, 0x4D, 0x11, 0xF5, 0xA8 }
++};
++
++// Largest payload looked for behind the firmware volume.
++#define KERNEL_PAYLOAD_MAX  SIZE_256MB
++
+ #define RAM_BLOCK_SIZE  512
+ 
+ #pragma pack(1)
+@@ -128,13 +137,116 @@ STATIC EFI_BLOCK_IO_PROTOCOL  mBlockIo = {
+   RamBlockFlush
+ };
+ 
++STATIC
++BOOLEAN
++IsFatBootSector (
++  IN  CONST UINT8  *Sector,
++  IN  UINT64       Available,
++  OUT UINT64       *VolumeBytes
++  )
++{
++  UINT16  BytesPerSector;
++  UINT64  Sectors;
++
++  if ((Sector[510] != 0x55) || (Sector[511] != 0xAA) || ((Sector[0] != 0xEB) && (Sector[0] != 0xE9))) {
++    return FALSE;
++  }
++
++  BytesPerSector = (UINT16)(Sector[11] | (Sector[12] << 8));
++  Sectors        = (UINT64)(Sector[19] | (Sector[20] << 8));
++  if (Sectors == 0) {
++    Sectors = (UINT64)Sector[32] | ((UINT64)Sector[33] << 8) | ((UINT64)Sector[34] << 16) | ((UINT64)Sector[35] << 24);
++  }
++
++  if ((BytesPerSector != RAM_BLOCK_SIZE) || (Sector[13] == 0) || (Sector[16] == 0) || (Sectors == 0) ||
++      (Sectors * RAM_BLOCK_SIZE > Available))
++  {
++    return FALSE;
++  }
++
++  *VolumeBytes = Sectors * RAM_BLOCK_SIZE;
++  return TRUE;
++}
++
++/**
++  Narrow [*Start, *End) to the first FAT volume in it, scanning sector by sector.
++**/
++STATIC
++BOOLEAN
++FindFatVolume (
++  IN OUT UINT64  *Start,
++  IN OUT UINT64  *End
++  )
++{
++  UINT64  Offset;
++  UINT64  Bytes;
++
++  for (Offset = *Start; Offset + RAM_BLOCK_SIZE <= *End; Offset += RAM_BLOCK_SIZE) {
++    if (IsFatBootSector ((CONST UINT8 *)(UINTN)Offset, *End - Offset, &Bytes)) {
++      *Start = Offset;
++      *End   = Offset + Bytes;
++      return TRUE;
++    }
++  }
++
++  return FALSE;
++}
++
++STATIC
++BOOLEAN
++PublishVolume (
++  IN UINT64  Start,
++  IN UINT64  End
++  )
++{
++  EFI_STATUS  Status;
++  EFI_HANDLE  Handle;
++
++  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: FAT volume 0x%lx-0x%lx\n", Start, End));
++
++  //
++  // Claim the initrd pages: on Mu-Silicium ports whose RAM manager publishes
++  // the DRAM as conventional memory, nothing else keeps them out of the
++  // allocator while the payload is in use.
++  //
++  {
++    EFI_PHYSICAL_ADDRESS  Claim = Start & ~(EFI_PHYSICAL_ADDRESS)EFI_PAGE_MASK;
++
++    Status = gBS->AllocatePages (AllocateAddress, EfiBootServicesData, EFI_SIZE_TO_PAGES (End - Claim), &Claim);
++    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: claim initrd pages %r\n", Status));
++  }
++
++  mRamBase                = (UINT8 *)(UINTN)Start;
++  mMedia.MediaId          = 1;
++  mMedia.RemovableMedia   = FALSE;
++  mMedia.MediaPresent     = TRUE;
++  mMedia.LogicalPartition = FALSE;
++  mMedia.ReadOnly         = TRUE;
++  mMedia.WriteCaching     = FALSE;
++  mMedia.BlockSize        = RAM_BLOCK_SIZE;
++  mMedia.IoAlign          = 1;
++  mMedia.LastBlock        = (End - Start) / RAM_BLOCK_SIZE - 1;
++
++  Handle = NULL;
++  Status = gBS->InstallMultipleProtocolInterfaces (
++                  &Handle,
++                  &gEfiDevicePathProtocolGuid,
++                  &mDevicePath,
++                  &gEfiBlockIoProtocolGuid,
++                  &mBlockIo,
++                  NULL
++                  );
++  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: initrd block device 0x%lx size 0x%lx %r\n", Start, End - Start, Status));
++  return !EFI_ERROR (Status);
++}
++
++
+ STATIC
+ VOID
+ PublishInitrd (
+   IN CONST VOID  *Fdt
+   )
+ {
+-  EFI_STATUS  Status;
+   INT32       Chosen;
+   CONST VOID  *StartProp;
+   CONST VOID  *EndProp;
+@@ -142,7 +254,6 @@ PublishInitrd (
+   INT32       EndLength;
+   UINT64      Start;
+   UINT64      End;
+-  EFI_HANDLE  Handle;
+ 
+   Chosen = FdtPathOffset (Fdt, "/chosen");
+   if (Chosen < 0) {
+@@ -161,32 +272,53 @@ PublishInitrd (
+ 
+   Start = ReadCells (StartProp, StartLength / 4);
+   End   = ReadCells (EndProp, EndLength / 4);
+-  if ((End <= Start) || (((End - Start) % RAM_BLOCK_SIZE) != 0)) {
+-    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: initrd 0x%lx-0x%lx is not a whole number of sectors\n", Start, End));
++  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: initrd 0x%lx-0x%lx\n", Start, End));
++  if (End <= Start) {
+     return;
+   }
+ 
+-  mRamBase                = (UINT8 *)(UINTN)Start;
+-  mMedia.MediaId          = 1;
+-  mMedia.RemovableMedia   = FALSE;
+-  mMedia.MediaPresent     = TRUE;
+-  mMedia.LogicalPartition = FALSE;
+-  mMedia.ReadOnly         = TRUE;
+-  mMedia.WriteCaching     = FALSE;
+-  mMedia.BlockSize        = RAM_BLOCK_SIZE;
+-  mMedia.IoAlign          = 1;
+-  mMedia.LastBlock        = (End - Start) / RAM_BLOCK_SIZE - 1;
++  //
++  // Bootloaders that concatenate ramdisks (Android boot header v4: vendor_boot
++  // fragments first, then the boot image's) put the payload after other data.
++  // Publish the FAT volume wherever it starts.
++  //
++  if (!FindFatVolume (&Start, &End)) {
++    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: no FAT volume in the initrd\n"));
++    return;
++  }
+ 
+-  Handle = NULL;
+-  Status = gBS->InstallMultipleProtocolInterfaces (
+-                  &Handle,
+-                  &gEfiDevicePathProtocolGuid,
+-                  &mDevicePath,
+-                  &gEfiBlockIoProtocolGuid,
+-                  &mBlockIo,
+-                  NULL
+-                  );
+-  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: initrd block device 0x%lx size 0x%lx %r\n", Start, End - Start, Status));
++  PublishVolume (Start, End);
++}
++
++/**
++  Android 13+ bootloaders with an init_boot partition drop the boot image
++  ramdisk; a payload appended to the kernel field after the firmware volume
++  is loaded with the kernel instead.
++**/
++STATIC
++VOID
++PublishKernelPayload (
++  VOID
++  )
++{
++  EFI_HOB_GUID_TYPE  *Hob;
++  UINT64             Start;
++  UINT64             Bytes;
++
++  Hob = GetFirstGuidHob (&mKernelPayloadHobGuid);
++  if ((Hob == NULL) || (GET_GUID_HOB_DATA_SIZE (Hob) < sizeof (UINT64))) {
++    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: no kernel image payload HOB\n"));
++    return;
++  }
++
++  Start = ReadUnaligned64 ((CONST UINT64 *)GET_GUID_HOB_DATA (Hob));
++  if (!IsFatBootSector ((CONST UINT8 *)(UINTN)Start, KERNEL_PAYLOAD_MAX, &Bytes)) {
++    DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: no FAT volume behind the firmware at 0x%lx\n", Start));
++    return;
++  }
++
++  DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: kernel image payload 0x%lx-0x%lx\n", Start, Start + Bytes));
++  PublishVolume (Start, Start + Bytes);
+ }
+ 
+ EFI_STATUS
+@@ -218,5 +350,9 @@ UniXNURamDiskDxeEntry (
+   DEBUG ((DEBUG_ERROR, "UNIXNURAMDISK: device tree at 0x%lx, %u bytes\n", Dtb, (UINT32)FdtTotalSize ((VOID *)(UINTN)Dtb)));
+ 
+   PublishInitrd ((VOID *)(UINTN)Dtb);
++  if (mRamBase == NULL) {
++    PublishKernelPayload ();
++  }
++
+   return EFI_SUCCESS;
+ }
+diff --git a/scripts/patch-xnu-entry-probe.py b/scripts/patch-xnu-entry-probe.py
+index 9e3e598..7b93244 100644
+--- a/scripts/patch-xnu-entry-probe.py
++++ b/scripts/patch-xnu-entry-probe.py
+@@ -84,13 +84,7 @@ _start:
+   mrs x1, cntpct_el0
+   cmp x1, x2
+   b.lo 1b
+-  movz w0, #0x0009
+-  movk w0, #0x8400, lsl #16
+-  mov x1, xzr
+-  mov x2, xzr
+-  mov x3, xzr
+-  smc #0
+-2:
++{prep}{reset}2:
+   wfe
+   b 2b
+ """ + ".ltorg\n",
+@@ -106,28 +100,35 @@ _start:
+   mrs x1, cntpct_el0
+   cmp x1, x2
+   b.lo 1b
+-  movz w0, #0x0009
+-  movk w0, #0x8400, lsl #16
+-  mov x1, xzr
+-  mov x2, xzr
+-  mov x3, xzr
+-  smc #0
+-2:
++{prep}{reset}2:
+   wfe
+   b 2b
+ """ + ".ltorg\n",
+ }
+ 
++# UNIXNU_PROBE_RESET_PREP_SMC="fid,x1,x2,x3" issues one SMC before each PSCI reset, e.g. to set
++# the reboot mode a board's bootloader reads (akita: Tensor PMU write of 0xfc = bootloader).
++_PREP = os.environ.get('UNIXNU_PROBE_RESET_PREP_SMC', '')
++def _mov32(reg, value):
++    # movz/movk keep the code small (the caves are tight); values are 32-bit at most.
++    if value < 0x10000:
++        return f'  mov x{reg}, #{value:#x}\n'
++    return f'  movz w{reg}, #{value & 0xffff:#x}\n  movk w{reg}, #{value >> 16:#x}, lsl #16\n'
++
++
++PREP = (''.join(_mov32(i, int(v, 0)) for i, v in enumerate(_PREP.split(','))) + '  smc #0\n') if _PREP else ''
++# UNIXNU_PROBE_RESET_WARM=1 resets with PSCI SYSTEM_RESET2 (warm; SMC64) in place of SYSTEM_RESET.
++# Pixel (Tensor) Linux always restarts warm (dss.ko sets reboot_mode); a cold reset clears the
++# PMU reboot mode, so a probe reset lands in Android. If SYSTEM_RESET2 returns, the code waits
++# (the board's watchdog resets later).
++RESET = ('  movz w0, #0x0012\n  movk w0, #0xc400, lsl #16\n  mov x1, xzr\n  mov x2, xzr\n  smc #0\n'
++         if os.environ.get('UNIXNU_PROBE_RESET_WARM') == '1' else
++         '  movz w0, #0x0009\n  movk w0, #0x8400, lsl #16\n  smc #0\n')
++
+ RESET_BEFORE = """.text
+ .global _start
+ _start:
+-  movz w0, #0x0009
+-  movk w0, #0x8400, lsl #16
+-  mov x1, xzr
+-  mov x2, xzr
+-  mov x3, xzr
+-  smc #0
+-1:
++{prep}{reset}1:
+   wfe
+   b 1b
+ """
+@@ -397,7 +398,7 @@ def main():
+ 
+     with tempfile.TemporaryDirectory() as tmp:
+         for site, stage, symbols in sites:
+-            source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
++            source = RESET_BEFORE.format(prep=PREP, reset=RESET) if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay, prep=PREP, reset=RESET)
+             code = assemble(source, CAVES[stage], symbols, Path(tmp))
+             if len(code) > CAVE_SIZE:
+                 raise SystemExit(f'Stage {stage} code is too large')

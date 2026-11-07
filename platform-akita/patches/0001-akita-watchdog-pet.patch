@@ -1,0 +1,61 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -708,8 +708,48 @@
+ /*
+  * Now running in a thread.  Kick off other services,
+  * invoke user bootstrap, enter pageout loop.
++ */
++#if SHENG
++/*
++ * akita (Pixel 8a): the firmware arms the cluster-0 watchdog (WTCON at 0x10060000) with its longest
++ * period and the reboot mode "bootloader", so a hang ends in fastboot. A boot that is merely slow must
++ * not: with akita-wdt-pet-seconds=N this thread reloads the counter every 10 s for N seconds. Without
++ * the argument, or with the watchdog stopped, it does nothing.
+  */
++#include <arm/machine_routines.h>
+ static void
++akita_watchdog_pet_thread(void *argument, __unused wait_result_t result)
++{
++	volatile uint32_t *wdt = (volatile uint32_t *)(uintptr_t)argument;
++	unsigned seconds = 0;
++	PE_parse_boot_argn("akita-wdt-pet-seconds", &seconds, sizeof(seconds));
++	for (unsigned elapsed = 0; elapsed < seconds; elapsed += 10) {
++		wdt[2] = 0xffff;                /* WTCNT: back to the full period */
++		assert_wait_timeout((event_t)argument, THREAD_UNINT, 10, NSEC_PER_SEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static void
++akita_watchdog_pet_start(void)
++{
++	unsigned seconds = 0;
++	if (!PE_parse_boot_argn("akita-wdt-pet-seconds", &seconds, sizeof(seconds)) || !seconds) {
++		return;
++	}
++	volatile uint32_t *wdt = (volatile uint32_t *)ml_io_map(0x10060000ULL, 0x1000);
++	if (!wdt || !(wdt[0] & (1U << 5))) {
++		return;
++	}
++	wdt[2] = 0xffff;
++	thread_t thread;
++	if (kernel_thread_start(akita_watchdog_pet_thread, (void *)(uintptr_t)wdt, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* SHENG */
++
++static void
+ kernel_bootstrap_thread(void)
+ {
+ 	processor_t processor = current_processor();
+@@ -738,6 +778,9 @@
+ 	 */
+ 	kernel_bootstrap_thread_log("thread_daemon_init");
+ 	thread_daemon_init();
++#if SHENG
++	akita_watchdog_pet_start();
++#endif
+ 
+ 	/*
+ 	 * Thread callout service.

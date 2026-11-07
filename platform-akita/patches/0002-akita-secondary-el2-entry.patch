@@ -1,0 +1,48 @@
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -131,6 +131,45 @@
+ 	.align	7
+ 	.globl EXT(reset_vector)
+ LEXT(reset_vector)
++#if SHENG
++	/*
++	 * akita (Pixel 8a): the EL3 firmware starts PSCI CPU_ON cores at EL2, where the UEFI firmware ran. Set EL2 up
++	 * as DarwinBoot does for the boot CPU (AArch64 EL1, PAC keys and instructions not trapped, physical timer and
++	 * GICv3 system registers for EL1, no stage 2) and continue below at EL1h with interrupts masked. Only x9 is
++	 * used: x0 carries the PSCI context. A core already at EL1 skips this.
++	 */
++	mrs		x9, CurrentEL
++	cmp		x9, #8
++	b.ne	Lreset_vector_el1
++	mov		x9, #3
++	lsl		x9, x9, #40
++	orr		x9, x9, #(1 << 31)
++	msr		HCR_EL2, x9
++	mov		x9, #3
++	msr		CNTHCTL_EL2, x9
++	msr		CNTVOFF_EL2, xzr
++	mov		x9, #0x33FF
++	msr		CPTR_EL2, x9
++	msr		HSTR_EL2, xzr
++	msr		MDCR_EL2, xzr
++	mrs		x9, MIDR_EL1
++	msr		VPIDR_EL2, x9
++	mrs		x9, MPIDR_EL1
++	msr		VMPIDR_EL2, x9
++	msr		VTTBR_EL2, xzr
++	mov		x9, #0xF
++	msr		S3_4_C12_C9_5, x9			// ICC_SRE_EL2: SRE, DFB, DIB, Enable
++	mov		x9, #0x0800
++	movk	x9, #0x30D0, lsl #16
++	msr		SCTLR_EL1, x9				// reset value: MMU and caches off
++	adr		x9, Lreset_vector_el1
++	msr		ELR_EL2, x9
++	mov		x9, #0x3C5
++	msr		SPSR_EL2, x9
++	isb
++	eret
++Lreset_vector_el1:
++#endif /* SHENG */
+ 	// Preserve x0 for start_first_cpu, if called
+ 	// Unlock the core for debugging
+ #if !SHENG

@@ -1,0 +1,144 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -137,6 +137,16 @@
+     uint8_t *fHalfToByte = nullptr;     // 'RGhA' surfaces: each half-float channel's 8-bit value, clamped to [0, 1]
+     uint16_t *fRow = nullptr;           // one 'RGhA' row
+     uint64_t fRowBytes = 0;
++    // akita: WindowServer repaints only what changed since the last frame into whichever surface it renders next, as if that
++    // surface still held the previous frame. With two surfaces in turn each one collects its own stale pixels (old cursors,
++    // old selections) and copying a whole surface shows them. Keep each surface's last contents and copy only the pixels
++    // WindowServer changed in it, so the scanout accumulates exactly what was drawn.
++    static constexpr unsigned kShadowSlots = 4;
++    struct Shadow { IOSurface *surface; uint32_t *pixels; uint64_t bytes, used; };
++    Shadow fShadow[kShadowSlots]{};
++    uint32_t *fConverted = nullptr;     // one converted scanout row
++    uint64_t fConvertedBytes = 0, fShadowUse = 0, fChangedPixels = 0;
++    Shadow *shadowFor(IOSurface *, uint64_t bytes, bool *fresh);
+     uint8_t *fScanout = nullptr;
+     IOTimerEventSource *fVBL = nullptr;
+     DisplayColorRemapMode fColorRemapMode = static_cast<DisplayColorRemapMode>(0);
+@@ -203,6 +213,14 @@
+         IOFree(fHalfToByte, 65536);
+     if (fRow)
+         IOFree(fRow, fRowBytes);
++    for (auto &slot : fShadow) {
++        if (slot.pixels)
++            IOFree(slot.pixels, slot.bytes);
++        slot = {};
++    }
++    if (fConverted)
++        IOFree(fConverted, fConvertedBytes);
++    fConverted = nullptr;
+     fHalfToByte = nullptr;
+     fRow = nullptr;
+     OSSafeReleaseNULL(fScanoutMap);
+@@ -346,6 +364,20 @@
+     if (shape != fLayerShape) {
+         fLayerShape = shape;
+         IOLog("NativeGOPDisplay: swap mask=%#x scanout layer=%d\n", mask, selected);
++        // akita bring-up: each layer's surface and the swap record words around the layer mask, to locate the
++        // per-layer rectangles (menus and the cursor arrive as extra layers).
++        static unsigned dumps;
++        if ((mask & (mask - 1)) && dumps < 8) {
++            dumps++;
++            for (unsigned i = 0; i < kNativeGopSwapLayerCount; i++)
++                if (surfaces[i])
++                    IOLog("NativeGOPDisplay: layer %u %llux%llu %#x\n", i, geometry[i].width, geometry[i].height, geometry[i].format);
++            const uint32_t *words = reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(swap) + 560);
++            for (unsigned row = 0; row < 14; row++)
++                IOLog("NativeGOPDisplay: rec+%u: %x %x %x %x %x %x %x %x\n", 560 + row * 32,
++                      words[row * 8], words[row * 8 + 1], words[row * 8 + 2], words[row * 8 + 3],
++                      words[row * 8 + 4], words[row * 8 + 5], words[row * 8 + 6], words[row * 8 + 7]);
++        }
+     }
+     if (selected >= 0)
+         copySurface(surfaces[selected]);
+@@ -367,6 +399,34 @@
+     return static_cast<uint8_t>((scaled + (1u << (shift - 1))) >> shift);
+ }
+ 
++// The shadow of a surface: its pixels as last converted. A surface not seen before (or after its slot was reused) is fresh
++// and is copied whole.
++NativeGOPDisplay::Shadow *NativeGOPDisplay::shadowFor(IOSurface *surface, uint64_t bytes, bool *fresh)
++{
++    Shadow *victim = &fShadow[0];
++    for (auto &slot : fShadow) {
++        if (slot.surface == surface && slot.bytes == bytes) {
++            slot.used = ++fShadowUse;
++            *fresh = false;
++            return &slot;
++        }
++        if (slot.used < victim->used)
++            victim = &slot;
++    }
++    if (victim->bytes != bytes) {
++        if (victim->pixels)
++            IOFree(victim->pixels, victim->bytes);
++        victim->pixels = static_cast<uint32_t *>(IOMalloc(bytes));
++        victim->bytes = victim->pixels ? bytes : 0;
++    }
++    if (!victim->pixels)
++        return nullptr;
++    victim->surface = surface;
++    victim->used = ++fShadowUse;
++    *fresh = true;
++    return victim;
++}
++
+ void NativeGOPDisplay::copySurface(IOSurface *surface)
+ {
+     uint64_t width = ioSurfaceWidth(surface), height = ioSurfaceHeight(surface), rowBytes = ioSurfaceBytesPerRow(surface);
+@@ -407,6 +467,18 @@
+         fRow = replacement;
+         fRowBytes = sourceRowBytes;
+     }
++    if (fConvertedBytes < copyWidth * 4) {
++        auto *replacement = static_cast<uint32_t *>(IOMalloc(copyWidth * 4));
++        if (!replacement) return;
++        if (fConverted) IOFree(fConverted, fConvertedBytes);
++        fConverted = replacement;
++        fConvertedBytes = copyWidth * 4;
++    }
++    bool fresh = true;
++    Shadow *shadow = shadowFor(surface, copyWidth * copyHeight * 4, &fresh);
++    if (!fFrames)
++        fresh = true;
++    uint64_t changed = 0;
+     if (memory->prepare() != kIOReturnSuccess)
+         return;
+     struct FrameRead {
+@@ -460,8 +532,21 @@
+         uint64_t saved;
+         if (!sheng_fb_begin(SHENG_FB_GUI, &saved)) return;
+         auto *pixels = reinterpret_cast<volatile uint32_t *>(line);
+-        nativeGopScanoutRow(pixels, copyWidth, fRow, width,
+-                           format == kFormatRGhA ? fHalfToByte : nullptr);
++        if (!shadow) {
++            nativeGopScanoutRow(pixels, copyWidth, fRow, width,
++                               format == kFormatRGhA ? fHalfToByte : nullptr);
++        } else {
++            nativeGopScanoutRow(reinterpret_cast<volatile uint32_t *>(fConverted), copyWidth, fRow, width,
++                               format == kFormatRGhA ? fHalfToByte : nullptr);
++            uint32_t *previous = shadow->pixels + y * copyWidth;
++            for (uint64_t x = 0; x < copyWidth; x++) {
++                if (fresh || fConverted[x] != previous[x]) {
++                    pixels[x] = fConverted[x];
++                    previous[x] = fConverted[x];
++                    changed++;
++                }
++            }
++        }
+         sheng_fb_end(saved);
+         if (sample && format == kFormatRGhA) {
+             for (uint64_t x = 0; x < copyWidth; x++) {
+@@ -483,6 +568,10 @@
+     }
+     fLastLit = lit;
+     fLastCenter = center;
++    fChangedPixels = changed;
++    if (fFrames <= 8 || fFrames % 200 == 0)
++        IOLog("NativeGOPDisplay: frame %llu surface %p %s, %llu pixels changed\n", fFrames, surface,
++              !shadow ? "unshadowed" : fresh ? "fresh" : "diffed", changed);
+     if (format == kFormatRGhA && (fFrames <= 8 || fFrames % 50 == 0))
+         IOLog("NativeGOPDisplay: frame %llu: %llu pixels lit, %llu nonzero, centre %#llx\n", fFrames, lit, raw, center);
+ }

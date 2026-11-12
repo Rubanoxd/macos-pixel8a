@@ -454,7 +454,8 @@ uint32_t gShared, gPcieCore = 0x18001000;
 constexpr uint32_t kRingOff[5] = {0x0000, 0x1000, 0x9000, 0xA000, 0x10000};
 constexpr uint32_t kScratch = 0x1A000, kRingUpd = 0x1B000, kIoctlReq = 0x1C000, kIoctlResp = 0x1E000 /* 8 x 8 KB */, kEvent = 0x2E000 /* 8 x 2 KB */;
 constexpr uint32_t kIdx = 0x30000;   // DMA index buffer (4-byte indices): h2d w, h2d r, d2h w, d2h r
-constexpr uint32_t kDmaSize = 0x40000;
+constexpr uint32_t kDmaSize = 0x400000;   // 4 MB in the low bank: rings, control buffers, flow ring, 256 RX and 256 TX buffers
+constexpr uint32_t kFlowRing = 0x40000, kRxBuf = 0x100000, kTxBuf = 0x200000, kNumRx = 256, kNumTx = 256, kBufSz = 2048;
 void bell() { ramPut(gPcieCore + 0xA20, 1); }   // H2D_MAILBOX_0 (PCIe2 core rev >= 64)
 uint8_t *ringSlot(Ring &r, uint16_t i) { return gDma.va + r.off + i * r.itemsz; }
 inline uint32_t hidx(uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(gDma.va + off); }
@@ -634,6 +635,8 @@ int console() {
 
 // ---- Stage 21 (after 8): CLM blob, events, up, escan; the networks found go to the log ----
 uint16_t gTrans = 2;
+bool gLinkUp, gKeyed;
+void onLink();
 unsigned gScanSeen;
 uint32_t gRxOff;
 inline uint32_t be32(const uint8_t *p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
@@ -648,7 +651,9 @@ void repost(uint32_t id) {   // give a consumed ioctl-response or event buffer b
 void onEvent(const uint8_t *pkt, uint16_t len) {
   if (len < 72) return;
   const uint32_t type = be32(pkt + 28), status = be32(pkt + 32), dlen = be32(pkt + 44);
-  if (type != 69) { printf("pcie: event %u status %u\n", type, status); return; }   // WLC_E_ESCAN_RESULT
+  if (type == 16) gLinkUp = (pkt[27] & 1) != 0;   // WLC_E_LINK: flags (big endian u16 at +26), bit 0 = link up
+  if (type == 46 && status == 6) gKeyed = true;  // WLC_E_PSK_SUP, WLC_SUP_KEYED
+  if (type != 69) { printf("pcie: event %u status %u reason %u flags %#x\n", type, status, be32(pkt + 36), (pkt[26] << 8) | pkt[27]); onLink(); return; }   // not WLC_E_ESCAN_RESULT
   if (status != 8 || dlen < 12) { printf("pcie: scan done (status %u), %u networks seen\n", status, gScanSeen); return; }
   const uint8_t *r = pkt + 72;   // wl_escan_result: buflen, version, sync_id, bss_count, bss_info[]
   uint16_t count; memcpy(&count, r + 10, 2);
@@ -757,6 +762,208 @@ int wifiScan() {
   return gScanSeen ? 0 : 1;
 }
 
+// ---- Stage 22: join a WPA2-PSK network with the firmware's own supplicant (sup_wpa). The network comes from
+// /Users/akita/.akita/wifi/network.conf, written by the user: "ssid=<name>" and "psk=<passphrase>" lines. ----
+int wifiJoin() {
+  if (!gDma.va) { printf("pcie: stage 22: run stages 8 and 21 first\n"); return 1; }
+  char conf[512] = {};
+  const int n = readFile("/Users/akita/.akita/wifi/network.conf", reinterpret_cast<uint8_t *>(conf), sizeof conf - 1);
+  if (n <= 0) { printf("pcie: stage 22: no /Users/akita/.akita/wifi/network.conf\n"); return 1; }
+  char ssid[33] = {}, psk[65] = {};
+  for (char *line = conf; line && *line;) {
+    char *end = strchr(line, '\n'); if (end) *end = 0;
+    size_t l = strlen(line); while (l && (line[l - 1] == '\r' || line[l - 1] == ' ')) line[--l] = 0;
+    if (!strncmp(line, "ssid=", 5)) strlcpy(ssid, line + 5, sizeof ssid);
+    if (!strncmp(line, "psk=", 4)) strlcpy(psk, line + 4, sizeof psk);
+    line = end ? end + 1 : nullptr;
+  }
+  const size_t slen = strlen(ssid), plen = strlen(psk);
+  if (!slen || plen < 8) { printf("pcie: stage 22: network.conf needs ssid= and a psk= of 8..63 characters\n"); return 1; }
+  printf("pcie: stage 22: joining a network (%zu-character name)\n", slen);   // the name and passphrase never go to the log
+  gLinkUp = gKeyed = false;
+  uint8_t v[4];
+  auto set32 = [&](uint32_t cmd, uint32_t val) { memcpy(v, &val, 4); return ioctl(cmd, v, 4, 0); };
+  int r1 = set32(20, 1);            // WLC_SET_INFRA
+  int r2 = set32(22, 0);            // WLC_SET_AUTH open
+  int r3 = set32(134, 4);           // WLC_SET_WSEC AES
+  int r4 = set32(165, 0x80);        // WLC_SET_WPA_AUTH WPA2-PSK
+  uint32_t one = 1;
+  int r5 = iovarSet("sup_wpa", &one, 4);
+  uint8_t pmk[68] = {};
+  const uint16_t kl = static_cast<uint16_t>(plen), fl = 1;   // WSEC_PASSPHRASE
+  memcpy(pmk, &kl, 2); memcpy(pmk + 2, &fl, 2); memcpy(pmk + 4, psk, plen);
+  int r6 = ioctl(268, pmk, sizeof pmk, 0);   // WLC_SET_WSEC_PMK
+  memset(psk, 0, sizeof psk); memset(pmk, 0, sizeof pmk); memset(conf, 0, sizeof conf);
+  uint8_t ss[36] = {};
+  const uint32_t sl = static_cast<uint32_t>(slen); memcpy(ss, &sl, 4); memcpy(ss + 4, ssid, slen);
+  int r7 = ioctl(26, ss, sizeof ss, 0);      // WLC_SET_SSID: start the join
+  printf("pcie: stage 22: infra %d auth %d wsec %d wpa_auth %d sup_wpa %d pmk %d join %d\n", r1, r2, r3, r4, r5, r6, r7);
+  for (unsigned ms = 0; ms < 20000 && !(gLinkUp && gKeyed); ms += 10) { IOSleep(10); drain(nullptr, 0); }
+  printf("pcie: stage 22: link %s, keys %s\n", gLinkUp ? "up" : "down", gKeyed ? "installed" : "not installed");
+  return gLinkUp && gKeyed ? 0 : 1;
+}
+
+// ---- Stage 23: the data path and a macOS network interface (en1). RX buffers on the rxpost ring, one TX flow ring (all traffic
+// to the AP), a polling thread for the completion rings, ifnet with ether framing (as AkitaUsbGadget.h). ----
+Ring gFlow;
+uint16_t gFlowId = 2;
+uint8_t gMac[6];
+ifnet_t gIf;
+IOLock *gTxLock;
+uint32_t gTxNext;
+uint64_t gRxPkts, gTxPkts, gTxDrops;
+bool gFlowUp, gPolling;
+void postRx(uint32_t i) {
+  uint8_t m[32] = {};
+  m[0] = 0x11; const uint32_t id = 0x3000 + i; memcpy(m + 4, &id, 4);
+  const uint16_t dl = kBufSz; memcpy(m + 10, &dl, 2);
+  putAddr(m + 24, gDma.pa + kRxBuf + i * kBufSz);
+  h2dPush(1, m, 32);
+}
+errno_t wifiOutput(ifnet_t, mbuf_t mb) {
+  const size_t len = mbuf_pkthdr_len(mb);
+  IOLockLock(gTxLock);
+  bool sent = false;
+  if (gFlowUp && len >= 14 && len <= kBufSz) {
+    const uint32_t slot = gTxNext++ % kNumTx;
+    uint8_t *buf = gDma.va + kTxBuf + slot * kBufSz;
+    uint8_t hdr[14];
+    mbuf_copydata(mb, 0, 14, hdr);
+    mbuf_copydata(mb, 14, len - 14, buf);
+    __asm__ volatile("dsb sy" ::: "memory");
+    uint8_t m[48] = {};
+    m[0] = 0x0F; const uint32_t id = 0x4000 + slot; memcpy(m + 4, &id, 4);
+    memcpy(m + 8, hdr, 14);
+    m[22] = 0x01; m[23] = 1;   // 802.3 frame, one segment
+    putAddr(m + 32, gDma.pa + kTxBuf + slot * kBufSz);
+    const uint16_t dl = static_cast<uint16_t>(len - 14); memcpy(m + 42, &dl, 2);
+    Ring &r = gFlow;
+    r.r = tcm16r(r.ridx);
+    if (static_cast<uint16_t>((r.w + 1) % r.items) != r.r) {
+      uint8_t *it = ringSlot(r, r.w);
+      memcpy(it, m, 48);
+      it[3] = static_cast<uint8_t>(r.seq++ % 253);
+      __asm__ volatile("dsb sy" ::: "memory");
+      r.w = static_cast<uint16_t>((r.w + 1) % r.items);
+      tcm16(r.widx, r.w);
+      bell();
+      sent = true;
+    }
+  }
+  IOLockUnlock(gTxLock);
+  if (sent) { ++gTxPkts; ifnet_stat_increment_out(gIf, 1, static_cast<uint32_t>(len), 0); } else { ++gTxDrops; ifnet_stat_increment_out(gIf, 0, 0, 1); }
+  mbuf_freem(mb);
+  return 0;
+}
+errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *) {
+  if (cmd == SIOCSIFADDR) { ifnet_set_flags(ifp, IFF_UP, IFF_UP); return 0; }
+  if (cmd == SIOCSIFFLAGS) { ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING); return 0; }
+  if (cmd == SIOCADDMULTI || cmd == SIOCDELMULTI) return 0;
+  return EOPNOTSUPP;
+}
+void wifiDetach(ifnet_t) {}
+void onLink() {
+  if (gIf) ifnet_set_flags(gIf, gLinkUp ? (IFF_UP | IFF_RUNNING) : IFF_UP, IFF_UP | IFF_RUNNING);
+}
+void rxDeliver(const uint8_t *frame, uint32_t len) {
+  if (!gIf || len < 14 || len > kBufSz) return;
+  mbuf_t mb = nullptr;
+  if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &mb) != 0) return;
+  if (len > mbuf_maxlen(mb) && mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &mb) != 0) { mbuf_freem(mb); return; }
+  memcpy(mbuf_data(mb), frame, len);
+  mbuf_setlen(mb, len); mbuf_pkthdr_setlen(mb, len); mbuf_pkthdr_setrcvif(mb, gIf);
+  char *h = static_cast<char *>(mbuf_data(mb));
+  mbuf_pkthdr_setheader(mb, h);
+  mbuf_setdata(mb, h + 14, len - 14); mbuf_pkthdr_adjustlen(mb, -14);
+  struct ifnet_stat_increment_param st = {}; st.packets_in = 1; st.bytes_in = len;
+  ifnet_input(gIf, mb, &st);
+  ++gRxPkts;
+}
+void pollThread(void *, wait_result_t) {
+  for (;;) {
+    IOSleep(2);
+    IOLockLock(gTxLock);
+    drain(nullptr, 0);   // control: events (link), flow ring create answers
+    Ring &rc = gRing[4];   // RX completions
+    const uint16_t w = static_cast<uint16_t>(ridxGet(rc, true));
+    while (rc.r != w) {
+      const uint8_t *it = ringSlot(rc, rc.r);
+      uint32_t id; uint16_t dlen, doff; memcpy(&id, it + 4, 4); memcpy(&dlen, it + 14, 2); memcpy(&doff, it + 16, 2);
+      if (id >= 0x3000 && id < 0x3000 + kNumRx) {
+        const uint8_t *b = gDma.va + kRxBuf + (id - 0x3000) * kBufSz + (doff ? doff : gRxOff);
+        IOLockUnlock(gTxLock); rxDeliver(b, dlen); IOLockLock(gTxLock);
+        postRx(id - 0x3000);
+      }
+      rc.r = static_cast<uint16_t>((rc.r + 1) % rc.items);
+      ridxPut(rc, false, rc.r);
+    }
+    Ring &tc = gRing[3];   // TX completions: nothing to free (fixed slots), just consume
+    const uint16_t tw = static_cast<uint16_t>(ridxGet(tc, true));
+    if (tc.r != tw) { tc.r = tw; ridxPut(tc, false, tc.r); }
+    IOLockUnlock(gTxLock);
+  }
+}
+int dataPath() {
+  if (!gDma.va || !gShared) { printf("pcie: stage 23: run stages 8 and 21 first\n"); return 1; }
+  if (!gTxLock) gTxLock = IOLockAlloc();
+  uint8_t mac[32] = {};
+  memcpy(mac, "cur_etheraddr", 14);
+  if (ioctl(262, mac, 32, 32) == 0) memcpy(gMac, mac, 6);
+  // RX buffers
+  for (uint32_t i = 0; i < 128; ++i) postRx(i);
+  // TX flow ring: id 2 (after the two common H2D rings), 512 items of 48 bytes, all traffic to the AP (destination 0)
+  const uint32_t ringInfo = ramRead(gShared + 48);
+  gFlow.off = kFlowRing; gFlow.items = 512; gFlow.itemsz = 48; gFlow.w = gFlow.r = 0; gFlow.seq = 254;
+  gFlow.widx = ramRead(ringInfo + 4) + gFlowId * 4; gFlow.ridx = ramRead(ringInfo + 8) + gFlowId * 4;
+  tcm16(gFlow.widx, 0); tcm16(gFlow.ridx, 0);
+  uint8_t m[40] = {};
+  m[0] = 0x03; const uint32_t rid = 0x6000; memcpy(m + 4, &rid, 4);
+  memcpy(m + 14, gMac, 6);    // sa (da stays 0: indirect, everything goes through the AP)
+  m[20] = 0;                  // tid
+  memcpy(m + 22, &gFlowId, 2);
+  const uint16_t mi = 512, li = 48; memcpy(m + 28, &mi, 2); memcpy(m + 30, &li, 2);
+  putAddr(m + 32, gDma.pa + kFlowRing);
+  h2dPush(0, m, 40);
+  for (unsigned ms = 0; ms < 2000; ms += 5) {   // FLOW_RING_CREATE_CMPLT (type 4) arrives on the control completion ring
+    IOSleep(5);
+    Ring &c = gRing[2];
+    const uint16_t w = static_cast<uint16_t>(ridxGet(c, true));
+    bool done = false;
+    while (c.r != w) {
+      const uint8_t *it = ringSlot(c, c.r);
+      if (it[0] == 0x04) { uint16_t st; memcpy(&st, it + 8, 2); printf("pcie: stage 23: flow ring %u create status %u\n", gFlowId, st); gFlowUp = st == 0; done = true; }
+      else if (it[0] == 0x0E) { uint32_t reqid; memcpy(&reqid, it + 4, 4); uint16_t el; memcpy(&el, it + 12, 2); onEvent(gDma.va + kEvent + (reqid - 0x2000) * 2048 + gRxOff, el); repost(reqid); }
+      c.r = static_cast<uint16_t>((c.r + 1) % c.items);
+      ridxPut(c, false, c.r);
+    }
+    if (done) break;
+  }
+  // the interface
+  if (!gIf) {
+    struct ifnet_init_eparams init = {};
+    init.ver = IFNET_INIT_CURRENT_VERSION; init.len = sizeof(init);
+    init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
+    init.output = wifiOutput; init.uniqueid = "akita-wifi-bcm4383"; init.uniqueid_len = 18;
+    init.name = "en"; init.unit = 1; init.family = IFNET_FAMILY_ETHERNET; init.type = IFT_ETHER;
+    init.demux = ether_demux; init.add_proto = ether_add_proto; init.del_proto = ether_del_proto;
+    init.check_multi = ether_check_multi; init.framer_extended = ether_frameout_extended;
+    init.ioctl = wifiIoctl; init.detach = wifiDetach;
+    static const uint8_t bc[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    init.broadcast_addr = bc; init.broadcast_len = 6;
+    if (ifnet_allocate_extended(&init, &gIf) == 0) {
+      ifnet_set_addrlen(gIf, 6); ifnet_set_baudrate(gIf, 600000000); ifnet_set_mtu(gIf, ETHERMTU);
+      ifnet_set_flags(gIf, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
+      ifnet_set_hdrlen(gIf, 14); ifnet_set_offload(gIf, 0);
+      if (ifnet_attach(gIf, nullptr) == 0) ifnet_set_lladdr(gIf, gMac, 6); else { ifnet_release(gIf); gIf = nullptr; }
+    }
+  }
+  onLink();
+  if (!gPolling) { thread_t t = nullptr; if (kernel_thread_start(pollThread, nullptr, &t) == KERN_SUCCESS) { thread_deallocate(t); gPolling = true; } }
+  printf("pcie: stage 23: interface %s%u (MAC %02x:%02x:%02x:%02x:%02x:%02x), flow ring %s, link %s, polling %d\n", gIf ? ifnet_name(gIf) : "-", gIf ? ifnet_unit(gIf) : 0,
+         gMac[0], gMac[1], gMac[2], gMac[3], gMac[4], gMac[5], gFlowUp ? "up" : "refused", gLinkUp ? "up" : "down", gPolling);
+  return gIf ? 0 : 1;
+}
+
 int command(unsigned stage) {
   if (stage == 1) {
     const uint64_t phy = smcPmuRead(kPmuPhyCtrl);
@@ -785,6 +992,9 @@ int command(unsigned stage) {
   if (stage == 9) return loopback();
   if (stage == 20) return console();
   if (stage == 21) return wifiScan();
+  if (stage == 22) return wifiJoin();
+  if (stage == 23) return dataPath();
+  if (stage == 24) { printf("pcie: rx %llu tx %llu drops %llu link %d keyed %d flow %d\n", gRxPkts, gTxPkts, gTxDrops, gLinkUp, gKeyed, gFlowUp); return 0; }
   if (stage == 14 || stage == 15) { gLowMem = stage - 14; gDma.va = nullptr; printf("pcie: host rings in %s\n", gLowMem ? "the low bank" : "macOS memory"); return 0; }
   if (stage >= 10 && stage <= 13) { if (stage < 12) gHostCap = stage - 10; else gDmaIdx = stage - 12; printf("pcie: host_cap %u, DMA indices %u\n", gHostCap, gDmaIdx); return 0; }
   printf("pcie: unknown stage %u\n", stage);

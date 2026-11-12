@@ -20,6 +20,8 @@ sequences and register values).
 | 8 | msgbuf: five common rings in host memory (indices in the chip's TCM), ioctl/event buffers posted, `WLC_GET_VAR cur_etheraddr` | **the firmware answers with the MAC address** (rings in the low DRAM bank, see below) |
 | 9, 20 | DMA loopback; the firmware's own console (`hnd_cons_t`, read through BAR0) | the console showed our messages arriving as zeros |
 | 21 | CLM blob (`clmload`, 1400-byte chunks), `event_msgs`, `WLC_UP`, `escan` (params v3; v1 and v4 refused with BCME_VERSION), `ESCAN_RESULT` events | **scan works: 26 results on 2.4 and 5 GHz in 8 s** |
+| 22 | WPA2-PSK join with the firmware's supplicant (`sup_wpa`, `WLC_SET_WSEC_PMK`, `WLC_SET_SSID`); network from a file the user writes | written, waiting for credentials |
+| 23 | RX buffers on the rxpost ring, a TX flow ring (`FLOW_RING_CREATE`), polling thread, BSD interface with Ethernet framing | **`en1` appears in macOS; the firmware accepts the flow ring** |
 
 **The DMA finding.** The chip's writes into macOS memory worked from the start, but its *reads* of macOS memory returned
 zeros: every message was rejected (`RING_STATUS` BADOPTION) and the firmware console printed `unknown message: 8 / 00 00 00 00…`.

@@ -394,6 +394,13 @@ extern "C" int akita_acpm_get_khz(unsigned domain, uint32_t *khz) {
 }
 
 #include "AkitaTouch.inc"   // akita: the touch controller's staged bring-up (kern.akita_acpm = 2000000 + stage)
+#include <net/kpi_interface.h>   // akita: AkitaPcie.inc network interface
+#include <net/if.h>
+#include <net/if_types.h>
+#include <net/ethernet.h>
+#include <net/if_ether.h>
+#include <sys/kpi_mbuf.h>
+#include <sys/sockio.h>
 #include <sys/vnode.h>   // akita: AkitaPcie.inc reads the Wi-Fi firmware
 #include <sys/fcntl.h>
 #include <sys/random.h>

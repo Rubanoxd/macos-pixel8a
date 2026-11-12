@@ -38,6 +38,7 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **Swap on flash** (real swapfiles, 2–6 GB under pressure) | ✅ |
 | **RAM: macOS sees 5.98 GiB** (was 4 GiB; UEFI heap moved, all 8 GiB declared, integrity-tested) | ✅ |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
+| Wi-Fi (BCM4383 on PCIe): PCIe link up and chip identified (`14e4:4449`); firmware and driver next | 🔧 in progress, `docs/wifi-bringup.md` |
 | Video out over USB-C (DisplayPort alt mode) | 📋 researched, see `docs/research-hdmi-usbc.md` |
 
 More photos in [`photos/`](photos/).

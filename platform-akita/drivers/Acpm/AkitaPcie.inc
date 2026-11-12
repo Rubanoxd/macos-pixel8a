@@ -933,6 +933,7 @@ void postRx(uint32_t i) {
   h2dPush(1, m, 32);
 }
 uint64_t gTxPosted, gTxDone;
+uint32_t gToPeer, gToPeerMacOk, gPeerPings; uint8_t gToPeerLastMac[6];
 // Post one frame whose payload (after the 14-byte Ethernet header) is already in TX slot `slot`. Called with gTxLock held.
 bool txPost(uint32_t slot, const uint8_t hdr[14], uint32_t dlen32) {
   uint8_t *buf = gDma.va + kTxBuf + slot * kBufSz;
@@ -974,6 +975,11 @@ errno_t wifiOutput(ifnet_t ifp, mbuf_t mb) {
     uint8_t hdr[14];
     mbuf_copydata(mb, 0, 14, hdr);
     mbuf_copydata(mb, 14, len - 14, gDma.va + kTxBuf + slot * kBufSz);
+    if (hdr[12] == 0x08 && hdr[13] == 0x00 && len >= 34) {   // IPv4 to the control channel's peer: which MAC does the stack use?
+      extern uint8_t gPeerIpForTx[4];
+      const uint8_t *ip = gDma.va + kTxBuf + slot * kBufSz;
+      if (!memcmp(ip + 16, gPeerIpForTx, 4)) { ++gToPeer; memcpy(gToPeerLastMac, hdr, 6); }
+    }
     if (hdr[12] == 0x08 && hdr[13] == 0x06 && len >= 42) {   // an ARP request of ours: answer it from the gleaned table
       uint8_t f[42]; memcpy(f, hdr, 14); memcpy(f + 14, gDma.va + kTxBuf + slot * kBufSz, 28); arpAsked(f, 42);
     }
@@ -1007,6 +1013,7 @@ extern "C" uint8_t sheng_log_buffer[];
 extern "C" void akita_reset_to_fastboot(void);
 struct WifiPeer { bool on; uint8_t mac[6], ip[4]; uint16_t port; uint64_t sent; uint32_t packets; };
 WifiPeer gPeer;
+uint8_t gPeerIpForTx[4];
 uint32_t gCtlCmds, gShellDrops;
 bool ownIp(uint8_t ip[4], uint8_t mask[4] = nullptr) {
   ifaddr_t *list = nullptr;
@@ -1085,6 +1092,12 @@ void ctlPump() {
   }
   IOLockUnlock(gTxLock);
 }
+void ctlRun(void *arg, wait_result_t) {
+  const unsigned what = static_cast<unsigned>(reinterpret_cast<uintptr_t>(arg));
+  printf("pcie: control channel: running command %u\n", what);
+  printf("pcie: control channel: command %u -> %d\n", what, akita_acpm_command(what));
+  thread_terminate(current_thread());
+}
 // true: the frame was for the control channel (or a shell port from someone other than the peer) and is consumed here.
 bool ctlFrame(const uint8_t *f, uint32_t len) {
   if (len < 14 + 20 + 8 || f[12] != 0x08 || f[13] != 0x00) return false;
@@ -1094,6 +1107,7 @@ bool ctlFrame(const uint8_t *f, uint32_t len) {
   const uint8_t *l4 = ip + ihl;
   const uint16_t dport = static_cast<uint16_t>((l4[2] << 8) | l4[3]);
   const bool fromPeer = gPeer.on && !memcmp(f + 6, gPeer.mac, 6);
+  if (fromPeer && ip[9] == 1 && 14 + ihl < len && l4[0] == 8) ++gPeerPings;   // ICMP echo requests from the peer
   if (ip[9] == 6 && dport >= 2323 && dport <= 2325) {   // TCP to the root shells: the peer only
     if (fromPeer) return false;
     ++gShellDrops;
@@ -1110,6 +1124,7 @@ bool ctlFrame(const uint8_t *f, uint32_t len) {
   if (t[0] == 'H') {
     if (!fromPeer) {   // a new peer: the log from the start
       IOLockLock(gTxLock);
+      memcpy(gPeerIpForTx, ip + 12, 4);
       memcpy(gPeer.mac, f + 6, 6); memcpy(gPeer.ip, ip + 12, 4); gPeer.port = static_cast<uint16_t>((l4[0] << 8) | l4[1]); gPeer.sent = 0; gPeer.on = true;
       IOLockUnlock(gTxLock);
       printf("pcie: control channel: peer registered (hello over %s)\n", f[0] == 0xff ? "broadcast" : "unicast");
@@ -1120,6 +1135,11 @@ bool ctlFrame(const uint8_t *f, uint32_t len) {
     // commands other than hello only from the peer
   } else if (t[0] == 'L') {
     IOLockLock(gTxLock); gPeer.sent = 0; IOLockUnlock(gTxLock);
+  } else if (t[0] == 'K' && tl > 1 && tl < 12) {   // K<number>: an akita_acpm command (sysctl kern.akita_acpm) without userland
+    uint32_t v = 0;
+    for (uint32_t i = 1; i < tl && t[i] >= '0' && t[i] <= '9'; ++i) v = v * 10 + static_cast<uint32_t>(t[i] - '0');
+    thread_t th = nullptr;
+    if (v && kernel_thread_start(ctlRun, reinterpret_cast<void *>(static_cast<uintptr_t>(v)), &th) == KERN_SUCCESS) thread_deallocate(th);
   } else if (tl == 8 && !memcmp(t, "FASTBOOT", 8)) {
     printf("pcie: control channel: FASTBOOT requested over Wi-Fi\n");
     akita_reset_to_fastboot();
@@ -1277,9 +1297,10 @@ void pollThread(void *, wait_result_t) {
       const uint64_t sum = gRxPkts + gTxPkts + gTxBad;
       if (sum != lastSum) {
         lastSum = sum;
-        printf("pcie: traffic rx %llu (bc %llu mc %llu to us %llu other %llu; arp %llu replies %llu) tx %llu (arp %llu, drops %llu, bad completions %llu last 0x%x; posted %llu done %llu) control %u cmds, log %u pkts, shell drops %u, gleaned %u, announced %u\n",
+        printf("pcie: traffic rx %llu (bc %llu mc %llu to us %llu other %llu; arp %llu replies %llu) tx %llu (arp %llu, drops %llu, bad completions %llu last 0x%x; posted %llu done %llu) control %u cmds, log %u pkts, shell drops %u, gleaned %u, announced %u; peer pings in %u, frames to the peer's IP %u (last to %s MAC)\n",
                gRxPkts, gRxBc, gRxMc, gRxUc, gRxOther, gRxArp, gRxArpReply, gTxPkts, gTxArp, gTxDrops, gTxBad, gTxLastBad, gTxPosted, gTxDone,
-               gCtlCmds, gPeer.packets, gShellDrops, gGleaned, gAnnounced);
+               gCtlCmds, gPeer.packets, gShellDrops, gGleaned, gAnnounced, gPeerPings, gToPeer,
+               !gToPeer ? "no" : !memcmp(gToPeerLastMac, gPeer.mac, 6) ? "the peer's" : (gToPeerLastMac[0] & 1) ? "a group" : "another");
       }
     }
   }

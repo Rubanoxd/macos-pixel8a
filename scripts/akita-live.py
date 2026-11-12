@@ -16,6 +16,7 @@ Por Wi-Fi (canal de AkitaPcie.inc, para cuando el USB-C tiene un dongle; el Mac 
   wlog [fichero]           saluda por broadcast (UDP 5141) y recibe el log del kernel por unicast; guarda la IP del teléfono
                            en scratch/live/phone-wifi-ip (para `AKHOST=$(cat ...) scratch/akx ...`)
   wfastboot                como `fastboot`, a la IP guardada (solo lo acepta del Mac que saludó)
+  wcmd <n>                 ejecuta en el kernel la orden kern.akita_acpm=<n> (p. ej. 5000010 arranca el Power Delivery)
 """
 import os
 import socket
@@ -136,6 +137,57 @@ def png(path, width, height, rgb):
                 chunk(b'IDAT', zlib.compress(raw, 6)) + chunk(b'IEND', b''))
 
 
+# 5x7 glyphs for the watermark (no PIL here)
+GLYPHS = {
+    '@': ['01110', '10001', '10111', '10101', '10111', '10000', '01111'],
+    '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
+    '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
+    '2': ['01110', '10001', '00001', '00010', '00100', '01000', '11111'],
+    'r': ['00000', '00000', '10110', '11001', '10000', '10000', '10000'],
+    'u': ['00000', '00000', '10001', '10001', '10001', '10011', '01101'],
+    'b': ['10000', '10000', '10110', '11001', '10001', '10001', '11110'],
+    'a': ['00000', '00000', '01110', '00001', '01111', '10001', '01111'],
+    'n': ['00000', '00000', '10110', '11001', '10001', '10001', '10001'],
+    'o': ['00000', '00000', '01110', '10001', '10001', '10001', '01110'],
+}
+WATERMARK = '@1421rubano'
+
+
+def rotate_ccw(rgb, width, height):
+    """The panel's framebuffer is portrait with the desktop turned; a quarter turn left gives the landscape desktop."""
+    out = bytearray(len(rgb))
+    for y in range(height):
+        row = y * width * 3
+        for x in range(width):
+            o = ((width - 1 - x) * height + y) * 3
+            out[o:o + 3] = rgb[row + x * 3:row + x * 3 + 3]
+    return out, height, width
+
+
+def watermark(rgb, width, height, text=WATERMARK, px=None):
+    """White text with a dark shadow in the bottom-right corner."""
+    px = px or max(2, width // 320)
+    tw = (len(text) * 6 - 1) * px
+    x0, y0 = width - tw - 4 * px, height - 7 * px - 4 * px
+    for shade, d in (((0, 0, 0), px // 2 or 1), ((255, 255, 255), 0)):
+        for i, ch in enumerate(text):
+            for gy, line in enumerate(GLYPHS.get(ch, ['00000'] * 7)):
+                for gx, bit in enumerate(line):
+                    if bit != '1':
+                        continue
+                    for yy in range(px):
+                        for xx in range(px):
+                            x = x0 + (i * 6 + gx) * px + xx + d
+                            y = y0 + gy * px + yy + d
+                            if 0 <= x < width and 0 <= y < height:
+                                o = (y * width + x) * 3
+                                if shade == (0, 0, 0):
+                                    rgb[o:o + 3] = bytes(c // 3 for c in rgb[o:o + 3])
+                                else:
+                                    rgb[o:o + 3] = bytes(shade)
+    return rgb
+
+
 def shot(path, scale):
     s = send('S%d' % scale)
     s.settimeout(3)
@@ -162,7 +214,11 @@ def shot(path, scale):
             break
     if image is None:
         sys.exit('sin respuesta del teléfono')
-    png(path, size[0], size[1], bytes(image))
+    w, h = size
+    if os.environ.get('AKITA_RAW_SHOT') != '1':   # landscape, as the desktop is seen, with the watermark
+        image, w, h = rotate_ccw(image, w, h)
+        image = watermark(image, w, h)
+    png(path, w, h, bytes(image))
     print('%s: %dx%d, %d/%d bytes%s' % (path, size[0], size[1], got, total, '' if got >= total else ' (INCOMPLETA)'))
 
 
@@ -201,6 +257,8 @@ def main():
         wlog(args[1] if len(args) > 1 else os.path.join(OUT, 'wifi-%s.log' % time.strftime('%H%M%S')))
     elif what == 'wfastboot':
         wsend('FASTBOOT')
+    elif what == 'wcmd':   # an akita_acpm command (kern.akita_acpm) run by the kernel itself, no userland needed
+        wsend('K%d' % int(args[1]))
     elif what == 'replay':
         send('L')
     elif what == 'steps':

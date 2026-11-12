@@ -1,2 +1,3 @@
 #!/bin/bash
-exec ssh -F /Volumes/datos2/unixnu-akita/scratch/sshkeys/ssh_config_full -o BatchMode=yes akita-full "$@"
+# SSH to the phone (full OS). Over USB by default; AKHOST=<ip> (e.g. $(cat scratch/live/phone-wifi-ip)) goes over Wi-Fi.
+exec ssh -F /Volumes/datos2/unixnu-akita/scratch/sshkeys/ssh_config_full -o BatchMode=yes ${AKHOST:+-o HostName=$AKHOST} akita-full "$@"

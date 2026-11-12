@@ -77,6 +77,26 @@ disagree (some say 4K60, others that it stays at 1080p60). Not confirmed.
 
 Phases 1–4 do not depend on macOS: they can be tested from the kernel with logs.
 
+## Progress (2026-11-12)
+
+- **Phase 1 done.** `AkitaI2c.inc` drives HSI2C 11 (USI11, left running by the firmware) and reads the MAX77759:
+  TCPC vendor 0x0B6A, product 0x7759, device 0x0002, and PMIC_ID 0x3B. It never writes the PMIC, charger or fuel gauge.
+- **Phase 2 done.** `AkitaTypec.inc` is a small USB PD engine on the TCPC, a polling kernel thread with an allow-list of TCPC
+  registers. The phone never sources VBUS. With a powered USB-C hub that has HDMI, the exchange goes:
+  ```
+  <- Source_Capabilities 5 V 3 A   -> Request   <- Accept   <- PS_RDY   (charging again: SinkVbus)
+  <- DR_Swap   -> Accept           (the phone is the USB host / DFP)
+  -> Discover Identity / SVIDs (ff01) / Modes (VDO 0c05: pins C, D)   -> Enter Mode   -> DP Status   -> DP Configure (pin D)
+  ```
+  Three things were needed:
+  - **The plug orientation in TCPC_CONTROL.** The hub sat on CC2, and BMC goes over the configured line.
+  - **Re-arming RECEIVE_DETECT after every hard reset.** The TCPC clears it.
+  - **Reading the RX buffer through READABLE_BYTE_COUNT (0x30), in one transaction.** On the MAX77759 the buffer can only
+    be read that way, as Linux `tcpci_maxim_core.c` does.
+- The Wi-Fi control channel (`akita-live.py wcmd 5000010`) starts PD with the hub plugged, so no USB link is needed.
+- Next: USB host mode (DWC3 as xHCI) for a keyboard and mouse behind the hub. After that, phase 3 for video: the PHY, AUX
+  and the EDID, with a capture card as the monitor.
+
 ## Risks and open questions
 
 - **We lose the debug link.** Today the log, the viewer and the shell go over USB-C in device (gadget) mode.

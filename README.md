@@ -39,7 +39,7 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **RAM: macOS sees 5.98 GiB** (was 4 GiB; UEFI heap moved, all 8 GiB declared, integrity-tested) | ✅ |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
 | Wi-Fi (BCM4383 on PCIe): **joins WPA2 at boot, DHCP, internet (DNS, HTTPS)**; kernel log, shell and fastboot reset over Wi-Fi; no Wi-Fi menu yet (`en1` is not an IOKit interface) | ✅ works, `docs/wifi-bringup.md` |
-| Video out over USB-C (DisplayPort alt mode) | 📋 researched, see `docs/research-hdmi-usbc.md` |
+| USB-C: Power Delivery and DisplayPort alternate mode (MAX77759 TCPC) | ✅ PD contract, host role, DP mode configured with a USB-C HDMI hub; video output next, see `docs/research-hdmi-usbc.md` |
 
 More photos in [`photos/`](photos/).
 

@@ -348,6 +348,7 @@ extern "C" int akita_acpm_rtc_write(uint64_t seconds);
 extern "C" void akita_acpm_boot_profile(void);
 extern "C" void akita_wifi_boot(void);   // akita: AkitaPcie.inc
 extern "C" void akita_acpm_boot_profile(void) {
+  printf("macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano\n");   // akita: the author's mark in every boot log
   unsigned allowed = 0, profile = 0;
   PE_parse_boot_argn("akita-acpm", &allowed, sizeof allowed);
   PE_parse_boot_argn("akita-dvfs", &profile, sizeof profile);
@@ -411,6 +412,8 @@ extern "C" {   // akita: bpf.h has no extern "C" of its own
 #include <sys/fcntl.h>
 #include <sys/random.h>
 #include "AkitaPcie.inc"    // akita: the Wi-Fi PCIe link, staged look (kern.akita_acpm = 4000000 + stage)
+#include "AkitaI2c.inc"     // akita: HSI2C 11, the MAX77759 bus (kern.akita_acpm = 5000000 + stage), read-only towards the chips
+#include "AkitaTypec.inc"   // akita: USB Power Delivery on the MAX77759 TCPC (kern.akita_acpm = 5000010.., see the file)
 
 extern "C" int akita_acpm_command(unsigned what) {
   static IOLock *made;
@@ -444,7 +447,9 @@ extern "C" int akita_acpm_command(unsigned what) {
     IOLockUnlock(gAcpmLock);
     return 0;
   }
-  if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);   // akita: Wi-Fi PCIe stages (AkitaPcie.inc)
+  if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);
+  if (what >= 5000010 && what < 5000100) return typec::command(what - 5000000);   // akita: USB PD (AkitaTypec.inc)
+  if (what > 5000000 && what < 5000100) return i2c::command(what - 5000000);   // akita: MAX77759 bus (AkitaI2c.inc)   // akita: Wi-Fi PCIe stages (AkitaPcie.inc)
   if (what == 3000000 || what == 3000001) {   // akita: the PMIC RTC: 3000000 writes the kernel's calendar time (UTC) into it, 3000001 reads it
     uint64_t t = 0;
     if (what == 3000001) return akita_acpm_rtc_seconds(&t);

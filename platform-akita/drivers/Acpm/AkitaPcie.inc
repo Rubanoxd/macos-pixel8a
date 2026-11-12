@@ -416,7 +416,7 @@ int download() {
 
 // ---- Stage 8: the msgbuf protocol (brcmfmac pcie.c / msgbuf.c, ISC): common rings in host memory, ring indices in the chip's
 // TCM, polled completions. Asks the firmware for its MAC address (WLC_GET_VAR "cur_etheraddr"). ----
-unsigned gHostCap = 0, gDmaIdx = 0, gLowMem = 0;   // 4000014/15: host rings in macOS memory / in the low bank at 0xD0000000   // kern.akita_acpm 4000010/11: host_cap off/on; 4000012/13: TCM/DMA indices
+unsigned gHostCap = 0, gDmaIdx = 0, gLowMem = 1;   // 4000014/15: host rings in macOS memory / in the low bank at 0xD0000000   // kern.akita_acpm 4000010/11: host_cap off/on; 4000012/13: TCM/DMA indices
 struct Dma { IOBufferMemoryDescriptor *md; IOMemoryMap *map; uint8_t *va; uint64_t pa; uint32_t size; };
 Dma gDma;
 bool dmaAlloc(Dma &d, uint32_t size) {
@@ -632,6 +632,131 @@ int console() {
   return 0;
 }
 
+// ---- Stage 21 (after 8): CLM blob, events, up, escan; the networks found go to the log ----
+uint16_t gTrans = 2;
+unsigned gScanSeen;
+uint32_t gRxOff;
+inline uint32_t be32(const uint8_t *p) { return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3]; }
+void repost(uint32_t id) {   // give a consumed ioctl-response or event buffer back to the firmware
+  uint8_t m[40] = {};
+  const bool ev = id >= 0x2000;
+  m[0] = ev ? 0x0D : 0x0B; memcpy(m + 4, &id, 4);
+  const uint16_t blen = ev ? 2048 : 8192; memcpy(m + 8, &blen, 2);
+  putAddr(m + 16, gDma.pa + (ev ? kEvent + (id - 0x2000) * 2048 : kIoctlResp + (id - 0x1000) * 8192));
+  h2dPush(0, m, 24);
+}
+void onEvent(const uint8_t *pkt, uint16_t len) {
+  if (len < 72) return;
+  const uint32_t type = be32(pkt + 28), status = be32(pkt + 32), dlen = be32(pkt + 44);
+  if (type != 69) { printf("pcie: event %u status %u\n", type, status); return; }   // WLC_E_ESCAN_RESULT
+  if (status != 8 || dlen < 12) { printf("pcie: scan done (status %u), %u networks seen\n", status, gScanSeen); return; }
+  const uint8_t *r = pkt + 72;   // wl_escan_result: buflen, version, sync_id, bss_count, bss_info[]
+  uint16_t count; memcpy(&count, r + 10, 2);
+  const uint8_t *b = r + 12;
+  for (unsigned i = 0; i < count && b + 90 <= pkt + len; ++i) {
+    uint32_t blen; memcpy(&blen, b + 4, 4);
+    char ssid[33] = {}; const unsigned sl = b[18] > 32 ? 32 : b[18]; memcpy(ssid, b + 19, sl);
+    int16_t rssi; memcpy(&rssi, b + 78, 2);
+    printf("pcie: wifi: \"%s\" %02x:%02x:%02x:%02x:%02x:%02x channel %u RSSI %d dBm\n", sl ? ssid : "(hidden)", b[8], b[9], b[10], b[11], b[12], b[13], b[88], rssi);
+    ++gScanSeen;
+    if (!blen) break;
+    b += blen;
+  }
+}
+// Drains the control completion ring; returns the length of an ioctl answer (copied to out) when one arrives, -1 otherwise.
+int drain(uint8_t *out, uint32_t outMax) {
+  Ring &c = gRing[2];
+  int got = -1;
+  const uint16_t w = static_cast<uint16_t>(ridxGet(c, true));
+  while (c.r != w) {
+    const uint8_t *it = ringSlot(c, c.r);
+    uint32_t reqid; memcpy(&reqid, it + 4, 4);
+    if (it[0] == 0x0C && reqid >= 0x1000 && reqid < 0x1008) {   // IOCTL_CMPLT
+      uint16_t st, rlen; memcpy(&st, it + 8, 2); memcpy(&rlen, it + 12, 2);
+      const uint8_t *buf = gDma.va + kIoctlResp + (reqid - 0x1000) * 8192 + gRxOff;
+      if (out && rlen) memcpy(out, buf, rlen < outMax ? rlen : outMax);
+      got = st ? -2 - st : rlen;
+      repost(reqid);
+    } else if (it[0] == 0x0E && reqid >= 0x2000 && reqid < 0x2008) {   // WL_EVENT
+      uint16_t elen; memcpy(&elen, it + 12, 2);
+      onEvent(gDma.va + kEvent + (reqid - 0x2000) * 2048 + gRxOff, elen);
+      repost(reqid);
+    } else if (it[0] != 0x0A) {
+      printf("pcie: d2h type %#x req %#x status %u\n", it[0], reqid, it[8] | (it[9] << 8));
+    }
+    c.r = static_cast<uint16_t>((c.r + 1) % c.items);
+    ridxPut(c, false, c.r);
+  }
+  return got;
+}
+// One ioctl: data (len bytes) goes in the request buffer; the answer comes back in it (outMax bytes at most). 0 or the error.
+int ioctl(uint32_t cmd, uint8_t *data, uint32_t len, uint32_t outMax) {
+  uint8_t *req = gDma.va + kIoctlReq;
+  memcpy(req, data, len);
+  __asm__ volatile("dsb sy" ::: "memory");
+  uint8_t m[40] = {};
+  m[0] = 0x09; const uint32_t rid = 0x7777; memcpy(m + 4, &rid, 4);
+  memcpy(m + 8, &cmd, 4); const uint16_t tid = gTrans++, inlen = static_cast<uint16_t>(len), olen = static_cast<uint16_t>(outMax > len ? outMax : len);
+  memcpy(m + 12, &tid, 2); memcpy(m + 14, &inlen, 2); memcpy(m + 16, &olen, 2);
+  putAddr(m + 24, gDma.pa + kIoctlReq);
+  if (!h2dPush(0, m, 40)) return -100;
+  for (unsigned ms = 0; ms < 3000; ms += 2) {
+    IOSleep(2);
+    const int r = drain(data, outMax);
+    if (r >= 0) return 0;
+    if (r < -1) return r;
+  }
+  return -101;
+}
+int iovarSet(const char *name, const void *val, uint32_t vlen) {
+  static uint8_t buf[2048];
+  const uint32_t n = static_cast<uint32_t>(strlen(name)) + 1;
+  if (n + vlen > sizeof buf) return -102;
+  memcpy(buf, name, n); memcpy(buf + n, val, vlen);
+  return ioctl(263, buf, n + vlen, 0);
+}
+int wifiScan() {
+  if (!gDma.va || !gShared) { printf("pcie: stage 21: run stage 8 first\n"); return 1; }
+  gRxOff = ramRead(gShared + 36);
+  // CLM blob in 1400-byte chunks (brcmf_c_download_blob)
+  uint8_t *clm = static_cast<uint8_t *>(IOMalloc(65536));
+  const int clmLen = clm ? readFile("/Users/akita/.akita/wifi/clm.blob", clm, 65536) : -1;
+  int r = 0;
+  for (int off = 0; clmLen > 0 && off < clmLen && r == 0; off += 1400) {
+    const uint32_t chunk = static_cast<uint32_t>(clmLen - off > 1400 ? 1400 : clmLen - off);
+    uint8_t d[12 + 1400];
+    const uint16_t flag = static_cast<uint16_t>((1u << 12) | (off == 0 ? 0x2u : 0u) | (off + static_cast<int>(chunk) >= clmLen ? 0x4u : 0u)), type = 2;
+    const uint32_t crc = 0;
+    memcpy(d, &flag, 2); memcpy(d + 2, &type, 2); memcpy(d + 4, &chunk, 4); memcpy(d + 8, &crc, 4); memcpy(d + 12, clm + off, chunk);
+    r = iovarSet("clmload", d, 12 + chunk);
+  }
+  if (clm) IOFree(clm, 65536);
+  printf("pcie: stage 21: CLM blob %d bytes loaded: %d (rx data offset %u)\n", clmLen, r, gRxOff);
+  uint8_t mask[16]; memset(mask, 0xff, sizeof mask);
+  printf("pcie: stage 21: event_msgs %d\n", iovarSet("event_msgs", mask, sizeof mask));
+  uint8_t up[4] = {};
+  printf("pcie: stage 21: up %d\n", ioctl(2, up, 4, 0));
+  // escan: the firmware refused version 1 (BCME_VERSION); try the params versions 4, 3, 2 (wlioctl.h wl_scan_params_v2..v4)
+  gScanSeen = 0;
+  int er = -1;
+  for (uint32_t ver = 4; ver >= 2 && er != 0; --ver) {
+    uint8_t e[8 + 80] = {};
+    const uint16_t act = 1, sync = 0x1234; memcpy(e, &ver, 4); memcpy(e + 4, &act, 2); memcpy(e + 6, &sync, 2);
+    uint8_t *pp = e + 8;
+    const uint16_t pv = static_cast<uint16_t>(ver), plen = ver == 4 ? 76 : 72;
+    memcpy(pp, &pv, 2); memcpy(pp + 2, &plen, 2);
+    memset(pp + 40, 0xff, 6);   // bssid broadcast
+    pp[46] = 2;                 // bss type any
+    const unsigned first = ver == 4 ? 56 : 52;   // nprobes (v4 has scan_type_ext before it)
+    const int32_t def = -1; for (unsigned k = 0; k < 4; ++k) memcpy(pp + first + k * 4, &def, 4);
+    er = iovarSet("escan", e, 8u + plen);
+    printf("pcie: stage 21: escan v%u: %d\n", ver, er);
+  }
+  for (unsigned ms = 0; ms < 8000; ms += 10) { IOSleep(10); drain(nullptr, 0); }
+  printf("pcie: stage 21: %u networks in 8 s\n", gScanSeen);
+  return gScanSeen ? 0 : 1;
+}
+
 int command(unsigned stage) {
   if (stage == 1) {
     const uint64_t phy = smcPmuRead(kPmuPhyCtrl);
@@ -659,6 +784,7 @@ int command(unsigned stage) {
   if (stage == 8) return msgbuf();
   if (stage == 9) return loopback();
   if (stage == 20) return console();
+  if (stage == 21) return wifiScan();
   if (stage == 14 || stage == 15) { gLowMem = stage - 14; gDma.va = nullptr; printf("pcie: host rings in %s\n", gLowMem ? "the low bank" : "macOS memory"); return 0; }
   if (stage >= 10 && stage <= 13) { if (stage < 12) gHostCap = stage - 10; else gDmaIdx = stage - 12; printf("pcie: host_cap %u, DMA indices %u\n", gHostCap, gDmaIdx); return 0; }
   printf("pcie: unknown stage %u\n", stage);

@@ -19,6 +19,7 @@ sequences and register values).
 | 7 | Halt the CR4, firmware into its TCM (`0x6E0000`, 2.1 MB in 17 banks), NVRAM + length token, random-seed rTLV, reset vector, run | **firmware up in 680 ms: `pciedev_shared` at `0x8331d0`, protocol 7, no trap** |
 | 8 | msgbuf: five common rings in host memory (indices in the chip's TCM), ioctl/event buffers posted, `WLC_GET_VAR cur_etheraddr` | **the firmware answers with the MAC address** (rings in the low DRAM bank, see below) |
 | 9, 20 | DMA loopback; the firmware's own console (`hnd_cons_t`, read through BAR0) | the console showed our messages arriving as zeros |
+| 21 | CLM blob (`clmload`, 1400-byte chunks), `event_msgs`, `WLC_UP`, `escan` (params v3; v1 and v4 refused with BCME_VERSION), `ESCAN_RESULT` events | **scan works: 26 results on 2.4 and 5 GHz in 8 s** |
 
 **The DMA finding.** The chip's writes into macOS memory worked from the start, but its *reads* of macOS memory returned
 zeros: every message was rejected (`RING_STATUS` BADOPTION) and the firmware console printed `unknown message: 8 / 00 00 00 00…`.
@@ -29,5 +30,5 @@ lets the PCIe channel read some regions. The driver will keep its DMA buffers in
 The firmware files come from the phone's own vendor partition (`scripts/ext4cat.py` reads them out of a `vendor.img` dump) and
 are copied to `/Users/akita/.akita/wifi/` on the phone; they are never redistributed.
 
-Next: the CLM blob (regulatory data), `up`, a scan, WPA2 association with the firmware's own supplicant, the data path (flow
-rings, RX buffer posts) and finally an `IOEthernetController` for macOS.
+Next: WPA2 association with the firmware's own supplicant (needs the user's network name and passphrase, read from a file
+the user writes), the data path (flow rings, RX buffer posts), a network interface for macOS, and bring-up at boot.

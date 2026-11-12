@@ -6,6 +6,7 @@
 //   2  read only: the first words of the controller's ELBI (0x13120000) and SOC (0x13130000) windows. If the block's clocks are
 //      gated this read takes an SError and the phone panics (it comes back to fastboot by itself).
 // Sources: Google's pcie-exynos-rc.c / pcie-exynos-zuma-rc-cal.c (android-gs-akita-5.15-android14-qpr3), the zuma device tree.
+extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);   // osfmk/arm/machine_routines.h (not in the IOKit headers)
 namespace pcie {
 constexpr uint64_t kPmuPhyCtrl = 0x15460000 + 0x3ec8;   // pcie_1 pmu-offset
 constexpr uint64_t kGph3 = 0x13040000;                   // pinctrl_9, first bank
@@ -413,6 +414,224 @@ int download() {
   return rc;
 }
 
+// ---- Stage 8: the msgbuf protocol (brcmfmac pcie.c / msgbuf.c, ISC): common rings in host memory, ring indices in the chip's
+// TCM, polled completions. Asks the firmware for its MAC address (WLC_GET_VAR "cur_etheraddr"). ----
+unsigned gHostCap = 0, gDmaIdx = 0, gLowMem = 0;   // 4000014/15: host rings in macOS memory / in the low bank at 0xD0000000   // kern.akita_acpm 4000010/11: host_cap off/on; 4000012/13: TCM/DMA indices
+struct Dma { IOBufferMemoryDescriptor *md; IOMemoryMap *map; uint8_t *va; uint64_t pa; uint32_t size; };
+Dma gDma;
+bool dmaAlloc(Dma &d, uint32_t size) {
+  if (gLowMem) {   // a free gap of the low DRAM bank (no carve-out between 0xC3090000 and 0xD8100000; the UEFI heap ends at 0xC7C00000)
+    d.md = nullptr; d.map = nullptr; d.pa = 0xD0000000; d.size = size;
+    d.va = reinterpret_cast<uint8_t *>(ml_io_map_wcomb(d.pa, size));
+    if (!d.va) return false;
+    for (uint32_t o = 0; o < size; o += 4) *reinterpret_cast<volatile uint32_t *>(d.va + o) = 0;
+    __asm__ volatile("dsb sy" ::: "memory");
+    return true;
+  }
+  d.md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x0000000fffffffffULL & ~0xfffULL);
+  if (!d.md || d.md->prepare() != kIOReturnSuccess) return false;
+  IOByteCount len = 0;
+  d.pa = d.md->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
+  d.map = d.md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+  if (!d.map || !d.pa || len < size) return false;
+  d.va = reinterpret_cast<uint8_t *>(d.map->getVirtualAddress());
+  d.size = size;
+  // the buffer's cached kernel alias was zeroed at allocation: clean and invalidate it so no dirty line lands on the rings later
+  if (uint8_t *cached = static_cast<uint8_t *>(d.md->getBytesNoCopy())) {
+    for (uint32_t o = 0; o < size; o += 64) __asm__ volatile("dc civac, %0" : : "r"(cached + o) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+  }
+  memset(d.va, 0, size);
+  __asm__ volatile("dsb sy" ::: "memory");
+  return true;
+}
+inline void tcm16(uint32_t addr, uint16_t v) { winTo(addr); *reinterpret_cast<volatile uint16_t *>(gBar0 + (addr & 0xfff)) = v; __asm__ volatile("dsb sy" ::: "memory"); }
+inline uint16_t tcm16r(uint32_t addr) { winTo(addr); return *reinterpret_cast<volatile uint16_t *>(gBar0 + (addr & 0xfff)); }
+struct Ring { uint32_t off, items, itemsz, widx, ridx; uint16_t w, r; uint32_t seq; uint32_t hw, hr; };   // hw/hr: index slots in host memory (DMA indices)
+Ring gRing[5];
+uint32_t gShared, gPcieCore = 0x18001000;
+// layout of gDma (offsets)
+constexpr uint32_t kRingOff[5] = {0x0000, 0x1000, 0x9000, 0xA000, 0x10000};
+constexpr uint32_t kScratch = 0x1A000, kRingUpd = 0x1B000, kIoctlReq = 0x1C000, kIoctlResp = 0x1E000 /* 8 x 8 KB */, kEvent = 0x2E000 /* 8 x 2 KB */;
+constexpr uint32_t kIdx = 0x30000;   // DMA index buffer (4-byte indices): h2d w, h2d r, d2h w, d2h r
+constexpr uint32_t kDmaSize = 0x40000;
+void bell() { ramPut(gPcieCore + 0xA20, 1); }   // H2D_MAILBOX_0 (PCIe2 core rev >= 64)
+uint8_t *ringSlot(Ring &r, uint16_t i) { return gDma.va + r.off + i * r.itemsz; }
+inline uint32_t hidx(uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(gDma.va + off); }
+inline void hidxPut(uint32_t off, uint32_t v) { *reinterpret_cast<volatile uint32_t *>(gDma.va + off) = v; __asm__ volatile("dsb sy" ::: "memory"); }
+uint32_t ridxGet(const Ring &r, bool wr) { return gDmaIdx ? hidx(wr ? r.hw : r.hr) : tcm16r(wr ? r.widx : r.ridx); }
+void ridxPut(const Ring &r, bool wr, uint16_t v) { if (gDmaIdx) hidxPut(wr ? r.hw : r.hr, v); else tcm16(wr ? r.widx : r.ridx, v); }
+bool h2dPush(unsigned ring, const void *msg, uint32_t len) {
+  Ring &r = gRing[ring];
+  r.r = static_cast<uint16_t>(ridxGet(r, false));
+  if (static_cast<uint16_t>((r.w + 1) % r.items) == r.r) return false;   // full
+  uint8_t *slot = ringSlot(r, r.w);
+  memset(slot, 0, r.itemsz);
+  memcpy(slot, msg, len);
+  slot[2] = 0;                                   // flags: the ring's phase (0 for H2D rings)
+  slot[3] = static_cast<uint8_t>(r.seq % 253);   // epoch: bcmdhd numbers each H2D ring's messages from H2D_EPOCH_INIT_VAL (254)
+  r.seq++;
+  __asm__ volatile("dsb sy" ::: "memory");
+  r.w = static_cast<uint16_t>((r.w + 1) % r.items);
+  ridxPut(r, true, r.w);
+  bell();
+  return true;
+}
+uint32_t gReqId = 0x100;
+void putAddr(uint8_t *p, uint64_t pa) { const uint32_t lo = static_cast<uint32_t>(pa), hi = static_cast<uint32_t>(pa >> 32); memcpy(p, &lo, 4); memcpy(p + 4, &hi, 4); }
+int msgbuf() {
+  if (!gBar0 || !gCfg) { printf("pcie: stage 8: run stages 3, 5-7 first\n"); return 1; }
+  const Core *cr4 = nullptr;
+  for (unsigned i = 0; i < gNumCores; ++i) { if (gCores[i].id == 0x83e) cr4 = &gCores[i]; if (gCores[i].id == 0x83c) gPcieCore = gCores[i].base; }
+  (void)cr4;
+  gShared = ramRead(kRamBase + 0x220000 - 4);
+  if (gShared <= kRamBase || gShared >= kRamBase + 0x220000) { printf("pcie: stage 8: no shared structure (%#x)\n", gShared); return 1; }
+  const uint32_t flags = ramRead(gShared), ver = flags & 0xff, ringInfo = ramRead(gShared + 48);
+  const uint16_t maxRxPost = static_cast<uint16_t>(ramRead(gShared + 32) >> 16);
+  const uint32_t ringMem = ramRead(ringInfo), h2dW = ramRead(ringInfo + 4), h2dR = ramRead(ringInfo + 8), d2hW = ramRead(ringInfo + 12), d2hR = ramRead(ringInfo + 16);
+  const uint32_t maxes = ramRead(ringInfo + 52), maxCompl = ramRead(ringInfo + 56) & 0xffff;
+  printf("pcie: stage 8: shared %#x flags %#x v%u, ring info %#x: ringmem %#x idx h2d w %#x r %#x d2h w %#x r %#x, max flow %u sub %u, rxpost %u\n", gShared, flags, ver,
+         ringInfo, ringMem, h2dW, h2dR, d2hW, d2hR, maxes & 0xffff, maxes >> 16, maxRxPost);
+  if (!gDma.va && !dmaAlloc(gDma, kDmaSize)) { printf("pcie: stage 8: no DMA memory\n"); return -1; }
+  memset(gDma.va, 0, kDmaSize); __asm__ volatile("dsb sy" ::: "memory");
+  printf("pcie: stage 8: host memory %#llx (%u KB)\n", static_cast<unsigned long long>(gDma.pa), kDmaSize / 1024);
+  // DMA indices (the firmware reads/writes the ring indices in host memory): four arrays of 4-byte slots
+  const uint32_t maxSub = maxes >> 16, hW = kIdx, hR = hW + maxSub * 4, dW = hR + maxSub * 4, dR = dW + maxCompl * 4;
+  const uint64_t ia[4] = {gDma.pa + hW, gDma.pa + hR, gDma.pa + dW, gDma.pa + dR};
+  for (unsigned k = 0; k < 4 && gDmaIdx; ++k) { ramPut(ringInfo + 20 + k * 8, static_cast<uint32_t>(ia[k])); ramPut(ringInfo + 24 + k * 8, static_cast<uint32_t>(ia[k] >> 32)); }
+  printf("pcie: stage 8: %u completion rings; DMA indices at %#llx\n", maxCompl, static_cast<unsigned long long>(ia[0]));
+  const uint32_t items[5] = {64, 1024, 64, 1024, 1024};
+  const uint32_t isz[5] = {40, 32, 24, ver >= 7 ? 24u : 16u, ver >= 7 ? 40u : 32u};
+  for (unsigned i = 0; i < 5; ++i) {
+    Ring &r = gRing[i];
+    r.off = kRingOff[i]; r.items = items[i]; r.itemsz = isz[i]; r.w = r.r = 0; r.seq = 254;
+    r.widx = i < 2 ? h2dW + i * 4 : d2hW + (i - 2) * 4;
+    r.ridx = i < 2 ? h2dR + i * 4 : d2hR + (i - 2) * 4;
+    r.hw = i < 2 ? hW + i * 4 : dW + (i - 2) * 4;
+    r.hr = i < 2 ? hR + i * 4 : dR + (i - 2) * 4;
+    const uint32_t mem = ringMem + i * 16;
+    const uint64_t pa = gDma.pa + r.off;
+    ramPut(mem + 8, static_cast<uint32_t>(pa)); ramPut(mem + 12, static_cast<uint32_t>(pa >> 32));
+    tcm16(mem + 4, static_cast<uint16_t>(r.items)); tcm16(mem + 6, static_cast<uint16_t>(r.itemsz));
+    tcm16(r.widx, 0); tcm16(r.ridx, 0);
+  }
+  ramPut(gShared + 52, 8); ramPut(gShared + 56, static_cast<uint32_t>(gDma.pa + kScratch)); ramPut(gShared + 60, static_cast<uint32_t>((gDma.pa + kScratch) >> 32));
+  // host_cap (pciedev_shared +84): IPC version 7, host ready supported (bcmdhd dhd_set_host_cap)
+  if (gHostCap) ramPut(gShared + 84, 7u | ((flags & 0x10000000) ? 0x400u : 0u));
+  if (flags & 0x10000000) ramPut(gPcieCore + 0xA24, 1);   // host ready (H2D_MAILBOX_1)
+  IOSleep(50);
+  // ioctl response and event buffers
+  uint8_t m[40];
+  for (unsigned i = 0; i < 8; ++i) {
+    memset(m, 0, sizeof m); m[0] = 0x0B; const uint32_t id = 0x1000 + i; memcpy(m + 4, &id, 4);
+    const uint16_t blen = 8192; memcpy(m + 8, &blen, 2); putAddr(m + 16, gDma.pa + kIoctlResp + i * 8192);
+    if (!h2dPush(0, m, 24)) { printf("pcie: stage 8: control ring full\n"); return 1; }
+    memset(m, 0, sizeof m); m[0] = 0x0D; const uint32_t eid = 0x2000 + i; memcpy(m + 4, &eid, 4);
+    const uint16_t elen = 2048; memcpy(m + 8, &elen, 2); putAddr(m + 16, gDma.pa + kEvent + i * 2048);
+    h2dPush(0, m, 24);
+  }
+  // WLC_GET_VAR "cur_etheraddr"
+  memset(gDma.va + kIoctlReq, 0, 64);
+  memcpy(gDma.va + kIoctlReq, "cur_etheraddr", 14);
+  __asm__ volatile("dsb sy" ::: "memory");
+  memset(m, 0, sizeof m); m[0] = 0x09; const uint32_t rid = 0x7777; memcpy(m + 4, &rid, 4);
+  const uint32_t cmd = 262; memcpy(m + 8, &cmd, 4); const uint16_t tid = 1, inlen = 32, outlen = 32; memcpy(m + 12, &tid, 2); memcpy(m + 14, &inlen, 2); memcpy(m + 16, &outlen, 2);
+  putAddr(m + 24, gDma.pa + kIoctlReq);
+  h2dPush(0, m, 40);
+  printf("pcie: stage 8: posted 8 ioctl and 8 event buffers and the ioctl; h2d ctrl w %u r %u (dma idx %u, host_cap %u)\n", gRing[0].w, ridxGet(gRing[0], false), gDmaIdx, gHostCap);
+  // completions
+  Ring &c = gRing[2];
+  bool done = false;
+  for (unsigned ms = 0; ms < 2000 && !done; ms += 5) {
+    IOSleep(5);
+    const uint16_t w = static_cast<uint16_t>(ridxGet(c, true));
+    while (c.r != w) {
+      const uint8_t *it = ringSlot(c, c.r);
+      uint32_t reqid; memcpy(&reqid, it + 4, 4);
+      uint16_t status; memcpy(&status, it + 8, 2);
+      uint16_t ringid, widx; memcpy(&ringid, it + 10, 2); memcpy(&widx, it + 12, 2);
+      printf("pcie: stage 8: d2h ctrl msg type %#x flags %#x epoch %u req %#x status %u ring %u widx %u\n", it[0], it[2], it[3], reqid, status, ringid, widx);
+      if (it[0] == 0x0C) {
+        uint16_t rlen; memcpy(&rlen, it + 12, 2);
+        const uint8_t *buf = (reqid >= 0x1000 && reqid < 0x1008) ? gDma.va + kIoctlResp + (reqid - 0x1000) * 8192 : nullptr;
+        if (buf) printf("pcie: stage 8: ioctl answer %u bytes: MAC %02x:%02x:%02x:%02x:%02x:%02x\n", rlen, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]);
+        done = true;
+      }
+      c.r = static_cast<uint16_t>((c.r + 1) % c.items);
+      ridxPut(c, false, c.r);
+    }
+  }
+  printf("pcie: stage 8: indices host h2d w %u r %u, d2h w %u r %u; TCM h2d w %u r %u, d2h w %u r %u\n", hidx(gRing[0].hw), hidx(gRing[0].hr),
+         hidx(gRing[2].hw), hidx(gRing[2].hr), tcm16r(gRing[0].widx), tcm16r(gRing[0].ridx), tcm16r(gRing[2].widx), tcm16r(gRing[2].ridx));
+  const uint32_t trap = ramRead(gShared + 4);
+  printf("pcie: stage 8: %s; shared flags now %#x trap %#x\n", done ? "ioctl answered" : "no ioctl answer in 2 s", ramRead(gShared), trap);
+  return done ? 0 : 1;
+}
+
+// Stage 9 (after 8): DMA loopback (MSG_TYPE_LPBK_DMAXFER 0x13): the chip copies 256 bytes from one host buffer to another,
+// which proves its reads of host memory; raw dumps of a ring status and of our first ring slot.
+int loopback() {
+  if (!gDma.va) return 1;
+  uint8_t *src = gDma.va + kIoctlReq + 0x1000, *dst = gDma.va + kIoctlReq + 0x1800;
+  for (unsigned i = 0; i < 256; ++i) { src[i] = static_cast<uint8_t>(0xA5 ^ i); dst[i] = 0; }
+  __asm__ volatile("dsb sy" ::: "memory");
+  uint8_t m[40] = {};
+  m[0] = 0x13; const uint32_t id = 0x5150; memcpy(m + 4, &id, 4);
+  putAddr(m + 8, gDma.pa + kIoctlReq + 0x1000); putAddr(m + 16, gDma.pa + kIoctlReq + 0x1800);
+  const uint32_t len = 256, delay = 0; memcpy(m + 24, &len, 4); memcpy(m + 28, &delay, 4); memcpy(m + 32, &delay, 4);
+  const uint8_t *s0 = ringSlot(gRing[0], 0);
+  printf("pcie: stage 9: our ctrl slot 0: %02x %02x %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x %02x %02x\n", s0[0], s0[1], s0[2], s0[3], s0[4], s0[5],
+         s0[6], s0[7], s0[8], s0[9], s0[10], s0[11], s0[12], s0[13], s0[14], s0[15]);
+  if (!h2dPush(0, m, 40)) return 1;
+  Ring &c = gRing[2];
+  for (unsigned ms = 0; ms < 1000; ms += 5) {
+    IOSleep(5);
+    const uint16_t w = static_cast<uint16_t>(ridxGet(c, true));
+    while (c.r != w) {
+      const uint8_t *it = ringSlot(c, c.r);
+      printf("pcie: stage 9: d2h raw %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n", it[0], it[1],
+             it[2], it[3], it[4], it[5], it[6], it[7], it[8], it[9], it[10], it[11], it[12], it[13], it[14], it[15], it[16], it[17], it[18], it[19], it[20], it[21], it[22], it[23]);
+      c.r = static_cast<uint16_t>((c.r + 1) % c.items);
+      ridxPut(c, false, c.r);
+    }
+  }
+  // error bits: endpoint status (Received Master/Target Abort), its PCIe device status; root port status; the HSI2 S2MPU
+  {
+    auto ec = [](uint32_t off) { return *reinterpret_cast<volatile uint32_t *>(gCfg + off); };
+    uint32_t cap = ec(0x34) & 0xff, pcap = 0;
+    for (unsigned n = 0; cap && n < 16; ++n) { const uint32_t h = ec(cap); if ((h & 0xff) == 0x10) { pcap = cap; break; } cap = (h >> 8) & 0xff; }
+    const uint32_t rc = *reinterpret_cast<volatile uint32_t *>(gWin[kD].va + 0x04);
+    printf("pcie: stage 9: endpoint cmd/status %#x, pcie cap %#x devctl/sta %#x; root port cmd/status %#x, secondary status %#x\n", ec(0x04), pcap,
+           pcap ? ec(pcap + 8) : 0, rc, *reinterpret_cast<volatile uint32_t *>(gWin[kD].va + 0x1c));
+    // (the HSI2 S2MPU at 0x131f0000 is secure: reading it took an SError on fullos206)
+  }
+  unsigned same = 0;
+  for (unsigned i = 0; i < 256; ++i) same += dst[i] == src[i];
+  printf("pcie: stage 9: loopback destination matches %u of 256 bytes (first %02x %02x %02x %02x)\n", same, dst[0], dst[1], dst[2], dst[3]);
+  return same == 256 ? 0 : 1;
+}
+
+// Stage 20: the firmware's console (hnd_cons_t at pciedev_shared +20: log buffer address +8, size +12, write index +16), last 2 KB.
+int console() {
+  if (!gShared) gShared = ramRead(kRamBase + 0x220000 - 4);
+  const uint32_t cons = ramRead(gShared + 20);
+  if (cons <= kRamBase || cons >= kRamBase + 0x220000) { printf("pcie: console: none (%#x)\n", cons); return 1; }
+  const uint32_t buf = ramRead(cons + 8), size = ramRead(cons + 12), widx = ramRead(cons + 16);
+  printf("pcie: console at %#x: buffer %#x, %u bytes, write index %u\n", cons, buf, size, widx);
+  if (!size || size > 0x10000) return 1;
+  const uint32_t n = size < 2048 ? size : 2048;
+  char line[160]; unsigned l = 0;
+  for (uint32_t k = 0; k < n; ++k) {
+    const uint32_t i = (widx + size - n + k) % size;
+    const uint32_t w = ramRead(buf + (i & ~3u));
+    const char ch = static_cast<char>((w >> ((i & 3) * 8)) & 0xff);
+    if (ch == '\r' || ch == 0) continue;
+    if (ch == '\n' || l == sizeof line - 1) { line[l] = 0; if (l) printf("pcie: fw: %s\n", line); l = 0; IODelay(200); continue; }
+    line[l++] = ch;
+  }
+  return 0;
+}
+
 int command(unsigned stage) {
   if (stage == 1) {
     const uint64_t phy = smcPmuRead(kPmuPhyCtrl);
@@ -437,6 +656,11 @@ int command(unsigned stage) {
   if (stage == 5) return backplane();
   if (stage == 6) return enumerate();
   if (stage == 7) return download();
+  if (stage == 8) return msgbuf();
+  if (stage == 9) return loopback();
+  if (stage == 20) return console();
+  if (stage == 14 || stage == 15) { gLowMem = stage - 14; gDma.va = nullptr; printf("pcie: host rings in %s\n", gLowMem ? "the low bank" : "macOS memory"); return 0; }
+  if (stage >= 10 && stage <= 13) { if (stage < 12) gHostCap = stage - 10; else gDmaIdx = stage - 12; printf("pcie: host_cap %u, DMA indices %u\n", gHostCap, gDmaIdx); return 0; }
   printf("pcie: unknown stage %u\n", stage);
   return -1;
 }

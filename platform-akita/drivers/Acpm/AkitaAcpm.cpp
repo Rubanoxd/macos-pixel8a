@@ -15,6 +15,7 @@
 // table at SRAM + 0xa000; the DVFS client is channel 0 (exynos_cal_if: acpm-ipc-channel = <0>), the thermal one channel 9 (acpm_tmu).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>   // akita: AkitaPcie.inc host rings
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 #include <machine/machine_routines.h>

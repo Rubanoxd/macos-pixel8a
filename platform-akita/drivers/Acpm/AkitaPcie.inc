@@ -178,6 +178,241 @@ int readEndpoint() {
   return (c[0] & 0xffff) == 0x14e4 ? 0 : 1;
 }
 
+// Stage 5: BARs and the chip's backplane. iATU outbound region 1 maps CPU 0x60000000..0x60efffff to the same PCI addresses (the DT's
+// memory range); the root port forwards it (memory base/limit); BAR0 (64-bit) at 0x60000000, BAR2 (64-bit) at 0x60800000 (sized first).
+// BAR0's first 4 KB shows the backplane core chosen by config register 0x80 (PCI_BAR0_WIN): chipcommon at 0x18000000, whose word 0
+// is the chip id (low 16 bits 0x4383).
+volatile uint8_t *gBar0;
+int backplane() {
+  if (readEndpoint() != 0) return 1;
+  static volatile uint8_t *cfg;
+  if (!cfg) cfg = reinterpret_cast<volatile uint8_t *>(ml_io_map(0x60ffe000, 0x2000));
+  static volatile uint8_t *atu;
+  if (!atu) atu = reinterpret_cast<volatile uint8_t *>(ml_io_map(0x13400000 + 0x300000, 0x1000));
+  auto ec = [](uint32_t off) -> volatile uint32_t & { return *reinterpret_cast<volatile uint32_t *>(cfg + off); };
+  auto at = [](uint32_t off) -> volatile uint32_t & { return *reinterpret_cast<volatile uint32_t *>(atu + off); };
+  auto dbi = [](uint32_t off) -> volatile uint32_t & { return *reinterpret_cast<volatile uint32_t *>(gWin[kD].va + off); };
+  // size the BARs
+  uint32_t size[6];
+  for (unsigned b = 0; b < 6; ++b) {
+    const uint32_t old = ec(0x10 + b * 4);
+    ec(0x10 + b * 4) = 0xffffffffu;
+    size[b] = ec(0x10 + b * 4);
+    ec(0x10 + b * 4) = old;
+  }
+  printf("pcie: stage 5: BAR masks %#x %#x %#x %#x %#x %#x\n", size[0], size[1], size[2], size[3], size[4], size[5]);
+  ec(0x10) = 0x60000000; ec(0x14) = 0;
+  ec(0x18) = 0x60800000; ec(0x1c) = 0;
+  ec(0x04) = ec(0x04) | 0x6;
+  dbi(0x20) = 0x60e06000;   // root port memory window 0x60000000..0x60efffff
+  at(0x200 + 0x08) = 0x60000000; at(0x200 + 0x0c) = 0; at(0x200 + 0x10) = 0x60efffff;
+  at(0x200 + 0x14) = 0x60000000; at(0x200 + 0x18) = 0;
+  at(0x200 + 0x00) = 0;               // MEM
+  at(0x200 + 0x04) = 0x80000000u;
+  __asm__ volatile("dsb sy" ::: "memory");
+  IODelay(100);
+  if (!gBar0) gBar0 = reinterpret_cast<volatile uint8_t *>(ml_io_map(0x60000000, 0x8000));
+  if (!gBar0) return -1;
+  ec(0x80) = 0x18000000;   // BAR0 window: chipcommon
+  __asm__ volatile("dsb sy" ::: "memory");
+  const uint32_t chipid = *reinterpret_cast<volatile uint32_t *>(gBar0);
+  const uint32_t caps = *reinterpret_cast<volatile uint32_t *>(gBar0 + 4);
+  printf("pcie: stage 5: BAR0 %#x BAR2 %#x cmd %#x; chipcommon id %#x (chip %#x rev %u pkg %u, %u cores), caps %#x\n", ec(0x10), ec(0x18), ec(0x04) & 0xffff,
+         chipid, chipid & 0xffff, (chipid >> 16) & 0xf, (chipid >> 20) & 0xf, (chipid >> 24) & 0xf, caps);
+  return (chipid & 0xffff) == 0x4383 ? 0 : 1;
+}
+
+// Backplane access through BAR0's first window (config register 0x80 selects the 4 KB page).
+volatile uint8_t *gCfg;
+uint32_t bpRead(uint32_t addr) {
+  if (!gCfg) gCfg = reinterpret_cast<volatile uint8_t *>(ml_io_map(0x60ffe000, 0x2000));
+  *reinterpret_cast<volatile uint32_t *>(gCfg + 0x80) = addr & ~0xfffu;
+  __asm__ volatile("dsb sy" ::: "memory");
+  return *reinterpret_cast<volatile uint32_t *>(gBar0 + (addr & 0xfff));
+}
+void bpWrite(uint32_t addr, uint32_t value) {
+  if (!gCfg) gCfg = reinterpret_cast<volatile uint8_t *>(ml_io_map(0x60ffe000, 0x2000));
+  *reinterpret_cast<volatile uint32_t *>(gCfg + 0x80) = addr & ~0xfffu;
+  __asm__ volatile("dsb sy" ::: "memory");
+  *reinterpret_cast<volatile uint32_t *>(gBar0 + (addr & 0xfff)) = value;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+struct Core { uint32_t id, rev, base, wrap; };
+Core gCores[32];
+unsigned gNumCores;
+// Stage 6: walk the AXI enumeration ROM (aiutils.c ai_scan, simplified): every component's id and revision, its first slave port
+// address and its first wrapper. Read only.
+int enumerate() {
+  if (!gBar0 && backplane() != 0) return 1;
+  const uint32_t erom = bpRead(0x18000000 + 0xfc);
+  printf("pcie: stage 6: EROM at %#x\n", erom);
+  uint32_t at = erom;
+  gNumCores = 0;
+  auto next = [&at]() { const uint32_t v = bpRead(at); at += 4; return v; };
+  for (unsigned guard = 0; guard < 1024 && gNumCores < 32; ++guard) {
+    uint32_t cia = next();
+    if ((cia & 0xe) == 0xe) break;                    // ER_END
+    if ((cia & 0x7) != 0x1) continue;                 // not a valid component descriptor
+    const uint32_t cib = next();
+    const uint32_t cid = (cia >> 8) & 0xfff, mfg = cia >> 20, rev = cib >> 24;
+    const unsigned nmp = (cib >> 4) & 0x1f, nsp = (cib >> 9) & 0x1f, nmw = (cib >> 14) & 0x1f, nsw = (cib >> 19) & 0x1f;
+    for (unsigned i = 0; i < nmp; ++i) next();        // master port descriptors
+    uint32_t base = 0, wrap = 0;
+    // address descriptors until the next component (peek: a component descriptor has tag 0)
+    for (unsigned k = 0; k < 64; ++k) {
+      const uint32_t ad = bpRead(at);
+      if ((ad & 0xe) != 0x4 || !(ad & 1)) break;      // not an address descriptor
+      at += 4;
+      if (ad & 0x8) at += 4;                          // 64-bit address: upper word
+      if ((ad & 0x30) == 0x30) { const uint32_t sd = next(); if (sd & 0x8) at += 4; }   // size descriptor(s)
+      const uint32_t type = ad & 0xc0, port = (ad >> 8) & 0xf, addr = ad & 0xfffff000u;
+      if (type == 0x00 && port == 0 && !base) base = addr;
+      if ((type == 0xc0 || type == 0x80) && !wrap) wrap = addr;
+    }
+    if (mfg == 0x4bf || cid >= 0x800) {               // Broadcom components (skip ARM's bus bridges without a slave)
+      gCores[gNumCores++] = {cid, rev, base, wrap};
+      printf("pcie: stage 6: core %#x rev %u at %#x, wrapper %#x (masters %u slaves %u mwrap %u swrap %u)\n", cid, rev, base, wrap, nmp, nsp, nmw, nsw);
+    }
+  }
+  printf("pcie: stage 6: %u cores\n", gNumCores);
+  return gNumCores ? 0 : 1;
+}
+
+// ---- Stage 7: firmware into the chip's RAM and its ARM Cortex-R4 started (bcmdhd __dhdpcie_bus_download_state for a CR4) ----
+// The firmware, NVRAM and CLM blob come from the phone's own vendor partition, copied to /Users/akita/.akita/wifi/ (never shipped).
+int readFile(const char *path, uint8_t *buf, int max) {
+  vfs_context_t ctx = vfs_context_create(nullptr);
+  vnode_t vp = nullptr;
+  int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+  int total = -1;
+  if (!err) {
+    total = 0;
+    while (total < max) {
+      int resid = 0, chunk = max - total > 65536 ? 65536 : max - total;
+      err = vn_rdwr(UIO_READ, vp, reinterpret_cast<caddr_t>(buf + total), chunk, total, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+      if (err) { total = -1; break; }
+      total += chunk - resid;
+      if (resid) break;
+    }
+    vnode_close(vp, FREAD, ctx);
+  }
+  vfs_context_rele(ctx);
+  if (total < 0) printf("pcie: cannot read %s (%d)\n", path, err);
+  return total;
+}
+// RAM writes and reads through BAR0's window, the window moved only when the 4 KB page changes.
+uint32_t gWinPage = 1;
+void winTo(uint32_t addr) {
+  if ((addr & ~0xfffu) == gWinPage) return;
+  *reinterpret_cast<volatile uint32_t *>(gCfg + 0x80) = gWinPage = addr & ~0xfffu;
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+void ramWrite(uint32_t addr, const uint8_t *src, uint32_t len) {   // addr and len multiples of 4
+  for (uint32_t i = 0; i < len; i += 4) {
+    winTo(addr + i);
+    uint32_t w; memcpy(&w, src + i, 4);
+    *reinterpret_cast<volatile uint32_t *>(gBar0 + ((addr + i) & 0xfff)) = w;
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+}
+uint32_t ramRead(uint32_t addr) { winTo(addr); return *reinterpret_cast<volatile uint32_t *>(gBar0 + (addr & 0xfff)); }
+void ramPut(uint32_t addr, uint32_t v) { winTo(addr); *reinterpret_cast<volatile uint32_t *>(gBar0 + (addr & 0xfff)) = v; __asm__ volatile("dsb sy" ::: "memory"); }
+// AI wrapper reset (aiutils.c _ai_core_reset): ioctrl +0x408, resetctrl +0x800, resetstatus +0x804.
+void coreReset(uint32_t wrap, uint32_t bits, uint32_t resetbits) {
+  for (unsigned i = 0; i < 300 && ramRead(wrap + 0x804); ++i) IODelay(10);
+  ramPut(wrap + 0x800, 1); IODelay(10);
+  ramPut(wrap + 0x408, bits | resetbits | 0x2 | 0x1); (void)ramRead(wrap + 0x408);
+  for (unsigned i = 0; i < 300 && ramRead(wrap + 0x804); ++i) IODelay(10);
+  for (unsigned i = 0; i < 10000 && (ramRead(wrap + 0x800) & 1); ++i) { ramPut(wrap + 0x800, 0); IODelay(1); }
+  ramPut(wrap + 0x408, bits | 0x1); (void)ramRead(wrap + 0x408);
+}
+constexpr uint32_t kRamBase = 0x6E0000;   // CR4_4383_RAM_BASE
+int download() {
+  if ((!gNumCores && enumerate() != 0) || !gCfg) return 1;
+  gWinPage = 1;
+  const Core *cr4 = nullptr;
+  for (unsigned i = 0; i < gNumCores; ++i) if (gCores[i].id == 0x83e) cr4 = &gCores[i];
+  if (!cr4 || !cr4->wrap) { printf("pcie: stage 7: no ARM CR4\n"); return 1; }
+  // TCM size from the CR4's banks (brcmfmac brcmf_chip_tcm_ramsize)
+  const uint32_t cap = ramRead(cr4->base + 4);
+  const unsigned banks = (cap & 0xf) + ((cap >> 4) & 0xf);
+  uint32_t ramsize = 0;
+  for (unsigned b = 0; b < banks; ++b) {
+    ramPut(cr4->base + 0x40, b);
+    const uint32_t info = ramRead(cr4->base + 0x44);
+    ramsize += ((info & 0xff) + 1) * ((info & 0x200) ? 1024 : 8192);
+  }
+  printf("pcie: stage 7: CR4 cap %#x, %u banks, RAM %#x bytes at %#x\n", cap, banks, ramsize, kRamBase);
+  if (!ramsize || ramsize > 0x400000) return 1;
+  // files
+  const int fwMax = 0x200000, nvMax = 0x10000;
+  uint8_t *fw = static_cast<uint8_t *>(IOMalloc(fwMax)), *nv = static_cast<uint8_t *>(IOMalloc(nvMax)), *vars = static_cast<uint8_t *>(IOMallocZero(nvMax + 8));
+  int fwLen = fw ? readFile("/Users/akita/.akita/wifi/fw.bin", fw, fwMax) : -1;
+  int nvLen = nv ? readFile("/Users/akita/.akita/wifi/nvram.txt", nv, nvMax) : -1;
+  int rc = 1;
+  if (fwLen > 0 && nvLen > 0 && vars && static_cast<uint32_t>(fwLen) < ramsize - 0x20000) {
+    // NVRAM text to "key=value\0...\0": no comments, no blank lines, trimmed
+    int vlen = 0;
+    for (int i = 0; i < nvLen;) {
+      int e = i; while (e < nvLen && nv[e] != '\n') ++e;
+      int a = i, b = e;
+      while (a < b && (nv[a] == ' ' || nv[a] == '\t')) ++a;
+      while (b > a && (nv[b - 1] == '\r' || nv[b - 1] == ' ' || nv[b - 1] == '\t')) --b;
+      if (b > a && nv[a] != '#') { memcpy(vars + vlen, nv + a, b - a); vlen += b - a; vars[vlen++] = 0; }
+      i = e + 1;
+    }
+    vars[vlen++] = 0;
+    const uint32_t varsz = (vlen + 3) & ~3u;
+    // enter download state: halt the ARM, clear the shared-address word
+    coreReset(cr4->wrap, 0x20, 0x20);   // SICF_CPUHALT
+    ramPut(kRamBase + ramsize - 4, 0);
+    // firmware
+    const uint32_t fwsz = (fwLen + 3) & ~3u;
+    for (int i = fwLen; i < static_cast<int>(fwsz); ++i) fw[i] = 0;
+    ramWrite(kRamBase, fw, fwsz);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < fwsz; i += 4096) { uint32_t w; memcpy(&w, fw + i, 4); if (ramRead(kRamBase + i) != w) ++bad; }
+    // vars at the top, the length token in the last word
+    const uint32_t varaddr = kRamBase + ramsize - 4 - varsz;
+    ramWrite(varaddr, vars, varsz);
+    const uint32_t words = varsz / 4, token = (~words << 16) | (words & 0xffff);
+    ramPut(kRamBase + ramsize - 4, token);
+    // random-seed rTLV right below the vars (type 0xFEEDC0DE, length without checksum)
+    uint8_t rnd[128];
+    read_random(rnd, sizeof rnd);
+    const uint32_t rndaddr = varaddr - 8 - sizeof rnd;
+    ramWrite(rndaddr, rnd, sizeof rnd);
+    ramPut(rndaddr + sizeof rnd, sizeof rnd);
+    ramPut(rndaddr + sizeof rnd + 4, 0xFEEDC0DEu);
+    // reset vector: the image's first word at address 0
+    uint32_t resetinstr; memcpy(&resetinstr, fw, 4);
+    const uint32_t at0 = ramRead(0);
+    ramPut(0, resetinstr);
+    printf("pcie: stage 7: firmware %d bytes (%u page mismatches), vars %u bytes at %#x token %#x, address 0 was %#x now %#x (want %#x)\n", fwLen, bad,
+           varsz, varaddr, token, at0, ramRead(0), resetinstr);
+    // exit download state: let the ARM run
+    coreReset(cr4->wrap, 0, 0);
+    // the firmware replaces the last word with the address of its pciedev_shared structure
+    uint32_t shared = token;
+    unsigned ms = 0;
+    for (; ms < 3000; ms += 10) { IOSleep(10); shared = ramRead(kRamBase + ramsize - 4); if (shared != token && shared != 0) break; }
+    printf("pcie: stage 7: after %u ms the shared word is %#x%s\n", ms, shared, shared != token && shared ? " (firmware up)" : " (no answer)");
+    if (shared > kRamBase && shared < kRamBase + ramsize) {
+      uint32_t sh[8];
+      for (unsigned i = 0; i < 8; ++i) sh[i] = ramRead(shared + i * 4);
+      printf("pcie: stage 7: pciedev_shared flags %#x (protocol version %u) trap %#x assert %#x %#x console %#x msgtrace %#x %#x\n", sh[0], sh[0] & 0xff,
+             sh[1], sh[2], sh[3], sh[4], sh[5], sh[6]);
+      rc = 0;
+    }
+  } else {
+    printf("pcie: stage 7: firmware %d bytes, nvram %d bytes: missing or too big\n", fwLen, nvLen);
+  }
+  if (fw) IOFree(fw, fwMax);
+  if (nv) IOFree(nv, nvMax);
+  if (vars) IOFree(vars, nvMax + 8);
+  return rc;
+}
+
 int command(unsigned stage) {
   if (stage == 1) {
     const uint64_t phy = smcPmuRead(kPmuPhyCtrl);
@@ -199,6 +434,9 @@ int command(unsigned stage) {
   }
   if (stage == 3) return bringUp();
   if (stage == 4) return readEndpoint();
+  if (stage == 5) return backplane();
+  if (stage == 6) return enumerate();
+  if (stage == 7) return download();
   printf("pcie: unknown stage %u\n", stage);
   return -1;
 }

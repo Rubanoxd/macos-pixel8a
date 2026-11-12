@@ -153,7 +153,7 @@ index 604f16a..b8b34e4 100644
  STARTUP(TUNABLES, STARTUP_RANK_FIRST, csr_bootstrap);
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24..d441b61 100644
+index 2467b24..5be2918 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -2738,6 +2738,10 @@ cleanup_rosetta_fp:
@@ -167,7 +167,7 @@ index 2467b24..d441b61 100644
  
  #if CONFIG_SECLUDED_MEMORY
  	if (secluded_for_apps &&
-@@ -8065,6 +8069,823 @@ static const char * init_programs[] = {
+@@ -8065,6 +8069,825 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
@@ -342,6 +342,8 @@ index 2467b24..d441b61 100644
 +    "  if [ -z \"$(vol AkitaData)\" ] && [ -z \"$(/bin/dd if=/dev/r$W bs=4096 count=8 2> /dev/null | /usr/bin/tr -d '\\000')\" ]; then\n"
 +    "    /sbin/newfs_apfs -v AkitaData /dev/$W && sleep 3 && C=$(vol AkitaData) && /sbin/newfs_apfs -A -v VM /dev/${C%s*} && sleep 2\n"
 +    "    echo \"AKITA rc.server: formatted the persistent window $W\" > /dev/console\n"
++    /* the APFS roles a Mac's volumes have (Data, VM): Finder then hides the data volume; diskutil needs the session's daemons */
++    "    ( sleep 120; /usr/sbin/diskutil apfs changeVolumeRole $(vol AkitaData) D; /usr/sbin/diskutil apfs changeVolumeRole $(vol VM) V ) > /dev/null 2>&1 &\n"
 +    "  fi\n"
 +    "  D=$(vol AkitaData); V=$(vol VM)\n"
 +    /* the home volume is mounted at /Users/akita once the template is in (below): fullos188 put it under /System/Volumes/Data
@@ -393,8 +395,8 @@ index 2467b24..d441b61 100644
 +    /* MiniLauncher treats this RAM-made account as new at every boot and runs MiniBuddy unless ~/.skipbuddy exists */
 +    "/usr/bin/touch $H/.skipbuddy && /usr/sbin/chown 501:20 $H/.skipbuddy\n"
 +    "/usr/bin/touch /private/var/db/.AppleSetupDone\n"
-+    /* akita: the Wi-Fi interface (AkitaPcie.inc, akita-wifi=1) appears a minute or two after boot: ask for an address by DHCP then */
-+    "( i=0; while [ $i -lt 300 ]; do /sbin/ifconfig en1 > /dev/null 2>&1 && { /usr/sbin/ipconfig set en1 DHCP; echo 'AKITA rc.server: en1 set to DHCP' > /dev/console; break; }; i=$((i+1)); sleep 2; done ) &\n"
++    /* akita: no display sleep: set by the autologin job (it locks the session, and without a Secure Enclave the lock delay cannot change) */
++    /* akita: DHCP on the Wi-Fi interface (en1) is asked by the autologin job (rc.server's background jobs die with it) */
 +    "echo \"AKITA rc.server: done (etc=$(ls /private/etc | wc -l) var=$(ls /private/var | wc -l) ld=$(ls /System/Library/LaunchDaemons | wc -l) user=$(id -u akita 2>&1))\" > /dev/console\n"
 +    "exit 0\n";
 +
@@ -403,7 +405,7 @@ index 2467b24..d441b61 100644
 +/* the boot-time loginwindow skips autologin (it starts before the session can be built); restarting it once does the login */
 +/* The autologin daemon also disables services that crash-loop here (no grafted cryptexes, no push, no hardware watchdog
 + * daemon) and burn CPU and corpses; rc.server is too early for launchctl. */
-+static const char akita_fullos_autologin_plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>com.akita.autologin</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>for j in com.apple.security.xprotectd com.apple.watchdogd com.apple.apsd com.apple.endpointsecurity.endpointsecurityd com.apple.AppSSODaemon com.apple.PerfPowerServices com.apple.security.cryptexd com.apple.mobileactivationd com.apple.logd_helper; do /bin/launchctl disable system/$j; /bin/launchctl bootout system/$j &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl disable gui/501/com.apple.duetexpertd; echo AKITA autologin: crash-looping services disabled &gt; /dev/console; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 10; id akita &gt; /dev/null 2&gt;&amp;1 || continue; P=$(pgrep -x -u root loginwindow) || exit 0; /usr/bin/defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser akita; /usr/bin/touch /private/var/akita/.skipbuddy; /usr/sbin/chown 501:20 /private/var/akita/.skipbuddy; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $P; echo AKITA autologin: kicked loginwindow $P &gt; /dev/console; for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 20; /bin/launchctl print gui/501 &gt; /dev/null 2&gt;&amp;1 || continue; for g in com.apple.duetexpertd com.apple.imagent; do /bin/launchctl disable gui/501/$g; /bin/launchctl bootout gui/501/$g &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl print-disabled gui/501 | /usr/bin/grep -q duetexpertd &amp;&amp; { echo AKITA autologin: duetexpertd imagent disabled &gt; /dev/console; break; }; done; for m in 1 2 3; do sleep 30; /usr/sbin/ioreg -n Root -d1 | /usr/bin/grep -q 'ScreenIsLocked\"=Yes' || break; Q=$(pgrep -x -u root loginwindow) || break; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $Q; echo AKITA autologin: the persistent session came up locked, kicked loginwindow $Q &gt; /dev/console; done; exit 0; done</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/></dict></plist>\n";
++static const char akita_fullos_autologin_plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>com.akita.autologin</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>( n=0; while :; do /sbin/ifconfig en1 &gt; /dev/null 2&gt;&amp;1 &amp;&amp; ! /sbin/ifconfig en1 | /usr/bin/head -1 | /usr/bin/grep -q \"&lt;UP\" &amp;&amp; { /sbin/ifconfig en1 up; echo AKITA net: en1 was down, up again &gt; /dev/console; }; r=$(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '$1 == \"169.254\" {print $4; exit}'); [ -n \"$r\" ] &amp;&amp; [ \"$r\" != en0 ] &amp;&amp; { /sbin/route -n change -net 169.254.0.0/16 -interface en0 &gt; /dev/null 2&gt;&amp;1; echo AKITA net: link-local route back to en0 from $r &gt; /dev/console; }; if /sbin/ifconfig en1 2&gt; /dev/null | /usr/bin/grep -q RUNNING &amp;&amp; [ -z \"$(/usr/sbin/ipconfig getifaddr en1)\" ]; then /usr/sbin/ipconfig set en1 DHCP; echo AKITA net: en1 up, DHCP asked &gt; /dev/console; sleep 20; fi; n=$((n+1)); if [ $((n % 6)) = 1 ]; then echo \"AKITA net: en1 $(/sbin/ifconfig en1 2&gt; /dev/null | /usr/bin/awk '/inet /{print $2}' | /usr/bin/tr '\\n' ' ')| routes $(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '$1 == \"default\" || $1 == \"169.254\" {print $1 \"/\" $2 \"/\" $4}' | /usr/bin/tr '\\n' ' ')| en0 $(/sbin/ifconfig en0 | /usr/bin/awk '/inet /{print $2}')\" &gt; /dev/console; fi; sleep 10; done ) &amp; for j in com.apple.security.xprotectd com.apple.watchdogd com.apple.apsd com.apple.endpointsecurity.endpointsecurityd com.apple.AppSSODaemon com.apple.PerfPowerServices com.apple.security.cryptexd com.apple.mobileactivationd com.apple.logd_helper; do /bin/launchctl disable system/$j; /bin/launchctl bootout system/$j &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl disable gui/501/com.apple.duetexpertd; echo AKITA autologin: crash-looping services disabled &gt; /dev/console; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 10; id akita &gt; /dev/null 2&gt;&amp;1 || continue; P=$(pgrep -x -u root loginwindow) || exit 0; /usr/bin/defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser akita; /usr/bin/touch /private/var/akita/.skipbuddy; /usr/sbin/chown 501:20 /private/var/akita/.skipbuddy; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $P; echo AKITA autologin: kicked loginwindow $P &gt; /dev/console; for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 20; /bin/launchctl print gui/501 &gt; /dev/null 2&gt;&amp;1 || continue; for g in com.apple.duetexpertd com.apple.imagent; do /bin/launchctl disable gui/501/$g; /bin/launchctl bootout gui/501/$g &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl print-disabled gui/501 | /usr/bin/grep -q duetexpertd &amp;&amp; { echo AKITA autologin: duetexpertd imagent disabled &gt; /dev/console; break; }; done; /usr/bin/pmset -a displaysleep 0 disksleep 0 sleep 0 &gt; /dev/null 2&gt;&amp;1; while :; do sleep 20; /usr/sbin/ioreg -n Root -d1 | /usr/bin/grep -q 'ScreenIsLocked\"=Yes' || continue; Q=$(pgrep -x -u root loginwindow) || continue; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $Q; echo AKITA autologin: the session was locked, kicked loginwindow $Q &gt; /dev/console; done; exit 0; done</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/></dict></plist>\n";
 +static const char akita_fullos_ssh_host[] = "-----BEGIN OPENSSH PRIVATE KEY-----\nREPLACE-WITH-YOUR-OWN-HOST-KEY (ssh-keygen -t ed25519)\n-----END OPENSSH PRIVATE KEY-----\n";
 +static const char akita_fullos_ssh_auth[] = "ssh-ed25519 REPLACE-WITH-YOUR-CLIENT-PUBLIC-KEY akita-client\n";
 +static const char akita_fullos_ipkeep_plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>com.akita.ipkeep</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>while :; do /sbin/ifconfig en0 | /usr/bin/grep -q 169.254.7.2 || { /sbin/ifconfig en0 inet 169.254.7.2 netmask 255.255.0.0 alias; echo AKITA ipkeep: en0 address set &gt; /dev/console; }; /bin/sleep 5; done</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><true/></dict></plist>\n";
@@ -991,7 +993,7 @@ index 2467b24..d441b61 100644
  void
  load_init_program(proc_t p)
  {
-@@ -8074,6 +8895,24 @@ load_init_program(proc_t p)
+@@ -8074,6 +8897,24 @@ load_init_program(proc_t p)
  	mach_vm_offset_t scratch_addr = 0;
  	mach_vm_size_t map_page_size = vm_map_page_size(map);
  
@@ -1016,7 +1018,7 @@ index 2467b24..d441b61 100644
  #if DEVELOPMENT || DEBUG
  	/* Use the opportunity to initialize exec's debug log stream */
  	exec_log_handle = os_log_create("com.apple.xnu.bsd", "exec");
-@@ -8081,6 +8920,9 @@ load_init_program(proc_t p)
+@@ -8081,6 +8922,9 @@ load_init_program(proc_t p)
  
  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
  	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
@@ -1026,7 +1028,7 @@ index 2467b24..d441b61 100644
  #if CONFIG_MEMORYSTATUS
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
-@@ -8127,7 +8969,14 @@ load_init_program(proc_t p)
+@@ -8127,7 +8971,14 @@ load_init_program(proc_t p)
  		}
  	}
  

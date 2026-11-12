@@ -397,7 +397,10 @@ extern "C" int akita_acpm_get_khz(unsigned domain, uint32_t *khz) {
 }
 
 #include "AkitaTouch.inc"   // akita: the touch controller's staged bring-up (kern.akita_acpm = 2000000 + stage)
-#include <net/kpi_interface.h>   // akita: AkitaPcie.inc network interface
+#include <net/kpi_interface.h>
+extern "C" {   // akita: bpf.h has no extern "C" of its own
+#include <net/bpf.h>
+}
 #include <net/if.h>
 #include <net/if_types.h>
 #include <net/ethernet.h>

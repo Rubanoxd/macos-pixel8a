@@ -30,9 +30,13 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | Dark mode, Liquid Glass (transparency) and wallpaper at boot | ✅ |
 | **Touchscreen** (Goodix on SPI, our own driver) with gestures: tap, drag, long press = right click, two-finger scroll | ✅ |
 | Window dragging: 15.7 → **~22 fps** (batched GPU submits, early swap completion, PanVK fast paths) | ✅ (goal: 60) |
-| GPU stable under stress (ring-full fault fixed) | ✅ |
+| GPU stable under stress (ring-full fault fixed; two jobs of slack counted from the job the GPU is in) | ✅ |
+| **Real clock**: boots with the time from the PMIC's RTC (S2MPG14), kept in sync | ✅ |
+| Autologin straight to the desktop with the persistent session | ✅ |
 | CPU thermal regulator (step down at 85 °C, step back up below 75 °C) | ✅ |
-| RAM: macOS sees 5.26 GiB (was 4 GiB) | ✅ short test |
+| **Persistent home and settings**: the user's files survive a reboot (APFS volume in a window of `userdata`) | ✅ |
+| **Swap on flash** (real swapfiles, 2–6 GB under pressure) | ✅ |
+| **RAM: macOS sees 5.98 GiB** (was 4 GiB; UEFI heap moved, all 8 GiB declared, integrity-tested) | ✅ |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
 | Video out over USB-C (DisplayPort alt mode) | 📋 researched, see `docs/research-hdmi-usbc.md` |
 
@@ -78,6 +82,14 @@ What WindowServer needed to use the GPU (details in the plugin code and the kern
 
 The remaining limit is CPU time in the Metal → Vulkan bridge on WindowServer's main thread (~150 µs per draw).
 
+## Persistent storage and memory
+
+The system volume stays read-only, as on a Mac; the user's home now lives on a persistent APFS volume and swap goes to
+flash. `NativeUfs` publishes a 64 GiB window of `userdata` as a disk (`AkitaDataDisk.h`, boot-arg `akita-data-disk=2`);
+`rc.server` formats it on first use (only if it is blank), mounts the home at `/Users/akita` and the swap volume at
+`/System/Volumes/VM`. macOS now sees 5.98 GiB of the phone's 8 GiB. Details in
+[`docs/storage-and-memory.md`](docs/storage-and-memory.md).
+
 ## Touchscreen
 
 The Pixel 8a's touch controller is a Goodix "nottingham" (Berlin family) on SPI. The firmware runs from the chip's own flash,
@@ -104,7 +116,8 @@ Protocol notes in [`docs/research-touch.md`](docs/research-touch.md).
 | `plugin/` | `NativeMaliMetal.bundle`: the Metal plugin (UniXNU frontend + metal2vulkan + PanVK), with live profilers. |
 | `tools/` | Tests (Vulkan, Metal, `metaldiscover`) and WindowServer inspection (`wsvars`, `wswatch`, `wssample`, `wsstack`, `wsfind`…). |
 | `scripts/` | Image build (`build-fullos.sh`), Mali/ACPM/bridge/darwin-drm/PanVK builds, test cycles, USB shell/log, profilers. |
-| `docs/` | Practical guide, full-OS plan, research notes (GPU, touch, USB-C video), development log. |
+| `uefi-akita/` | The akita platform for Mu-Silicium (`akitaPkg`, `S5P9865Pkg`): memory map, UFS, keypad. `patches/Mu-Silicium-213bce4-akita.patch` has the changes to its common code. |
+| `docs/` | Practical guide, full-OS plan, research notes (GPU, touch, USB-C video), storage and memory, development log. |
 
 The scripts contain absolute paths of the development machine (`/Volumes/datos2/unixnu-akita/...`): adapt them.
 

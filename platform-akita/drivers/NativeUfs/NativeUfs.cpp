@@ -1718,6 +1718,8 @@ static void discardPendingWindow (unsigned index)
   device->release ();
 }
 
+#include "AkitaDataDisk.h"
+
 static void publishThread (void *, wait_result_t)
 {
   struct Operations {
@@ -2223,6 +2225,7 @@ bool NativeUfs::startRoot (IOService *provider)
     }
     void discard (unsigned index) { discardPendingWindow (index); }
   } operations = { this, layout };
+  const unsigned windowCount = layout->windows;
   UfsRootPublicationResult result = ufsPrepareRootWindows (operations, layout->windows);
   IOFree (layout, sizeof (RootLayout));
   if (result.phase != UfsRootPhase::Complete) {
@@ -2237,6 +2240,7 @@ bool NativeUfs::startRoot (IOService *provider)
                           "root window preparation failed");
     return false;
   }
+  akitaDataStart (this, windowCount);   // akita: persistent Data window (akita-data-disk); before mlStart, which can block for minutes
 #if defined(NATIVE_MACOSLOG) && NATIVE_MACOSLOG
   mlStart();
 #if NATIVE_UFS_ZUMA

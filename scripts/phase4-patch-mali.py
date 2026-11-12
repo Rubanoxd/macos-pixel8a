@@ -636,7 +636,7 @@ uint64_t gSubPh[8];""")
 # fullos180 lost WindowServer to a CS fatal 0x40 (CS_CONFIG_FAULT) on two queues with 256 jobs outstanding: exactly the 64 KiB ring
 # of 256-byte jobs, full (the check allowed insert - extract == size). A submit with no room returned NoSpace -> VK_ERROR_DEVICE_LOST.
 sub("""  if (qu.insert + kJobBytes - ro->extract > qu.ringSize) return false;""",
-    """  if (qu.insert + kJobBytes - ro->extract >= qu.ringSize) return false;   // akita: one job of slack, never a full ring""")
+    """  if (qu.insert + 2 * kJobBytes - (ro->extract & ~uint64_t(kJobBytes - 1)) > qu.ringSize) return false;   // akita: two jobs of slack counted from the start of the job the CS is in (fullos193: extract mid-job let a 256th job in, fatal 0x40)""")
 sub("""      const uint64_t sub0 = cntvctNow(), kick0 = gSubPh[2];
       if (!groupSubmit(*g, i.queue, i.cs_va, i.cs_size, i.latest_flush, &o.seqno, i2.waits, i2.wait_count)) return kIOReturnNoSpace;""",
     """      const uint64_t sub0 = cntvctNow(), kick0 = gSubPh[2];
@@ -653,7 +653,7 @@ sub("""// akita: kickStream for several streams of a group's slot at once""",
 bool ringHasRoom(Group &g, unsigned q) {
   if (q >= g.queues || g.csg == kNoSlot) return true;   // groupSubmit refuses those on its own terms
   const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[g.csg].iface[q].kva + 0x1000);
-  return g.q[q].insert + kJobBytes - ro->extract < g.q[q].ringSize;
+  return g.q[q].insert + 2 * kJobBytes - (ro->extract & ~uint64_t(kJobBytes - 1)) <= g.q[q].ringSize;   // as groupSubmit: two jobs of slack
 }
 
 // akita: kickStream for several streams of a group's slot at once""")

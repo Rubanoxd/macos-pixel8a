@@ -28,6 +28,7 @@ WindowServer swap → NativeGOPDisplay → copies the frame into the panel's fra
 | Shader cache keyed on a fixed PanVK UUID (`keep-uuid.py`) and fixed bridge runtime id | build scripts | Rebuilt drivers keep the shader cache warm |
 | Thermal regulator with hysteresis (step down a third at ≥85 °C, boot speed at ≥95 °C, step up after 5 s below 75 °C) | `AkitaAcpm.cpp` | Replaced a one-way guard that left CPUs at boot speed forever |
 | Ring slack and wait-on-full | `Mali.cpp` (fullos181) | Fixed `CS_CONFIG_FAULT` (fatal 0x40) that happened with exactly 256 jobs outstanding (a full 64 KiB ring) |
+| Slack counted from the start of the job the CS is in, two jobs | `Mali.cpp` (fullos194) | fullos193 hit fatal 0x40 again: the read pointer was mid-job, so a 256th job still fit. 15 min of drag stress since: 0 faults |
 | Touch driver with gestures | `AkitaTouch.inc`, `NativeRecoveryInput.cpp` | Tap, drag, long press = right click, two-finger scroll |
 | Dark mode and transparency at boot | `kern_exec.c` (rc.server) | `AppleInterfaceStyle=Dark`; no forced reduce-transparency |
 | Ask DarwinBoot for up to 8 GiB (`AKITA_OWNED_MEMORY=0x200000000`) | `package-akita-macos.py` | macOS sees 5.26 GiB (was 4 GiB), fullos183 |

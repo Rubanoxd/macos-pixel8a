@@ -38,9 +38,9 @@ python3 scripts/emit_macos26_security.py --kernel-build $X --storage-driver $X/u
   --include-module com.apple.iokit.IOMobileGraphicsFamily --include-module com.apple.iokit.IOSurface --include-module com.apple.iokit.IOAVFamily \
   --include-module com.apple.filesystems.lifs --include-module com.apple.filesystems.tmpfs --recovery-components --hid-components > /dev/null
 BA=$(python3 -c "import json;print(json.load(open('out/akita-macos-fullos34/build.json'))['boot_args'])"); BA="${BA/cpus=8/cpus=${AKITA_CPUS:-9}}"; [ -n "${AKITA_CPUMASK:-}" ] && BA="${BA/cpus=${AKITA_CPUS:-9}/cpumask=$AKITA_CPUMASK}";   # akita: cpumask= (bit i = i-th DT cpu; cpu0 boots) and cpus= cannot go together
- BA="${BA/akita-fullos-union-mb=512/akita-fullos-union-mb=${AKITA_UNION_MB:-1024}} akita-mali-platform=1 akita-csr=${AKITA_CSR:-0x24} akita-tfp=1${AKITA_GPU_ADDON:+ akita-gpu-addon=1 akita-ws-metal=1} native-gop-landscape=${AKITA_LANDSCAPE:-1} akita-epoch=$(date +%s)${AKITA_EXTRA_BA:+ $AKITA_EXTRA_BA}"
+ BA="${BA/akita-fullos-union-mb=512/akita-fullos-union-mb=${AKITA_UNION_MB:-1024}} akita-mali-platform=1 akita-csr=${AKITA_CSR:-0x24} akita-tfp=1${AKITA_GPU_ADDON:+ akita-gpu-addon=1 akita-ws-metal=1} native-gop-landscape=${AKITA_LANDSCAPE:-1} akita-epoch=$(date +%s) akita-data-disk=${AKITA_DATA_DISK:-2}${AKITA_EXTRA_BA:+ $AKITA_EXTRA_BA}"
 python3 platform/akita/package-akita-macos.py --kernel-build out/akita-security-fullos$N --root-hash private/macos26-media/root-hash.bin \
-  --output out/akita-macos-fullos$N --cpus ${AKITA_CPUS:-9} ${AKITA_GPU_ADDON:+--gpu-addon $AKITA_GPU_ADDON} --fullos-root-uuid 47719F50-5527-44A3-9F59-8170528D8C14 --nvram "prev-lang:kbd=es:87" --boot-args "$BA" | grep "left in"
+  --output out/akita-macos-fullos$N ${AKITA_MU:+--mu $AKITA_MU} --cpus ${AKITA_CPUS:-9} ${AKITA_GPU_ADDON:+--gpu-addon $AKITA_GPU_ADDON} --fullos-root-uuid 47719F50-5527-44A3-9F59-8170528D8C14 --nvram "prev-lang:kbd=es:87" --boot-args "$BA" | grep "left in"
 python3 -c "import json;d=json.load(open('out/akita-security-fullos$N/security-relink.json'));assert d['storage_driver']['bundle']=='org.blu-sharky.NativeUfs' and len(d['roots'])==14;print('relink ok')"
 strings out/akita-macos-fullos$N/kernel.macho.adt | grep -q 47719F50-5527-44A3-9F59-8170528D8C14 && echo "adt uuid ok"
 echo "IMAGE out/akita-macos-fullos$N/akita-macos26-boot.img"

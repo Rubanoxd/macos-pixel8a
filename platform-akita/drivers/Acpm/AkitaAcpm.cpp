@@ -341,6 +341,8 @@ void applyProfile(thread_call_param_t, thread_call_param_t) {
 }  // namespace
 
 namespace touch { void startLive(); }   // akita: AkitaTouch.inc, included below
+extern "C" int akita_acpm_rtc_seconds(uint64_t *seconds);   // akita: the PMIC RTC, at the end of this file
+extern "C" int akita_acpm_rtc_write(uint64_t seconds);
 extern "C" void akita_acpm_boot_profile(void);
 extern "C" void akita_acpm_boot_profile(void) {
   unsigned allowed = 0, profile = 0;
@@ -391,6 +393,7 @@ extern "C" int akita_acpm_get_khz(unsigned domain, uint32_t *khz) {
 }
 
 #include "AkitaTouch.inc"   // akita: the touch controller's staged bring-up (kern.akita_acpm = 2000000 + stage)
+#include "AkitaPcie.inc"    // akita: the Wi-Fi PCIe link, staged look (kern.akita_acpm = 4000000 + stage)
 
 extern "C" int akita_acpm_command(unsigned what) {
   static IOLock *made;
@@ -423,6 +426,14 @@ extern "C" int akita_acpm_command(unsigned what) {
     }
     IOLockUnlock(gAcpmLock);
     return 0;
+  }
+  if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);   // akita: Wi-Fi PCIe stages (AkitaPcie.inc)
+  if (what == 3000000 || what == 3000001) {   // akita: the PMIC RTC: 3000000 writes the kernel's calendar time (UTC) into it, 3000001 reads it
+    uint64_t t = 0;
+    if (what == 3000001) return akita_acpm_rtc_seconds(&t);
+    clock_sec_t sec = 0; clock_usec_t usec = 0;
+    clock_get_calendar_microtime(&sec, &usec);
+    return akita_acpm_rtc_write(static_cast<uint64_t>(sec));
   }
   if (what > 2000000 && what < 2000100) {   // akita: touch bring-up stages (AkitaTouch.inc)
     IOLockLock(gAcpmLock);
@@ -474,4 +485,91 @@ extern "C" int akita_acpm_command(unsigned what) {
   }
   IOLockUnlock(gAcpmLock);
   return result;
+}
+
+// akita (Generated-by: LLM): the main PMIC's real-time clock, so macOS boots with the right time instead of the image's build time.
+// S2MPG14 RTC block = ACPM PMIC channel 2, I2C type 0x02 (s2mpg14-register.h I2C_ADDR_RTC). Google's rtc-s2mpg14.c reads it by
+// clearing then setting RUDR (bit 0 of RTC_UPDATE 0x01) to latch the counters, then SEC..YEAR at 0x06..0x0C in binary:
+// sec & 0x7f, min & 0x7f, hour & 0x1f (bit 6 = PM flag, the hour itself is 0..23), weekday one-hot, day & 0x1f, month & 0x0f (1..12),
+// year & 0x7f (+2000). Android keeps it in UTC. Only RUDR is ever changed (update with a one-bit mask); the time is never written.
+namespace {
+int rtcRead(uint32_t reg, uint8_t *value) {
+  uint32_t w[4] = {(0x02u << 8) | (reg & 0xff), 0 /* FUNC_READ */, 0, 0};
+  const int r = transfer(2, w, 4, true);
+  if (r != 0) return r;
+  if ((w[1] >> 24) & 0xff) return 1000 + static_cast<int>((w[1] >> 24) & 0xff);
+  *value = static_cast<uint8_t>((w[1] >> 8) & 0xff);
+  return 0;
+}
+int rtcUpdateBit0(uint8_t value) {
+  uint32_t w[4] = {(0x02u << 8) | 0x01u, 2u /* FUNC_UPDATE */ | (uint32_t(value & 1) << 8) | (1u << 16), 0, 0};
+  const int r = transfer(2, w, 4, true);
+  if (r != 0) return r;
+  return ((w[1] >> 24) & 0xff) ? 1000 + static_cast<int>((w[1] >> 24) & 0xff) : 0;
+}
+// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm).
+int64_t daysFromCivil(int64_t y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<int64_t>(doe) - 719468;
+}
+}  // namespace
+
+extern "C" int akita_acpm_rtc_seconds(uint64_t *seconds);
+extern "C" int akita_acpm_rtc_seconds(uint64_t *seconds) {
+  if (!seconds) return -100;
+  if (!gAcpmLock) gAcpmLock = IOLockAlloc();
+  if (!gAcpmLock) return -100;
+  IOLockLock(gAcpmLock);
+  int r = probe() ? 0 : -101;
+  uint8_t v[7] = {};
+  if (r == 0) r = rtcUpdateBit0(0);
+  if (r == 0) { IODelay(60); r = rtcUpdateBit0(1); }
+  if (r == 0) IODelay(1000);
+  for (unsigned i = 0; r == 0 && i < 7; ++i) r = rtcRead(0x06 + i, &v[i]);
+  IOLockUnlock(gAcpmLock);
+  if (r != 0) { printf("rtc: read failed (%d)\n", r); return r; }
+  const unsigned sec = v[0] & 0x7f, min = v[1] & 0x7f, hour = v[2] & 0x1f, day = v[4] & 0x1f, mon = v[5] & 0x0f, year = 2000 + (v[6] & 0x7f);
+  printf("rtc: %04u-%02u-%02u %02u:%02u:%02u UTC (raw %02x %02x %02x %02x %02x %02x %02x)\n", year, mon, day, hour, min, sec,
+         v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+  if (sec > 59 || min > 59 || hour > 23 || !day || day > 31 || !mon || mon > 12) return -102;
+  *seconds = static_cast<uint64_t>(daysFromCivil(year, mon, day)) * 86400 + hour * 3600 + min * 60 + sec;
+  return 0;
+}
+
+// Write a UTC time into the RTC (Google's s2m_rtc_set_time: the seven counters, then WUDR (bit 1 of RTC_UPDATE) cleared and set).
+extern "C" int akita_acpm_rtc_write(uint64_t seconds) {
+  if (seconds < 1704067200ULL || seconds >= 4102444800ULL) return -102;   // 2024..2099: the RTC holds years 2000..2127
+  const int64_t days = static_cast<int64_t>(seconds / 86400);
+  const unsigned rem = static_cast<unsigned>(seconds % 86400);
+  // civil from days (Hinnant)
+  const int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = static_cast<unsigned>(z - era * 146097), yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+  const unsigned day = doy - (153 * mp + 2) / 5 + 1, mon = mp < 10 ? mp + 3 : mp - 9;
+  const unsigned year = static_cast<unsigned>(yoe + era * 400 + (mon <= 2));
+  const unsigned hour = rem / 3600, min = rem / 60 % 60, sec = rem % 60, wday = static_cast<unsigned>((days + 4) % 7);   // 1970-01-01 was a Thursday
+  const uint8_t v[7] = {uint8_t(sec), uint8_t(min), uint8_t(hour | (hour >= 12 ? 0x40 : 0)), uint8_t(1u << wday), uint8_t(day), uint8_t(mon),
+                        uint8_t(year - 2000)};
+  if (!gAcpmLock) gAcpmLock = IOLockAlloc();
+  if (!gAcpmLock) return -100;
+  IOLockLock(gAcpmLock);
+  int r = probe() ? 0 : -101;
+  for (unsigned i = 0; r == 0 && i < 7; ++i) {
+    uint32_t w[4] = {(0x02u << 8) | (0x06u + i), 2u /* FUNC_UPDATE */ | (uint32_t(v[i]) << 8) | (0xffu << 16), 0, 0};
+    r = transfer(2, w, 4, true);
+    if (r == 0 && ((w[1] >> 24) & 0xff)) r = 1000 + static_cast<int>((w[1] >> 24) & 0xff);
+  }
+  for (unsigned bit = 0; r == 0 && bit < 2; ++bit) {   // WUDR low, then high: latch the new counters
+    uint32_t w[4] = {(0x02u << 8) | 0x01u, 2u | (uint32_t(bit ? 2 : 0) << 8) | (2u << 16), 0, 0};
+    r = transfer(2, w, 4, true);
+    if (r == 0 && ((w[1] >> 24) & 0xff)) r = 1000 + static_cast<int>((w[1] >> 24) & 0xff);
+    IODelay(bit ? 1000 : 60);
+  }
+  IOLockUnlock(gAcpmLock);
+  printf("rtc: wrote %04u-%02u-%02u %02u:%02u:%02u UTC: %d\n", year, mon, day, hour, min, sec, r);
+  return r;
 }

@@ -1,0 +1,66 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -149,6 +149,7 @@
+     // and every frame is turned a quarter turn onto the portrait panel: the phone is held with its top (the camera) on the left.
+     bool fLandscape = false;
+     // akita (Generated-by: LLM): what the panel shows per second and what a copy costs, told every ~10 s (native-gop-fps=0: not told).
++    uint64_t fFpsFlushAbs = 0, fFpsLoadAbs = 0, fFpsWriteAbs = 0;   // akita: where a copy's time goes
+     uint64_t fFpsFrames = 0, fFpsCopies = 0, fFpsCopyAbs = 0, fFpsCopyMaxAbs = 0, fFpsSince = 0, fFpsChanged = 0;
+     bool fFpsOn = true;
+     void fpsCopy(IOSurface *surface);
+@@ -430,9 +431,15 @@
+         absolutetime_to_nanoseconds(fFpsCopyAbs / fFpsCopies, &meanNs);
+         absolutetime_to_nanoseconds(fFpsCopyMaxAbs, &maxNs);
+         const uint64_t tenths = fFpsFrames * 10000000000ULL / ns;
+-        IOLog("NativeGOPDisplay: fps %llu.%llu (%llu frames in %llu ms), %llu copies, copy mean %llu.%llu ms longest %llu.%llu ms, %llu pixels changed per copy\n",
++        uint64_t flushNs = 0, loadNs = 0, writeNs = 0;
++        absolutetime_to_nanoseconds(fFpsFlushAbs / fFpsCopies, &flushNs);
++        absolutetime_to_nanoseconds(fFpsLoadAbs / fFpsCopies, &loadNs);
++        absolutetime_to_nanoseconds(fFpsWriteAbs / fFpsCopies, &writeNs);
++        IOLog("NativeGOPDisplay: fps %llu.%llu (%llu frames in %llu ms), %llu copies, copy mean %llu.%llu ms longest %llu.%llu ms (flush %llu.%llu, read %llu.%llu, write %llu.%llu), %llu pixels changed per copy\n",
+               tenths / 10, tenths % 10, fFpsFrames, ns / 1000000, fFpsCopies, meanNs / 1000000, (meanNs / 100000) % 10, maxNs / 1000000,
+-              (maxNs / 100000) % 10, fFpsChanged / fFpsCopies);
++              (maxNs / 100000) % 10, flushNs / 1000000, (flushNs / 100000) % 10, loadNs / 1000000, (loadNs / 100000) % 10,
++              writeNs / 1000000, (writeNs / 100000) % 10, fFpsChanged / fFpsCopies);
++        fFpsFlushAbs = fFpsLoadAbs = fFpsWriteAbs = 0;
+     }
+     fFpsSince = now;
+     fFpsFrames = fFpsCopies = fFpsCopyAbs = fFpsCopyMaxAbs = fFpsChanged = 0;
+@@ -724,8 +731,11 @@
+         IOLog("NativeGOPDisplay: surfaces read %s\n", cachedRead ? "through a cached mapping (invalidated first)" : "with their own cache mode");
+     }
+     if (span <= (512ULL << 20)) {
+-        if (cachedRead)
++        if (cachedRead) {
++            const uint64_t flushBegan = mach_absolute_time();
+             memory->performOperation(kIOMemoryIncoherentIOFlush, base, span);
++            fFpsFlushAbs += mach_absolute_time() - flushBegan;
++        }
+         frame.mapping = memory->createMappingInTask(kernel_task, 0,
+             kIOMapAnywhere | kIOMapReadOnly | (cachedRead ? kIOMapCopybackCache : 0), base, span);
+     }
+@@ -778,6 +788,7 @@
+             const uint64_t n = copyWidth - x0 < kBand ? copyWidth - x0 : kBand;
+             const uint64_t syLow = (copyWidth - 1 - (x0 + n - 1)) * height / copyWidth;   // the band's last column reads the lowest row
+             const uint32_t *rowOf[kBand];
++            const uint64_t loadBegan = mach_absolute_time();
+             for (uint64_t j = 0; j < n; j++) {
+                 const uint64_t sy = (copyWidth - 1 - (x0 + j)) * height / copyWidth;
+                 const uint64_t k = sy - syLow;
+@@ -802,6 +813,8 @@
+                     memcpy(row, fRow, width * 4);
+                 }
+             }
++            const uint64_t writeBegan = mach_absolute_time();
++            fFpsLoadAbs += writeBegan - loadBegan;
+             uint64_t saved;
+             if (!sheng_fb_begin(SHENG_FB_GUI, &saved)) return;
+             for (uint64_t y = 0; y < copyHeight; y++) {
+@@ -818,6 +831,7 @@
+                 }
+             }
+             sheng_fb_end(saved);
++            fFpsWriteAbs += mach_absolute_time() - writeBegan;
+         }
+         sample = false;
+     }

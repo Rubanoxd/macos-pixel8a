@@ -1,0 +1,52 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -164,6 +164,11 @@
+     SwapInfo fSwapInfo[kSwapInfoRing]{};   // held while kSwapInfoHeld is set, sent in order afterwards
+     unsigned fSwapInfoRead = 0, fSwapInfoWrite = 0;
+     uint64_t fLayerShape = 0;
++    // akita: with the Metal compositor a swap can arrive before the GPU has finished writing its surface (the Vulkan
++    // fence waits fail), so the copy taken at swap time misses what the GPU draws late. Keep the last shown surface and
++    // copy it again every ~100 ms for 5 s after each swap; the per-surface shadow writes only the pixels that changed.
++    IOSurface *fLastSurface = nullptr;
++    uint64_t fRecopyUntil = 0;
+ };
+ 
+ OSDefineMetaClassAndStructors(NativeGOPDisplay, IOMobileFramebufferLegacy)
+@@ -222,6 +227,10 @@
+ void NativeGOPDisplay::stop(IOService *provider)
+ {
+     IOMobileFramebufferLegacy::stop(provider);
++    if (fLastSurface) {
++        reinterpret_cast<OSObject *>(fLastSurface)->release();
++        fLastSurface = nullptr;
++    }
+     if (fHalfToByte)
+         IOFree(fHalfToByte, 65536);
+     if (fRow)
+@@ -318,6 +327,8 @@
+     }
+     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
+         fStalled++;
++    else if (fLastSurface && fTicks < fRecopyUntil && fTicks % 6 == 0 && !at<IOMFBSwapIORequest *>(this, kCurrentSwap))
++        copySurface(fLastSurface);   // pick up what the GPU finished after the swap
+     if (++fTicks % 3750 == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 60 s while swaps arrive
+         fReported = fSubmitted + fFrames + fDropped + fStalled;
+         IOLog("NativeGOPDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu lit centre %#llx\n",
+@@ -420,8 +431,16 @@
+                       words[row * 8 + 4], words[row * 8 + 5], words[row * 8 + 6], words[row * 8 + 7]);
+         }
+     }
+-    if (selected >= 0)
++    if (selected >= 0) {
+         copySurface(surfaces[selected]);
++        if (fLastSurface != surfaces[selected]) {
++            reinterpret_cast<OSObject *>(surfaces[selected])->retain();   // IOSurface is an OSObject (forward-declared here)
++            if (fLastSurface)
++                reinterpret_cast<OSObject *>(fLastSurface)->release();
++            fLastSurface = surfaces[selected];
++        }
++        fRecopyUntil = fTicks + 312;   // 5 s of 16 ms ticks
++    }
+     swap_complete_gated();
+ }
+ 

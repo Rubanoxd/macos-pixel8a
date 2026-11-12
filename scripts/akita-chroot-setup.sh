@@ -1,6 +1,6 @@
 #!/bin/bash
-# En el teléfono (Recovery): prepara un chroot del macOS completo en "/Volumes/Macintosh HD" con el cryptex SystemOS
-# en System/Volumes/Preboot/Cryptexes/OS, devfs y un tmpfs en unión sobre System/Library con dyld -> caché del cryptex.
+# On the phone (Recovery): prepares a full-macOS chroot in "/Volumes/Macintosh HD" with the SystemOS cryptex
+# at System/Volumes/Preboot/Cryptexes/OS, devfs, and a union tmpfs over System/Library with dyld -> the cryptex's cache.
 R="/Volumes/Macintosh HD"; C=/Volumes/CheerF25F71.arm64eSystemCryptex; D=/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld
 for i in $(seq 1 30); do [ -d "$R/System" ] && break; sleep 2; done
 mount | grep -q "$R/System/Volumes/Preboot " || mount_tmpfs "$R/System/Volumes/Preboot"

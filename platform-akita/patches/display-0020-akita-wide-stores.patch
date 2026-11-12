@@ -1,0 +1,27 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -968,9 +968,21 @@
+             if (!sheng_fb_begin(SHENG_FB_GUI, &saved)) return;
+             for (uint64_t y = yFirst; y < yEnd; y++) {
+                 const uint64_t sx = y * width / copyHeight;
+-                volatile uint32_t *pixels = reinterpret_cast<volatile uint32_t *>(fScanout + y * fVideo.v_rowBytes) + x0;
+-                for (uint64_t j = 0; j < n; j++)
+-                    pixels[j] = rowOf[j][sx];
++                uint32_t *row = reinterpret_cast<uint32_t *>(fScanout + y * fVideo.v_rowBytes) + x0;
++                if (n == kBand && !(reinterpret_cast<uintptr_t>(row) & 15)) {
++                    // akita (Generated-by: LLM): the band's 64 bytes as 64-bit pairs (stp: 16 bytes a store) instead of 16 single
++                    // 32-bit volatile stores into the write-combined scanout (5.5 ms a dragged frame)
++                    uint64_t *out = reinterpret_cast<uint64_t *>(row);
++                    for (uint64_t j = 0; j < kBand / 2; j += 2) {
++                        const uint64_t a = rowOf[2 * j][sx] | (static_cast<uint64_t>(rowOf[2 * j + 1][sx]) << 32);
++                        const uint64_t b = rowOf[2 * j + 2][sx] | (static_cast<uint64_t>(rowOf[2 * j + 3][sx]) << 32);
++                        __asm__ volatile("stp %0, %1, [%2]" :: "r"(a), "r"(b), "r"(out + j) : "memory");
++                    }
++                } else {
++                    volatile uint32_t *pixels = row;
++                    for (uint64_t j = 0; j < n; j++)
++                        pixels[j] = rowOf[j][sx];
++                }
+                 changed += n;
+             }
+             sheng_fb_end(saved);

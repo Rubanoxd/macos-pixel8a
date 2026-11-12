@@ -21,6 +21,8 @@
 // IOConnectMapMemory64 type: the display's scanout buffer, writable (write-combined), for the GPU hand-off presenter (MALI_GOP). Only exists
 // while the display driver runs in GPU mode (boot-arg sheng-fb-gpu=1); no process but the render server is granted it.
 #define MALI_MAP_SCANOUT 0x40000000u
+// akita: IOConnectMapMemory64 type: the GPU's LATEST_FLUSH_ID register page, read-only, uncached (Panthor's USER_FLUSH_ID_MMIO page)
+#define MALI_MAP_FLUSH_ID 0x20000000u
 #define MALI_MAX_QUEUES 4
 
 enum mali_selector {
@@ -39,6 +41,8 @@ enum mali_selector {
   MALI_BO_CREATE_HOST,    // in: mali_bo_create_host_in, out: mali_bo_create_out (a buffer object over the caller's own pages)
   MALI_LOG,               // in: mali_log_in (a line for the kernel's console: the Metal plugin cannot reach a console from a sandboxed process)
   MALI_GOP,               // in: mali_gop_in, out: mali_gop_out (the display driver's GPU hand-off: mode, wait for a finished frame, complete it)
+  MALI_EVENT_WAIT,        // in: mali_event_wait_in, out: mali_event_wait_out (akita: sleep until a job finished or the firmware raised an event)
+  MALI_GROUP_SUBMIT_BATCH, // in: mali_group_submit_batch_in, out: mali_group_submit_batch_out (akita: several streams of one group)
   MALI_SELECTOR_COUNT
 };
 
@@ -101,8 +105,26 @@ struct mali_group_destroy_in { uint32_t group, pad; };
 struct mali_group_submit_in { uint32_t group, queue; uint64_t cs_va; uint32_t cs_size, latest_flush; };
 struct mali_group_submit_out { uint64_t seqno; };   // the job's number on that queue, counted from 1
 
+// akita: the longer form of the submit: before the stream runs, the GPU waits until each listed queue of the same group has finished
+// its job number seqno (SYNC_WAIT64 on the group's syncobj words), so the caller need not block until then.
+#define MALI_SUBMIT_MAX_WAITS 3
+struct mali_group_submit_wait { uint32_t queue, pad; uint64_t seqno; };
+struct mali_group_submit2_in { struct mali_group_submit_in base; uint32_t wait_count, pad; struct mali_group_submit_wait waits[MALI_SUBMIT_MAX_WAITS]; };
+// akita: MALI_GROUP_SUBMIT_BATCH: up to MALI_SUBMIT_BATCH_MAX streams of one group, in order; out.done of them went in, with their seqnos.
+#define MALI_SUBMIT_BATCH_MAX 32
+struct mali_submit_entry { uint32_t queue, latest_flush; uint64_t cs_va; uint32_t cs_size, wait_count; struct mali_group_submit_wait waits[MALI_SUBMIT_MAX_WAITS]; };
+struct mali_group_submit_batch_in { uint32_t group, count; struct mali_submit_entry e[MALI_SUBMIT_BATCH_MAX]; };
+struct mali_group_submit_batch_out { uint32_t done, pad; uint64_t seqno[MALI_SUBMIT_BATCH_MAX]; };
+
 struct mali_fence_wait_in { uint32_t group, queue; uint64_t seqno, timeout_us; };   // timeout_us 0: just look
 struct mali_fence_wait_out { uint64_t done_seqno; uint32_t signaled, pad; };
+
+// akita: the driver counts its events (a job that finished, a fault, a tiler that ran out) in a generation number. The call returns at once
+// when the number is no longer `gen` (pass 0 the first time), else when it moves or timeout_us (at most a second) passes; either way it
+// says what the number is now. A waiter takes the number, looks at its fences, and only then sleeps on that number: nothing is missed.
+// interrupts 0: the driver has no job interrupt (it would only time out): the caller polls the syncobj pages as before.
+struct mali_event_wait_in { uint64_t gen, timeout_us; };
+struct mali_event_wait_out { uint64_t gen; uint32_t interrupts, pad; };
 
 // Panthor's TILER_HEAP_CREATE: chunks of chunk_size (a multiple of 4 KiB, 128 KiB..8 MiB) chained newest first in the VM's kernel region; the heap
 // context (32 bytes in a 64 byte slot) is where the firmware keeps its state. No chunk is ever added: when the initial ones are used up the

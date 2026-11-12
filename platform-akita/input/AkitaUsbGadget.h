@@ -74,7 +74,8 @@ struct Trb {
 // Live control over the gadget (mode 2), all as raw UDP built and parsed here, beside the BSD stack:
 //   5140  the kernel's retained log, broadcast as it grows ("AKLG" + 32-bit stream offset + text), from the start
 //   5141  commands from the Mac: "I<steps>" input steps in the akita-input-script syntax (K, T, A, C, P, M, W, D, U),
-//         "S[n]" a screenshot downscaled by n (2 by default), "L" replay the log from the start
+//         "S[n]" a screenshot downscaled by n (2 by default), "L" replay the log from the start,
+//         "FASTBOOT" reset straight into fastboot
 //   5142  screenshot replies to the asker ("AKFB" frame, offset, total, width, height + RGB bytes)
 // The handler for input steps is installed by NativeRecoveryInput (it owns the HID devices).
 void (*gRemoteInput)(const char *steps, unsigned length) = nullptr;
@@ -841,6 +842,8 @@ void Gadget::pumpRaw()
   }
 }
 
+extern "C" void akita_reset_to_fastboot(void);   // bsd/kern/kern_exec.c
+
 // UDP to 169.254.7.2:5141 is a command for the gadget, not for the stack.
 bool Gadget::command(const uint8_t *f, uint32_t length)
 {
@@ -870,6 +873,10 @@ bool Gadget::command(const uint8_t *f, uint32_t length)
     startShot(f + 6, ip + 12, srcPort, scale);
   } else if (text[0] == 'L') {
     fLogSent = 0;
+  } else if (textLength == 8 && !memcmp(text, "FASTBOOT", 8)) {
+    // back to fastboot even when userland is wedged (no shell): PMU boot mode + watchdog, in the kernel
+    IOLog("usbgadget: FASTBOOT requested from the Mac\n");
+    akita_reset_to_fastboot();
   }
   return true;
 }

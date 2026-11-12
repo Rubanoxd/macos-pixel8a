@@ -1,0 +1,88 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -148,6 +148,11 @@
+     // akita (Generated-by: LLM): native-gop-landscape=1: WindowServer gets a landscape mode (the portrait one turned on its side)
+     // and every frame is turned a quarter turn onto the portrait panel: the phone is held with its top (the camera) on the left.
+     bool fLandscape = false;
++    // akita (Generated-by: LLM): what the panel shows per second and what a copy costs, told every ~10 s (native-gop-fps=0: not told).
++    uint64_t fFpsFrames = 0, fFpsCopies = 0, fFpsCopyAbs = 0, fFpsCopyMaxAbs = 0, fFpsSince = 0, fFpsChanged = 0;
++    bool fFpsOn = true;
++    void fpsCopy(IOSurface *surface);
++    void fpsReport();
+     uint32_t *fTurned = nullptr;   // landscape: the frame turned onto the panel (panel width x height), built row by row of the surface
+     uint64_t fTurnedBytes = 0;
+     IOMemoryMap *fScanoutMap = nullptr;
+@@ -237,6 +242,9 @@
+         fModeWidth = modeWidth;
+         fModeHeight = static_cast<uint32_t>(fVideo.v_height * modeWidth / fVideo.v_width);
+     }
++    unsigned fps = 1;
++    PE_parse_boot_argn("native-gop-fps", &fps, sizeof(fps));
++    fFpsOn = fps != 0;
+     unsigned landscape = 0;
+     PE_parse_boot_argn("native-gop-landscape", &landscape, sizeof(landscape));
+     if (landscape == 1) {
+@@ -378,7 +386,8 @@
+     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
+         fStalled++;
+     else if (fLastSurface && fTicks < fRecopyUntil && fTicks % 6 == 0 && !at<IOMFBSwapIORequest *>(this, kCurrentSwap))
+-        copySurface(fLastSurface);   // pick up what the GPU finished after the swap
++        fpsCopy(fLastSurface);   // pick up what the GPU finished after the swap
++    fpsReport();
+     if (++fTicks % 3750 == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 60 s while swaps arrive
+         fReported = fSubmitted + fFrames + fDropped + fStalled;
+         IOLog("NativeGOPDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu lit centre %#llx\n",
+@@ -392,6 +401,43 @@
+     return fVBL->setTimeoutMS(16);
+ }
+ 
++// akita (Generated-by: LLM): a copy to the panel, timed.
++void NativeGOPDisplay::fpsCopy(IOSurface *surface)
++{
++    const uint64_t began = mach_absolute_time();
++    copySurface(surface);
++    const uint64_t took = mach_absolute_time() - began;
++    fFpsCopies++;
++    fFpsCopyAbs += took;
++    if (took > fFpsCopyMaxAbs)
++        fFpsCopyMaxAbs = took;
++    fFpsChanged += fChangedPixels;
++}
++
++void NativeGOPDisplay::fpsReport()
++{
++    const uint64_t now = mach_absolute_time();
++    if (!fFpsSince) {
++        fFpsSince = now;
++        return;
++    }
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(now - fFpsSince, &ns);
++    if (ns < 10000000000ULL)
++        return;
++    if (fFpsOn && fFpsCopies) {
++        uint64_t meanNs = 0, maxNs = 0;
++        absolutetime_to_nanoseconds(fFpsCopyAbs / fFpsCopies, &meanNs);
++        absolutetime_to_nanoseconds(fFpsCopyMaxAbs, &maxNs);
++        const uint64_t tenths = fFpsFrames * 10000000000ULL / ns;
++        IOLog("NativeGOPDisplay: fps %llu.%llu (%llu frames in %llu ms), %llu copies, copy mean %llu.%llu ms longest %llu.%llu ms, %llu pixels changed per copy\n",
++              tenths / 10, tenths % 10, fFpsFrames, ns / 1000000, fFpsCopies, meanNs / 1000000, (meanNs / 100000) % 10, maxNs / 1000000,
++              (maxNs / 100000) % 10, fFpsChanged / fFpsCopies);
++    }
++    fFpsSince = now;
++    fFpsFrames = fFpsCopies = fFpsCopyAbs = fFpsCopyMaxAbs = fFpsChanged = 0;
++}
++
+ // akita (Generated-by: LLM): take the fence for the swap that just became the current one. True: nothing to wait for.
+ bool NativeGOPDisplay::fenceBegin_gated()
+ {
+@@ -544,7 +590,8 @@
+         }
+     }
+     if (selected >= 0) {
+-        copySurface(surfaces[selected]);
++        fpsCopy(surfaces[selected]);
++        fFpsFrames++;
+         if (fLastSurface != surfaces[selected]) {
+             reinterpret_cast<OSObject *>(surfaces[selected])->retain();   // IOSurface is an OSObject (forward-declared here)
+             if (fLastSurface)

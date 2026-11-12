@@ -1,4 +1,4 @@
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/meson.build mesa-akita-main/meson.build
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/meson.build mesa-akita-main/meson.build
 --- mesa-main/meson.build	2026-11-07 16:02:02
 +++ mesa-akita-main/meson.build	2026-11-07 16:02:18
 @@ -813,6 +813,10 @@
@@ -12,7 +12,184 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/mes
  else
    # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
    # dependencies (such as vk-runtime) linking to it
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/meson.build mesa-akita-main/src/panfrost/lib/kmod/meson.build
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/compiler/bifrost/bi_ra.c mesa-akita-main/src/panfrost/compiler/bifrost/bi_ra.c
+--- mesa-main/src/panfrost/compiler/bifrost/bi_ra.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/compiler/bifrost/bi_ra.c	2026-11-08 22:59:56
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include "util/os_time.h"
+ #include "util/u_memory.h"
+ #include "bi_debug.h"
+ #include "bi_builder.h"
+@@ -699,7 +700,77 @@
+    return best_node;
+ }
+ 
++/* akita local change (Generated-by: LLM, not for upstream): the best `max`
++ * spill candidates of one failed allocation, by the same benefit as
++ * bi_choose_spill_node (the failing node and the nodes interfering with it).
++ * Huge shaders otherwise need hundreds of full RA passes, one spill each:
++ * WindowServer's Liquid Glass shaders took minutes to compile on Mali-G715.
++ */
+ static unsigned
++bi_choose_spill_nodes(bi_context *ctx, struct lcra_state *l, signed *out,
++                      unsigned max)
++{
++   BITSET_WORD *no_spill = BITSET_CALLOC(l->node_count);
++
++   bi_foreach_instr_global(ctx, ins) {
++      bi_foreach_dest(ins, d) {
++         if (ins->no_spill || ins->op == BI_OPCODE_ATEST ||
++             ins->op == BI_OPCODE_ZS_EMIT ||
++             (ins->op == BI_OPCODE_MOV_I32 &&
++              ins->src[0].type == BI_INDEX_REGISTER &&
++              ins->src[0].value ==
++                 bi_preload_reg(BI_PRELOAD_CUMULATIVE_COVERAGE, ctx->arch))) {
++            BITSET_SET(no_spill, ins->dest[d].value);
++         }
++      }
++   }
++
++   unsigned benefit[16] = {0}, count = 0;
++
++   /* keep the `max` best (node, benefit) pairs, sorted by benefit */
++#define AKITA_CONSIDER(node)                                                   \
++   do {                                                                        \
++      unsigned b_ = lcra_count_constraints(l, (node));                         \
++      unsigned at_ = count < max ? count++ : max;                              \
++      if (at_ == max && (max == 0 || b_ <= benefit[max - 1]))                  \
++         break;                                                                \
++      if (at_ == max)                                                          \
++         at_ = max - 1;                                                        \
++      while (at_ > 0 && benefit[at_ - 1] < b_) {                               \
++         benefit[at_] = benefit[at_ - 1];                                      \
++         out[at_] = out[at_ - 1];                                              \
++         at_--;                                                                \
++      }                                                                        \
++      benefit[at_] = b_;                                                       \
++      out[at_] = (node);                                                       \
++   } while (0)
++
++   if (!BITSET_TEST(no_spill, l->spill_node))
++      AKITA_CONSIDER((signed)l->spill_node);
++
++   if (nodearray_is_sparse(&l->linear[l->spill_node])) {
++      nodearray_sparse_foreach(&l->linear[l->spill_node], elem) {
++         unsigned i = nodearray_sparse_key(elem);
++         if (!nodearray_sparse_value(elem) || BITSET_TEST(no_spill, i) ||
++             i == l->spill_node)
++            continue;
++         AKITA_CONSIDER((signed)i);
++      }
++   } else {
++      nodearray_value *row = l->linear[l->spill_node].dense;
++      for (unsigned i = 0; i < l->node_count; ++i) {
++         if (!row[i] || BITSET_TEST(no_spill, i) || i == l->spill_node)
++            continue;
++         AKITA_CONSIDER((signed)i);
++      }
++   }
++#undef AKITA_CONSIDER
++
++   free(no_spill);
++   return count;
++}
++
++static unsigned
+ bi_count_read_index(bi_instr *I, bi_index index)
+ {
+    unsigned max = 0;
+@@ -1270,6 +1341,9 @@
+ 
+    unsigned iter_count = 0;
+    unsigned max_iters = 2000;
++   unsigned akita_spills = 0;   /* akita (Generated-by: LLM): RA cost report */
++   bool akita_presplit = false;
++   int64_t akita_start = os_time_get_nano();
+    /* Number of bytes of memory we've spilled into */
+    unsigned spill_count = ctx->info.tls_size;
+ 
+@@ -1296,6 +1370,15 @@
+          if (ctx->inputs->is_blend)
+             UNREACHABLE("Blend shaders may not spill");
+ 
++         /* akita (Generated-by: LLM): out-of-SSA, vector lowering and tied
++          * operands add pressure the SSA estimate does not see, so a shader
++          * spilled to exactly BI_MAX_REGS keeps failing full RA passes that
++          * cost seconds each on huge shaders. Leave 8 registers of headroom:
++          * the SSA spiller chooses better spills than the RA loop does. */
++         if (regs_to_use == BI_MAX_REGS)
++            regs_to_use -= 8;
++         akita_presplit = true;
++
+          bi_spill_ssa(ctx, regs_to_use);
+          spill_count += bi_lower_spill(ctx, spill_count);
+ 
+@@ -1319,8 +1402,9 @@
+    bi_coalesce_tied(ctx);
+    squeeze_index(ctx);
+ 
+-   /* Try with reduced register pressure to improve thread count */
+-   if (ctx->arch >= 7) {
++   /* Try with reduced register pressure to improve thread count
++    * (akita: not for a shader that had to spill already: it cannot fit) */
++   if (ctx->arch >= 7 && !akita_presplit) {
+       l = bi_allocate_registers(ctx, &success, false);
+ 
+       if (success) {
+@@ -1338,18 +1422,29 @@
+       if (success) {
+          ctx->info.work_reg_count = BI_MAX_REGS;
+       } else {
+-         signed spill_node = bi_choose_spill_node(ctx, l);
+-
+-         if (spill_node == -1)
+-            UNREACHABLE("Failed to choose spill node\n");
+-
+          if (ctx->inputs->is_blend)
+             UNREACHABLE("Blend shaders may not spill");
+ 
+-         spill_count =
+-            bi_spill_register(ctx, bi_get_index(spill_node), spill_count,
+-                              bi_get_index(l->spill_node));
++         /* akita (Generated-by: LLM): one spill on the first failed full RA
++          * pass, then batches from the same pass (2, 4, 8, 16). */
++         signed nodes[16];
++         unsigned batch = iter_count > 1 ? MIN2(1u << MIN2(iter_count - 1, 4u), 16u) : 1;
++         unsigned chosen = batch == 1 ? 0 : bi_choose_spill_nodes(ctx, l, nodes, batch);
++         if (!chosen) {
++            nodes[0] = bi_choose_spill_node(ctx, l);
++            chosen = 1;
++         }
+ 
++         if (nodes[0] == -1)
++            UNREACHABLE("Failed to choose spill node\n");
++
++         for (unsigned n = 0; n < chosen; ++n) {
++            spill_count =
++               bi_spill_register(ctx, bi_get_index(nodes[n]), spill_count,
++                                 bi_get_index(l->spill_node));
++         }
++         akita_spills += chosen;
++
+          lcra_free(l);
+          l = NULL;
+          /* In case the spill affected an instruction with tied
+@@ -1360,6 +1455,11 @@
+    }
+ 
+    compute_spill_cost(ctx);
++
++   int64_t akita_ms = (os_time_get_nano() - akita_start) / 1000000;
++   if (akita_ms > 1000)
++      fprintf(stderr, "bi_ra: %u iterations, %u loop spills, %lld ms, tls %u\n",
++              iter_count, akita_spills, (long long)akita_ms, spill_count);
+ 
+    assert(success);
+    assert(l != NULL);
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/lib/kmod/meson.build mesa-akita-main/src/panfrost/lib/kmod/meson.build
 --- mesa-main/src/panfrost/lib/kmod/meson.build	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/lib/kmod/meson.build	2026-11-07 16:02:58
 @@ -6,9 +6,12 @@
@@ -29,7 +206,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  
  if with_panfrost_vdrm
    libpankmod_lib_inc += [inc_virtio_gpu, inc_virtio_vdrm, include_directories('virtio')]
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/pan_kmod.c mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/lib/kmod/pan_kmod.c mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.c
 --- mesa-main/src/panfrost/lib/kmod/pan_kmod.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.c	2026-11-07 16:15:30
 @@ -12,7 +12,9 @@
@@ -98,7 +275,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  
  void
  pan_kmod_flush_bo_map_syncs_locked(struct pan_kmod_dev *dev)
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/pan_kmod.h mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.h
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/lib/kmod/pan_kmod.h mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.h
 --- mesa-main/src/panfrost/lib/kmod/pan_kmod.h	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/lib/kmod/pan_kmod.h	2026-11-07 16:13:37
 @@ -701,6 +701,12 @@
@@ -114,7 +291,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  static inline int
  pan_kmod_bo_export(struct pan_kmod_bo *bo)
  {
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/lib/kmod/panthor_kmod.c mesa-akita-main/src/panfrost/lib/kmod/panthor_kmod.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/lib/kmod/panthor_kmod.c mesa-akita-main/src/panfrost/lib/kmod/panthor_kmod.c
 --- mesa-main/src/panfrost/lib/kmod/panthor_kmod.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/lib/kmod/panthor_kmod.c	2026-11-07 16:15:30
 @@ -526,6 +526,16 @@
@@ -134,7 +311,157 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  static struct pan_kmod_bo *
  panthor_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
  {
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/lib/pan_fb.c mesa-akita-main/src/panfrost/lib/pan_fb.c
+--- mesa-main/src/panfrost/lib/pan_fb.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/lib/pan_fb.c	2026-11-11 18:07:11
+@@ -644,6 +644,11 @@
+       return;
+    }
+ 
++   /* akita (Generated-by: LLM): pack and merge on the stack, then store once: rgb_rt is write-combined GPU memory, and the merge
++    * below read it back (an uncached read per word, ~2% of WindowServer's main thread). */
++   struct mali_rgb_render_target_packed *out_rt = rgb_rt, local_rt;
++   rgb_rt = &local_rt;
++
+    pan_pack(rgb_rt, RGB_RENDER_TARGET, cfg) {
+       cfg.internal_buffer_offset = tile_rt_offset_B;
+       cfg.dithering_enable = true;
+@@ -693,6 +698,7 @@
+       GENX(pan_emit_default_color_attachment)(fb->rt_formats[rt], &desc);
+    }
+    pan_merge(rgb_rt, &desc, RGB_RENDER_TARGET);
++   *out_rt = local_rt;
+ }
+ 
+ static void
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/csf/panvk_cmd_buffer.h mesa-akita-main/src/panfrost/vulkan/csf/panvk_cmd_buffer.h
+--- mesa-main/src/panfrost/vulkan/csf/panvk_cmd_buffer.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/csf/panvk_cmd_buffer.h	2026-11-11 04:36:02
+@@ -25,6 +25,7 @@
+ #include "vk_synchronization.h"
+ 
+ #include "util/list.h"
++#include "util/u_dynarray.h"
+ #include "util/perf/u_trace.h"
+ 
+ struct panvk_sync_scope {
+@@ -554,6 +555,13 @@
+    struct panvk_pool desc_pool;
+    struct panvk_pool tls_pool;
+    struct list_head push_sets;
++   /* akita (Generated-by: LLM): the one-time secondaries this primary executes, whose
++    * big TLS BOs leave with the primary's at submit (csf/panvk_vX_gpu_queue.c) */
++   struct util_dynarray akita_secondaries;
++   /* akita: a one-time command buffer's TLS is allocated as it is submitted, not as it
++    * ends (a command buffer ended and never submitted held ~50 MiB): its TLS descriptor
++    * is written then (csf/panvk_vX_gpu_queue.c, akita_tls_fill). AKITA_TLS_AT_SUBMIT=0: off. */
++   bool akita_tls_deferred;
+ 
+    struct {
+       struct u_trace uts[PANVK_SUBQUEUE_COUNT];
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/csf/panvk_queue.h mesa-akita-main/src/panfrost/vulkan/csf/panvk_queue.h
+--- mesa-main/src/panfrost/vulkan/csf/panvk_queue.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/csf/panvk_queue.h	2026-11-11 03:17:12
+@@ -92,6 +92,13 @@
+    } utrace;
+ 
+    struct panvk_subqueue subqueues[PANVK_SUBQUEUE_COUNT];
++
++   /* akita (Generated-by: LLM, local only): the big TLS BOs of one-time-submit
++    * command buffers, taken from them at submit and given back to the device's
++    * cache (panvk_device::tls_big_bo_pool) once a binary syncobj made from the
++    * submit's signal says their work is done. A command buffer the Metal bridge
++    * keeps executable in a spare pool no longer holds ~50 MiB each. */
++   struct list_head akita_tls_pending;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c
+--- mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_buffer.c	2026-11-11 05:37:09
+@@ -50,7 +50,20 @@
+       to_panvk_physical_device(dev->vk.physical);
+    unsigned core_id_range = pan_query_core_id_range(&phys_dev->kmod.dev->props);
+ 
+-   if (cmdbuf->state.tls.info.tls.size) {
++   static int akita_defer = -1;
++   if (akita_defer < 0) {
++      const char *v = getenv("AKITA_TLS_AT_SUBMIT");
++      akita_defer = !(v && v[0] == '0');
++   }
++   cmdbuf->akita_tls_deferred = false;
++   if (cmdbuf->state.tls.info.tls.size && akita_defer && cmdbuf->state.tls.desc.cpu &&
++       (cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)) {
++      /* akita (Generated-by: LLM): allocated and written at submit (akita_tls_fill) */
++      cmdbuf->akita_tls_deferred = true;
++      cmdbuf->state.tls.info.tls.ptr = 0;
++   } else if (cmdbuf->state.tls.info.tls.size && cmdbuf->state.tls.desc.cpu) {
++      /* akita: no descriptor, nobody reads the pointer (a primary that only runs
++       * secondaries, each with its own TLS, had ~50 MiB for nothing) */
+       unsigned thread_tls_alloc =
+          pan_query_thread_tls_alloc(&phys_dev->kmod.dev->props);
+       unsigned size = pan_get_total_stack_size(cmdbuf->state.tls.info.tls.size,
+@@ -58,6 +71,14 @@
+ 
+       cmdbuf->state.tls.info.tls.ptr =
+          panvk_cmd_alloc_dev_mem(cmdbuf, tls, size, 4096).gpu;
++      /* akita (Generated-by: LLM): who asks for TLS (the first 60) */
++      static unsigned akita_told;
++      if (akita_told++ < 60)
++         fprintf(stderr, "akita-tls-alloc: %s%s%s, %u bytes/thread, %u KiB\n",
++                 cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY ? "primary" : "secondary",
++                 (cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) ? " one-time" : "",
++                 (cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) ? " pass-continue" : "",
++                 cmdbuf->state.tls.info.tls.size, size >> 10);
+    }
+ 
+    assert(!cmdbuf->state.tls.info.wls.size);
+@@ -880,6 +901,8 @@
+    panvk_pool_reset(&cmdbuf->tls_pool);
+    list_splicetail(&cmdbuf->push_sets, &pool->push_sets);
+    list_inithead(&cmdbuf->push_sets);
++   util_dynarray_clear(&cmdbuf->akita_secondaries);   /* akita */
++   cmdbuf->akita_tls_deferred = false;
+ 
+    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->utrace.uts); i++) {
+       struct u_trace *ut = &cmdbuf->utrace.uts[i];
+@@ -913,6 +936,7 @@
+    panvk_pool_cleanup(&cmdbuf->desc_pool);
+    panvk_pool_cleanup(&cmdbuf->tls_pool);
+    list_splicetail(&cmdbuf->push_sets, &pool->push_sets);
++   util_dynarray_fini(&cmdbuf->akita_secondaries);   /* akita */
+    vk_command_buffer_finish(&cmdbuf->vk);
+    vk_free(&dev->vk.alloc, cmdbuf);
+ }
+@@ -940,6 +964,7 @@
+    }
+ 
+    list_inithead(&cmdbuf->push_sets);
++   util_dynarray_init(&cmdbuf->akita_secondaries, NULL);   /* akita */
+    cmdbuf->vk.dynamic_graphics_state.vi = &cmdbuf->state.gfx.dynamic.vi;
+    cmdbuf->vk.dynamic_graphics_state.ms.sample_locations =
+       &cmdbuf->state.gfx.dynamic.sl;
+@@ -976,7 +1001,9 @@
+       .owns_bos = true,
+       .needs_locking = false,
+    };
+-   panvk_pool_init(&cmdbuf->tls_pool, device, &pool->tls_bo_pool, &pool->tls_big_bo_pool,
++   /* akita (Generated-by: LLM): the big TLS BOs go to the device's shared cache
++    * (panvk_device::tls_big_bo_pool), not to one cache per command pool. */
++   panvk_pool_init(&cmdbuf->tls_pool, device, &pool->tls_bo_pool, &device->tls_big_bo_pool,
+                    &tls_pool_props);
+ 
+    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->utrace.uts); i++)
+@@ -1077,6 +1104,8 @@
+       primary->state.tls.info.tls.size =
+          MAX2(primary->state.tls.info.tls.size,
+               secondary->state.tls.info.tls.size);
++      if (secondary->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
++         util_dynarray_append_typed(&primary->akita_secondaries, struct panvk_cmd_buffer *, secondary);   /* akita */
+       panvk_per_arch(cmd_prepare_exec_cmd_for_draws)(primary, secondary);
+ 
+       /* Write the conditional rendering flag into the subqueue context
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c
 --- mesa-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_cmd_draw.c	2026-11-07 16:14:43
 @@ -2467,7 +2467,7 @@
@@ -186,7 +513,351 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  
     render->view_mask = inheritance_info->viewMask;
     render->layer_count = inheritance_info->viewMask ?
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_cmd_draw.h mesa-akita-main/src/panfrost/vulkan/panvk_cmd_draw.h
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c
+--- mesa-main/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/csf/panvk_vX_gpu_queue.c	2026-11-11 06:43:56
+@@ -16,6 +16,9 @@
+ #include "panvk_queue.h"
+ #include "panvk_utrace.h"
+ 
++#include "pan_encoder.h"
++#include "pan_props.h"
++
+ #include "pan_trace.h"
+ 
+ #include "kmod/pan_kmod.h"
+@@ -813,6 +816,10 @@
+    uint32_t signal_queue_mask;
+    uint32_t req_resource_subqueue_mask;
+ 
++   /* akita: the subqueues of the one-time command buffers whose TLS is taken, and those BOs */
++   uint32_t akita_tls_mask;
++   struct list_head akita_tls_bos;
++
+    struct drm_panthor_queue_submit *qsubmits;
+    struct drm_panthor_sync_op *wait_ops;
+    struct drm_panthor_sync_op *signal_ops;
+@@ -829,6 +836,197 @@
+    } utrace;
+ };
+ 
++/* akita (Generated-by: LLM, local only): see panvk_gpu_queue::akita_tls_pending. */
++struct akita_tls_pending {
++   struct list_head link;
++   uint32_t syncobj;
++   struct list_head bos;
++};
++
++/* akita: a one-time primary with big TLS BOs of its own or in the one-time secondaries it executes */
++static bool
++akita_cmdbuf_has_tls(struct panvk_cmd_buffer *cmdbuf)
++{
++   if (!(cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT))
++      return false;
++   if (!list_is_empty(&cmdbuf->tls_pool.big_bos) || cmdbuf->akita_tls_deferred)
++      return true;
++   util_dynarray_foreach(&cmdbuf->akita_secondaries, struct panvk_cmd_buffer *, sec) {
++      if (!list_is_empty(&(*sec)->tls_pool.big_bos) || (*sec)->akita_tls_deferred)
++         return true;
++   }
++   return false;
++}
++
++/* akita (Generated-by: LLM): a deferred command buffer's TLS, made now: a BO from the device's
++ * cache or a new one, its address written into the command buffer's TLS descriptor (flushed for the
++ * GPU with the descriptor pool), the BO put on `into` to be given back when the submit is done. */
++static unsigned akita_tls_made, akita_tls_reused, akita_tls_failed;
++static unsigned
++akita_tls_fill(struct panvk_device *dev, struct panvk_cmd_buffer *cmdbuf, struct list_head *into)
++{
++   if (!cmdbuf->akita_tls_deferred)
++      return 0;
++   cmdbuf->akita_tls_deferred = false;
++   struct panvk_physical_device *phys_dev = to_panvk_physical_device(dev->vk.physical);
++   const struct pan_kmod_dev_props *props = &phys_dev->kmod.dev->props;
++   const unsigned size = pan_get_total_stack_size(cmdbuf->state.tls.info.tls.size,
++                                                  pan_query_thread_tls_alloc(props),
++                                                  pan_query_core_id_range(props));
++   struct panvk_priv_bo *bo = NULL;
++
++   /* akita: one shared BO per stride (see panvk_device::akita_tls_global) */
++   static int shared = -1;
++   if (shared < 0) {
++      const char *e = getenv("AKITA_TLS_SHARED");
++      shared = !e || atoi(e) != 0;
++   }
++   if (shared) {
++      const unsigned need = cmdbuf->state.tls.info.tls.size ?
++         util_next_power_of_two(ALIGN_POT(cmdbuf->state.tls.info.tls.size, 16)) : 0;
++      if (!need)
++         return 0;
++      simple_mtx_lock(&dev->akita_tls_global.lock);
++      int best = -1;
++      for (unsigned i = 0; i < dev->akita_tls_global.count; i++) {
++         if (best < 0 || dev->akita_tls_global.per_thread[i] > dev->akita_tls_global.per_thread[best])
++            best = i;
++      }
++      if ((best < 0 || dev->akita_tls_global.per_thread[best] < need) &&
++          dev->akita_tls_global.count < ARRAY_SIZE(dev->akita_tls_global.bo)) {
++         const unsigned total = pan_get_total_stack_size(need, pan_query_thread_tls_alloc(props),
++                                                         pan_query_core_id_range(props));
++         if (panvk_priv_bo_create(dev, total, panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_NO_MMAP),
++                                  VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "TLS (akita, shared)", &bo) == VK_SUCCESS) {
++            best = dev->akita_tls_global.count++;
++            dev->akita_tls_global.bo[best] = bo;
++            dev->akita_tls_global.per_thread[best] = need;
++            akita_tls_made++;
++            fprintf(stderr, "akita-tls: shared TLS %u: %u bytes/thread, %u KiB\n", best, need, total >> 10);
++         } else {
++            akita_tls_failed++;
++            fprintf(stderr, "akita-tls: no memory for a shared %u KiB TLS\n", total >> 10);
++         }
++      } else {
++         akita_tls_reused++;
++      }
++      if (best >= 0 && dev->akita_tls_global.per_thread[best] >= need) {
++         cmdbuf->state.tls.info.tls.size = dev->akita_tls_global.per_thread[best];
++         cmdbuf->state.tls.info.tls.ptr = dev->akita_tls_global.bo[best]->addr.dev;
++      } else {
++         cmdbuf->state.tls.info.tls.size = 0;   /* nothing better: no stack (shaders spilling would fault) */
++         cmdbuf->state.tls.info.tls.ptr = 0;
++      }
++      simple_mtx_unlock(&dev->akita_tls_global.lock);
++      GENX(pan_emit_tls)(&cmdbuf->state.tls.info, cmdbuf->state.tls.desc.cpu);
++      panvk_pool_flush_maps(&cmdbuf->desc_pool);
++      return 0;   /* nothing to give back */
++   }
++
++   struct panvk_bo_pool *cache = &dev->tls_big_bo_pool;
++   simple_mtx_lock(&cache->lock);
++   list_for_each_entry(struct panvk_priv_bo, cached, &cache->free_bos, node) {
++      if (pan_kmod_bo_size(cached->bo) >= size) {
++         bo = cached;
++         list_del(&bo->node);
++         break;
++      }
++   }
++   simple_mtx_unlock(&cache->lock);
++   if (bo) {
++      akita_tls_reused++;
++   } else if (panvk_priv_bo_create(dev, size, panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_NO_MMAP),
++                                   VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, "TLS (akita, at submit)", &bo) != VK_SUCCESS) {
++      akita_tls_failed++;
++      fprintf(stderr, "akita-tls: no memory for a %u KiB TLS at submit\n", size >> 10);
++      return 0;
++   } else {
++      akita_tls_made++;
++   }
++   cmdbuf->state.tls.info.tls.ptr = bo->addr.dev;
++   GENX(pan_emit_tls)(&cmdbuf->state.tls.info, cmdbuf->state.tls.desc.cpu);
++   panvk_pool_flush_maps(&cmdbuf->desc_pool);
++   list_addtail(&bo->node, into);
++   return 1;
++}
++
++static unsigned
++akita_cmdbuf_take_tls(struct panvk_device *dev, struct panvk_cmd_buffer *cmdbuf, struct list_head *into)
++{
++   unsigned n = list_length(&cmdbuf->tls_pool.big_bos);
++   list_splicetail(&cmdbuf->tls_pool.big_bos, into);
++   list_inithead(&cmdbuf->tls_pool.big_bos);
++   n += akita_tls_fill(dev, cmdbuf, into);
++   util_dynarray_foreach(&cmdbuf->akita_secondaries, struct panvk_cmd_buffer *, sec) {
++      n += list_length(&(*sec)->tls_pool.big_bos);
++      list_splicetail(&(*sec)->tls_pool.big_bos, into);
++      list_inithead(&(*sec)->tls_pool.big_bos);
++      n += akita_tls_fill(dev, *sec, into);
++   }
++   return n;
++}
++
++/* akita: counters, told on stderr every 200 submits (the first 30 times) */
++static struct {
++   uint64_t submits, cmdbufs, with_tls, one_time_tls, taken, given_back, sync_failed;
++} akita_tls_stats;
++
++static void
++akita_tls_give_back(struct panvk_device *dev, struct list_head *bos)
++{
++   struct panvk_bo_pool *cache = &dev->tls_big_bo_pool;
++   akita_tls_stats.given_back += list_length(bos);
++   simple_mtx_lock(&cache->lock);
++   list_splicetail(bos, &cache->free_bos);
++   list_inithead(bos);
++   unsigned count = list_length(&cache->free_bos);
++   while (count > cache->keep) {
++      struct panvk_priv_bo *smallest = NULL;
++      list_for_each_entry(struct panvk_priv_bo, bo, &cache->free_bos, node) {
++         if (!smallest || pan_kmod_bo_size(bo->bo) < pan_kmod_bo_size(smallest->bo))
++            smallest = bo;
++      }
++      list_del(&smallest->node);
++      panvk_priv_bo_unref(smallest);
++      count--;
++   }
++   simple_mtx_unlock(&cache->lock);
++}
++
++
++static void
++akita_tls_tell(struct panvk_gpu_queue *queue)
++{
++   static unsigned told;
++   const uint64_t n = akita_tls_stats.submits;
++   if ((n != 1 && n != 10 && n % 25) || told >= 60)
++      return;
++   told++;
++   fprintf(stderr, "akita-tls: made at submit %u, reused %u, failed %u; %llu submits, %llu command buffers, %llu with TLS BOs (%llu one-time), %llu BOs taken, %llu given back, %u pending, %llu sync failures\n",
++           akita_tls_made, akita_tls_reused, akita_tls_failed,
++           (unsigned long long)akita_tls_stats.submits, (unsigned long long)akita_tls_stats.cmdbufs,
++           (unsigned long long)akita_tls_stats.with_tls, (unsigned long long)akita_tls_stats.one_time_tls,
++           (unsigned long long)akita_tls_stats.taken, (unsigned long long)akita_tls_stats.given_back,
++           list_length(&queue->akita_tls_pending), (unsigned long long)akita_tls_stats.sync_failed);
++}
++
++/* Give back what finished; with `wait`, wait for all of it first. */
++static void
++akita_tls_reap(struct panvk_gpu_queue *queue, bool wait)
++{
++   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
++   list_for_each_entry_safe(struct akita_tls_pending, p, &queue->akita_tls_pending, link) {
++      uint32_t handle = p->syncobj;
++      int ret = pan_kmod_sync_wait(dev->kmod.dev, &handle, 1, wait ? INT64_MAX : 0, 0, NULL);
++      if (ret && !wait)
++         continue;   /* still running (in order or not: each has its own syncobj) */
++      akita_tls_give_back(dev, &p->bos);
++      pan_kmod_sync_destroy(dev->kmod.dev, p->syncobj);
++      list_del(&p->link);
++      free(p);
++   }
++}
++
+ struct panvk_queue_submit_stack_storage {
+    struct drm_panthor_queue_submit qsubmits[8];
+    struct drm_panthor_sync_op syncops[8];
+@@ -852,6 +1050,7 @@
+       submit->phys_dev->kmod.dev->props.timestamp_frequency;
+ 
+    submit->force_sync = PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC);
++   list_inithead(&submit->akita_tls_bos);
+ }
+ 
+ static VkResult
+@@ -874,6 +1073,8 @@
+ 
+          cmd_stage_mask |= panvk_get_subqueue_stages(j);
+          submit->qsubmit_count++;
++         if (akita_cmdbuf_has_tls(cmdbuf))
++            submit->akita_tls_mask |= BITFIELD_BIT(j);   /* akita */
+ 
+          struct panvk_subqueue *subq = &submit->queue->subqueues[j];
+          /* If we need a resource the subqueue has not requested yet. */
+@@ -945,6 +1146,9 @@
+       submit->signal_queue_mask |= BITFIELD_MASK(PANVK_SUBQUEUE_COUNT);
+    }
+ 
++   /* akita: the subqueues that ran a one-time command buffer's shaders signal, so we know when its TLS is free */
++   submit->signal_queue_mask |= submit->akita_tls_mask;
++
+    uint32_t syncop_count = 0;
+ 
+    /* We add sync-only queue submits to place our wait/signal operations. */
+@@ -1095,6 +1299,24 @@
+ 
+       uint32_t flush_id = panthor_kmod_get_flush_id(dev->kmod.dev);
+ 
++      akita_tls_stats.cmdbufs++;
++      if (!list_is_empty(&cmdbuf->tls_pool.big_bos)) {
++         akita_tls_stats.with_tls++;
++         if (akita_cmdbuf_has_tls(cmdbuf))
++            akita_tls_stats.one_time_tls++;
++      }
++      /* akita: a one-time command buffer's big TLS BOs leave it now (see akita_tls_pending) */
++      if (submit->akita_tls_mask &&
++          (cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)) {
++         akita_tls_stats.taken += akita_cmdbuf_take_tls(dev, cmdbuf, &submit->akita_tls_bos);
++      } else {
++         /* akita: a primary that may be submitted again keeps what its deferred one-time
++          * secondaries get, until it is reset (the old life of a TLS BO) */
++         akita_tls_fill(dev, cmdbuf, &cmdbuf->tls_pool.big_bos);
++         util_dynarray_foreach(&cmdbuf->akita_secondaries, struct panvk_cmd_buffer *, sec)
++            akita_tls_fill(dev, *sec, &cmdbuf->tls_pool.big_bos);
++      }
++
+       for (uint32_t j = 0; j < ARRAY_SIZE(cmdbuf->state.cs); j++) {
+          struct cs_builder *b = panvk_get_cs_builder(cmdbuf, j);
+          if (cs_is_empty(b))
+@@ -1280,6 +1502,31 @@
+       u_trace_context_process(&dev->utrace.utctx, false);
+    }
+ 
++   /* akita: a binary syncobj that signals with every subqueue that signalled here, for the TLS taken */
++   if (!list_is_empty(&submit->akita_tls_bos)) {
++      struct akita_tls_pending *p = calloc(1, sizeof(*p));
++      uint32_t handle = 0;
++      if (p && !pan_kmod_sync_create(dev->kmod.dev, 0, &handle) &&
++          !pan_kmod_sync_transfer(dev->kmod.dev, handle, 0, queue->syncobj_handle,
++                                  util_bitcount(submit->signal_queue_mask), 0)) {
++         p->syncobj = handle;
++         list_inithead(&p->bos);
++         list_splicetail(&submit->akita_tls_bos, &p->bos);
++         list_inithead(&submit->akita_tls_bos);
++         list_addtail(&p->link, &queue->akita_tls_pending);
++      } else {
++         akita_tls_stats.sync_failed++;
++         /* no way to know when it is done: wait for this submit, then give back */
++         uint64_t point = util_bitcount(submit->signal_queue_mask);
++         pan_kmod_sync_timeline_wait(dev->kmod.dev, &queue->syncobj_handle, &point, 1, INT64_MAX,
++                                     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++         akita_tls_give_back(dev, &submit->akita_tls_bos);
++         if (handle)
++            pan_kmod_sync_destroy(dev->kmod.dev, handle);
++         free(p);
++      }
++   }
++
+    pan_kmod_sync_reset(dev->kmod.dev, &queue->syncobj_handle, 1);
+ }
+ 
+@@ -1374,6 +1621,9 @@
+    }
+ 
+    panvk_queue_submit_init(&submit, vk_queue);
++   akita_tls_reap(submit.queue, false);   /* akita */
++   akita_tls_stats.submits++;
++   akita_tls_tell(submit.queue);
+    result = panvk_queue_submit_init_storage(&submit, vk_submit, &stack_storage);
+    if (result != VK_SUCCESS)
+       goto out;
+@@ -1460,6 +1710,7 @@
+       goto err_destroy_group;
+ 
+    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
++   list_inithead(&queue->akita_tls_pending);   /* akita */
+    *out_queue = &queue->vk;
+    return VK_SUCCESS;
+ 
+@@ -1486,6 +1737,7 @@
+    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+ 
++   akita_tls_reap(queue, true);   /* akita */
+    cleanup_queue(queue);
+    destroy_group(queue);
+    cleanup_tiler(queue);
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_cmd_desc_state.h mesa-akita-main/src/panfrost/vulkan/panvk_cmd_desc_state.h
+--- mesa-main/src/panfrost/vulkan/panvk_cmd_desc_state.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_cmd_desc_state.h	2026-11-10 23:55:05
+@@ -54,7 +54,7 @@
+ struct panvk_push_set {
+    struct panvk_cmd_pool_obj base;
+    struct panvk_descriptor_set set;
+-   struct panvk_opaque_desc descs[MAX_PUSH_DESCS];
++   struct panvk_opaque_desc descs[MAX_PUSH_DESC_SLOTS];
+ };
+ 
+ struct panvk_descriptor_state {
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_cmd_draw.h mesa-akita-main/src/panfrost/vulkan/panvk_cmd_draw.h
 --- mesa-main/src/panfrost/vulkan/panvk_cmd_draw.h	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_cmd_draw.h	2026-11-07 16:14:31
 @@ -10,6 +10,9 @@
@@ -263,7 +934,75 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  }
  
  static inline uint32_t
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_device_memory.c mesa-akita-main/src/panfrost/vulkan/panvk_device_memory.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_cmd_meta.h mesa-akita-main/src/panfrost/vulkan/panvk_cmd_meta.h
+--- mesa-main/src/panfrost/vulkan/panvk_cmd_meta.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_cmd_meta.h	2026-11-10 23:55:05
+@@ -24,7 +24,7 @@
+    } cs;
+    const struct panvk_descriptor_set *set0;
+    struct {
+-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
++      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESC_SLOTS];
+       uint64_t descs_dev_addr;
+       uint32_t desc_count;
+       bool dirty;
+@@ -38,7 +38,7 @@
+    const struct panvk_graphics_pipeline *pipeline;
+    const struct panvk_descriptor_set *set0;
+    struct {
+-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
++      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESC_SLOTS];
+       uint64_t descs_dev_addr;
+       uint32_t desc_count;
+       bool dirty;
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_descriptor_set_layout.h mesa-akita-main/src/panfrost/vulkan/panvk_descriptor_set_layout.h
+--- mesa-main/src/panfrost/vulkan/panvk_descriptor_set_layout.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_descriptor_set_layout.h	2026-11-10 23:55:05
+@@ -23,6 +23,14 @@
+ #define MAX_DYNAMIC_UNIFORM_BUFFERS   16
+ #define MAX_DYNAMIC_STORAGE_BUFFERS   8
+ #define MAX_PUSH_DESCS                32
++/* akita local change (Generated-by: LLM, not for upstream): maxPushDescriptors
++ * counts descriptors, but a combined image/sampler takes one slot per texture
++ * plane plus one per sampler plane (panvk_get_desc_stride), so a valid push
++ * set of MAX_PUSH_DESCS descriptors can need several times as many slots.
++ * With storage for only MAX_PUSH_DESCS slots, QuartzCore's generic fragment
++ * shader made descriptor_set_write() run past the push set and corrupt the
++ * heap (WindowServer crashes). Reserve the worst case: 3 planes + 3 samplers. */
++#define MAX_PUSH_DESC_SLOTS           (MAX_PUSH_DESCS * 6)
+ #define MAX_INLINE_UNIFORM_BLOCK_SIZE (1 << 16)
+ #define MAX_DYNAMIC_BUFFERS                                                    \
+    (MAX_DYNAMIC_UNIFORM_BUFFERS + MAX_DYNAMIC_STORAGE_BUFFERS)
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_device.h mesa-akita-main/src/panfrost/vulkan/panvk_device.h
+--- mesa-main/src/panfrost/vulkan/panvk_device.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_device.h	2026-11-11 06:43:56
+@@ -83,6 +83,25 @@
+       struct panvk_pool exec;
+    } mempools;
+ 
++   /* akita (Generated-by: LLM, local only): the command buffers' big TLS BOs
++    * (shader scratch, ~50 MiB each on this GPU) come back here instead of to
++    * their command pool: with one cache per command pool, every pool the
++    * Metal bridge made kept one, and WindowServer ran out of memory. */
++   struct panvk_bo_pool tls_big_bo_pool;
++
++   /* akita (Generated-by: LLM, local only): TLS BOs shared by every command
++    * buffer of the device. The shader stack is indexed by hardware thread
++    * slot (core, thread), so work running at the same time never uses the
++    * same part of it as long as everyone uses the same stride; one BO per
++    * stride, kept until the device goes. fullos143 made 31 x 50 MiB in one
++    * submit with a BO per command buffer. */
++   struct {
++      simple_mtx_t lock;
++      unsigned count;
++      unsigned per_thread[8];
++      struct panvk_priv_bo *bo[8];
++   } akita_tls_global;
++
+    struct {
+       util_once_flag blackhole_once;
+       struct pan_kmod_bo *blackhole;
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_device_memory.c mesa-akita-main/src/panfrost/vulkan/panvk_device_memory.c
 --- mesa-main/src/panfrost/vulkan/panvk_device_memory.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_device_memory.c	2026-11-07 16:13:37
 @@ -95,6 +95,33 @@
@@ -336,7 +1075,57 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  
  VKAPI_ATTR VkResult VKAPI_CALL
  panvk_GetMemoryFdPropertiesKHR(VkDevice _device,
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_instance.c mesa-akita-main/src/panfrost/vulkan/panvk_instance.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_image.c mesa-akita-main/src/panfrost/vulkan/panvk_image.c
+--- mesa-main/src/panfrost/vulkan/panvk_image.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_image.c	2026-11-11 22:43:59
+@@ -512,6 +512,20 @@
+ 
+       pan_img->planes[pan_plane] = &image->planes[plane].plane;
+       if (!pan_image_layout_init(arch, pan_img, pan_plane, &plane_layout)) {
++         /* akita diagnostic (Generated-by: LLM, local): which image layout
++          * the Mali rejects (imported IOSurfaces carry explicit layouts). */
++         fprintf(stderr,
++                 "panvk: layout init failed: %ux%ux%u fmt %u plane %u/%u mod %#llx "
++                 "explicit %d offset %llu row %llu array %llu strict %d usage %#llx\n",
++                 image->vk.extent.width, image->vk.extent.height,
++                 image->vk.extent.depth, image->vk.format, plane,
++                 image->plane_count,
++                 (unsigned long long)image->vk.drm_format_mod,
++                 explicit_info != NULL,
++                 (unsigned long long)plane_layout.offset_B,
++                 (unsigned long long)plane_layout.wsi_row_pitch_B,
++                 (unsigned long long)plane_layout.wsi_array_pitch_B,
++                 plane_layout.strict, (unsigned long long)image->vk.usage);
+          return panvk_error(image->vk.base.device,
+                             VK_ERROR_INITIALIZATION_FAILED);
+       }
+@@ -1079,10 +1093,24 @@
+     * the alignment requirement. It's up to us to satisfy the alignment
+     * requirement when allocating the VA range.
+     */
++   /* akita (Generated-by: LLM): a linear image needs its slices 64-byte aligned (pan_image_slice_align), not a page: the Metal bridge
++    * binds textures over Core Animation's buffers at offset 256 directly to their memory instead of shadowing them (copied in and out
++    * every pass) when the image asks no more than that. AKITA_LINEAR_ALIGN_PAGE=1 goes back to 4096. (The Dock's calendar icon
++    * without its date in fullos171 shows without this too, fullos174.) */
++   const bool akita_linear = image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
++      (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
++       image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR);
++   /* akita (Generated-by: LLM): an uncompressed tiled (u-interleaved) image needs 64-byte aligned slices, not a page. Metal answers
++    * a heap texture's alignment as 128: at 4096 the bridge could not bind the image where the heap places it and made every
++    * heap texture (Core Animation's 1200x540 targets, made again and again) a shadow copied in and out every pass. 128, as Metal.
++    * AKITA_TILED_ALIGN_PAGE=1 goes back to 4096. */
++   const bool akita_tiled = !akita_linear && !drm_is_afbc(image->vk.drm_format_mod) &&
++      image->vk.drm_format_mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED && !getenv("AKITA_TILED_ALIGN_PAGE");
+    const uint64_t alignment =
+       image->vk.create_flags & VK_IMAGE_CREATE_2_SPARSE_BINDING_BIT_KHR
+          ? panvk_image_get_sparse_binding_granularity(image)
+-         : 4096;
++         : (akita_linear && !getenv("AKITA_LINEAR_ALIGN_PAGE") ? 64
++            : akita_tiled ? 128 : 4096);
+    const VkImagePlaneMemoryRequirementsInfo *plane_info =
+       vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
+    const bool disjoint = is_disjoint(image);
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_instance.c mesa-akita-main/src/panfrost/vulkan/panvk_instance.c
 --- mesa-main/src/panfrost/vulkan/panvk_instance.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_instance.c	2026-11-07 16:13:37
 @@ -223,7 +223,12 @@
@@ -367,7 +1156,103 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
 +   return panvk_GetInstanceProcAddr(instance, pName);
 +}
 +#endif
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_physical_device.c mesa-akita-main/src/panfrost/vulkan/panvk_physical_device.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_mempool.c mesa-akita-main/src/panfrost/vulkan/panvk_mempool.c
+--- mesa-main/src/panfrost/vulkan/panvk_mempool.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_mempool.c	2026-11-11 02:38:05
+@@ -18,8 +18,27 @@
+       list_del(&bo->node);
+       panvk_priv_bo_unref(bo);
+    }
++   if (bo_pool->keep)
++      simple_mtx_destroy(&bo_pool->lock);
+ }
+ 
++/* akita (Generated-by: LLM): a shared pool keeps its `keep` biggest free BOs. */
++static void
++panvk_bo_pool_trim_locked(struct panvk_bo_pool *bo_pool)
++{
++   unsigned count = list_length(&bo_pool->free_bos);
++   while (count > bo_pool->keep) {
++      struct panvk_priv_bo *smallest = NULL;
++      list_for_each_entry(struct panvk_priv_bo, bo, &bo_pool->free_bos, node) {
++         if (!smallest || pan_kmod_bo_size(bo->bo) < pan_kmod_bo_size(smallest->bo))
++            smallest = bo;
++      }
++      list_del(&smallest->node);
++      panvk_priv_bo_unref(smallest);
++      count--;
++   }
++}
++
+ /* Knockoff u_upload_mgr. Uploads wherever we left off, allocating new entries
+  * when needed.
+  *
+@@ -49,6 +68,8 @@
+       list_del(&bo->node);
+    } else {
+       if (pool->big_bo_pool) {
++         if (pool->big_bo_pool->keep)
++            simple_mtx_lock(&pool->big_bo_pool->lock);
+          list_for_each_entry_safe(struct panvk_priv_bo, pooled_bo,
+                                   &pool->big_bo_pool->free_bos, node) {
+             const size_t picked_bo_sz = pan_kmod_bo_size(pooled_bo->bo);
+@@ -59,6 +80,8 @@
+                break;
+             }
+          }
++         if (pool->big_bo_pool->keep)
++            simple_mtx_unlock(&pool->big_bo_pool->lock);
+       }
+ 
+       if (bo == NULL) {
+@@ -228,8 +251,14 @@
+    }
+ 
+    if (pool->big_bo_pool) {
++      if (pool->big_bo_pool->keep)
++         simple_mtx_lock(&pool->big_bo_pool->lock);
+       list_splicetail(&pool->big_bos, &pool->big_bo_pool->free_bos);
+       list_inithead(&pool->big_bos);
++      if (pool->big_bo_pool->keep) {
++         panvk_bo_pool_trim_locked(pool->big_bo_pool);
++         simple_mtx_unlock(&pool->big_bo_pool->lock);
++      }
+    } else {
+       list_for_each_entry_safe(struct panvk_priv_bo, bo, &pool->big_bos, node) {
+          list_del(&bo->node);
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_mempool.h mesa-akita-main/src/panfrost/vulkan/panvk_mempool.h
+--- mesa-main/src/panfrost/vulkan/panvk_mempool.h	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_mempool.h	2026-11-11 02:38:05
+@@ -16,12 +16,28 @@
+ 
+ struct panvk_bo_pool {
+    struct list_head free_bos;
++   /* akita (Generated-by: LLM, local only): a pool shared by many owners (the
++    * device's one for the command buffers' TLS) takes a lock, and keeps at most
++    * `keep` free BOs: the rest are freed when they come back. 0: per-owner pool,
++    * no lock, no limit (upstream behaviour). */
++   unsigned keep;
++   simple_mtx_t lock;
+ };
+ 
+ static inline void
+ panvk_bo_pool_init(struct panvk_bo_pool *bo_pool)
+ {
+    list_inithead(&bo_pool->free_bos);
++   bo_pool->keep = 0;
++}
++
++/* akita: see panvk_bo_pool::keep. */
++static inline void
++panvk_bo_pool_init_shared(struct panvk_bo_pool *bo_pool, unsigned keep)
++{
++   list_inithead(&bo_pool->free_bos);
++   bo_pool->keep = keep;
++   simple_mtx_init(&bo_pool->lock, mtx_plain);
+ }
+ 
+ void panvk_bo_pool_cleanup(struct panvk_bo_pool *bo_pool);
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_physical_device.c mesa-akita-main/src/panfrost/vulkan/panvk_physical_device.c
 --- mesa-main/src/panfrost/vulkan/panvk_physical_device.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_physical_device.c	2026-11-07 16:06:12
 @@ -77,7 +77,12 @@
@@ -486,7 +1371,36 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  
     const VkExternalMemoryHandleTypeFlags supported_handle_types =
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+--- mesa-main/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c	2026-11-10 23:55:05
+@@ -375,6 +375,12 @@
+    const struct panvk_descriptor_set_layout *set_layout =
+       to_panvk_descriptor_set_layout(playout->set_layouts[info->set]);
+ 
++   /* akita (Generated-by: LLM): never write past the push set's storage */
++   if (unlikely(set_layout->desc_count > MAX_PUSH_DESC_SLOTS)) {
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++
+    struct panvk_descriptor_set *push_set =
+       cmd_get_push_desc_set(&cmd->vk, desc, info->set);
+    if (!push_set)
+@@ -428,6 +434,12 @@
+       to_panvk_descriptor_set_layout(playout->set_layouts[set]);
+    struct panvk_descriptor_state *desc_state =
+       panvk_cmd_get_desc_state(cmdbuf, template->bind_point);
++   /* akita (Generated-by: LLM): never write past the push set's storage */
++   if (unlikely(set_layout->desc_count > MAX_PUSH_DESC_SLOTS)) {
++      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++
+    struct panvk_descriptor_set *push_set =
+       cmd_get_push_desc_set(&cmdbuf->vk, desc_state, set);
+    if (!push_set)
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c
 --- mesa-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_draw.c	2026-11-07 16:14:31
 @@ -616,6 +616,7 @@
@@ -497,7 +1411,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  
     const VkMultisampledRenderToSingleSampledInfoEXT *ms2ss_info =
        vk_find_struct_const(pRenderingInfo,
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c
 --- mesa-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_frame_shaders.c	2026-11-07 16:14:14
 @@ -779,6 +779,14 @@
@@ -515,7 +1429,60 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
     for (unsigned rt = 0; rt < PAN_MAX_RTS; rt++) {
        if (pan_fb_shader_key_target_written(&key->key.rts[rt]) &&
            load->rts[rt].always)
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/panfrost/vulkan/panvk_vX_physical_device.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_physical_device.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+--- mesa-main/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c	2026-11-11 18:07:20
+@@ -37,7 +37,13 @@
+    uint64_t *common = (uint64_t *)&common_inner;
+ 
+    uint64_t *push_consts = cmdbuf->state.push_constants.data;
+-   uint64_t *faus = push_uniforms->cpu;
++   /* akita (Generated-by: LLM): build the FAU words on the stack and copy them out once: push_uniforms->cpu is write-combined GPU
++    * memory and the immediate merge below read each word back (uncached), on every draw. */
++   uint64_t local_faus[256];
++   const size_t fau_bytes = (size_t)shader->fau.total_count * sizeof(uint64_t) * repeat_count;
++   uint64_t *faus = fau_bytes <= sizeof(local_faus) ? local_faus : push_uniforms->cpu;
++   if (faus == local_faus)
++      memset(local_faus, 0, fau_bytes);
+    const struct pan_fau_layout *fau = &shader->info.fau;
+    uint32_t w;
+ 
+@@ -73,6 +79,9 @@
+             ((uint64_t)fau->words[i].constant << (32 * hi));
+       }
+    }
++
++   if (faus == local_faus)
++      memcpy(push_uniforms->cpu, local_faus, fau_bytes);
+ 
+    return VK_SUCCESS;
+ }
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_vX_device.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_device.c
+--- mesa-main/src/panfrost/vulkan/panvk_vX_device.c	2026-11-07 16:02:04
++++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_device.c	2026-11-11 06:43:56
+@@ -105,6 +105,9 @@
+    };
+ 
+    panvk_pool_init(&dev->mempools.exec, dev, NULL, NULL, &exec_pool_props);
++
++   simple_mtx_init(&dev->akita_tls_global.lock, mtx_plain);   /* akita */
++   panvk_bo_pool_init_shared(&dev->tls_big_bo_pool, 4);   /* akita: 2 then 4 churned 50 MiB BOs (fullos140: 93 made in 10 min, ~100 ms each) */
+ }
+ 
+ static void
+@@ -113,6 +116,11 @@
+    panvk_pool_cleanup(&dev->mempools.rw);
+    panvk_pool_cleanup(&dev->mempools.rw_nc);
+    panvk_pool_cleanup(&dev->mempools.exec);
++   panvk_bo_pool_cleanup(&dev->tls_big_bo_pool);   /* akita */
++   for (unsigned i = 0; i < dev->akita_tls_global.count; i++)   /* akita */
++      panvk_priv_bo_unref(dev->akita_tls_global.bo[i]);
++   dev->akita_tls_global.count = 0;
++   simple_mtx_destroy(&dev->akita_tls_global.lock);
+ }
+ 
+ /* On JM, this is called during device initialization. On CSF, panthor doesn't
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/panfrost/vulkan/panvk_vX_physical_device.c mesa-akita-main/src/panfrost/vulkan/panvk_vX_physical_device.c
 --- mesa-main/src/panfrost/vulkan/panvk_vX_physical_device.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/panfrost/vulkan/panvk_vX_physical_device.c	2026-11-07 16:14:09
 @@ -169,6 +169,9 @@
@@ -537,7 +1504,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
        /* The largest buffer texture format is 16B */
        .minTexelBufferOffsetAlignment = 16,
        /* Always aligned on a uniform slot (vec4). */
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/util/cache_ops_aarch64.c mesa-akita-main/src/util/cache_ops_aarch64.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/util/cache_ops_aarch64.c mesa-akita-main/src/util/cache_ops_aarch64.c
 --- mesa-main/src/util/cache_ops_aarch64.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/util/cache_ops_aarch64.c	2026-11-07 16:08:01
 @@ -26,12 +26,22 @@
@@ -587,7 +1554,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  }
  
  static void
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/util/os_mman.h mesa-akita-main/src/util/os_mman.h
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/util/os_mman.h mesa-akita-main/src/util/os_mman.h
 --- mesa-main/src/util/os_mman.h	2026-11-07 16:02:04
 +++ mesa-akita-main/src/util/os_mman.h	2026-11-07 16:02:07
 @@ -51,7 +51,19 @@
@@ -611,7 +1578,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  /* 32-bit needs mmap64 for 64-bit offsets */
  #  define os_mmap(addr, length, prot, flags, fd, offset) \
               mmap64(addr, length, prot, flags, fd, offset)
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/vulkan/runtime/vk_image.c mesa-akita-main/src/vulkan/runtime/vk_image.c
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/vulkan/runtime/vk_image.c mesa-akita-main/src/vulkan/runtime/vk_image.c
 --- mesa-main/src/vulkan/runtime/vk_image.c	2026-11-07 16:02:04
 +++ mesa-akita-main/src/vulkan/runtime/vk_image.c	2026-11-07 16:02:18
 @@ -23,7 +23,7 @@
@@ -641,7 +1608,7 @@ diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src
  VKAPI_ATTR VkResult VKAPI_CALL
  vk_common_GetImageDrmFormatModifierPropertiesEXT(UNUSED VkDevice device,
                                                   VkImage _image,
-diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci mesa-main/src/vulkan/runtime/vk_image.h mesa-akita-main/src/vulkan/runtime/vk_image.h
+diff -ruN -x .git -x *.pyc -x __pycache__ -x *.orig -x *.rej -x ci -x *.orig163 -x *.orig170 mesa-main/src/vulkan/runtime/vk_image.h mesa-akita-main/src/vulkan/runtime/vk_image.h
 --- mesa-main/src/vulkan/runtime/vk_image.h	2026-11-07 16:02:04
 +++ mesa-akita-main/src/vulkan/runtime/vk_image.h	2026-11-07 16:02:18
 @@ -80,7 +80,7 @@

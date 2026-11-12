@@ -1,14 +1,14 @@
 #!/bin/bash
-# Acceso SSH al macOS Recovery del Pixel 8a por el cable USB (gadget CDC-ECM de AkitaUsbGadget.h,
-# boot-arg akita-usb-gadget=2; el kext pone 169.254.7.2/16 en en0 del teléfono).
+# SSH access to the Pixel 8a's macOS over the USB cable (CDC-ECM gadget of AkitaUsbGadget.h,
+# boot-arg akita-usb-gadget=2; the kext puts 169.254.7.2/16 on the phone's en0).
 #
-#   ./akita-usb-shell.sh setup   deja sshd corriendo en el teléfono (claves propias en scratch/sshkeys)
-#                                después: ssh -F /Volumes/datos2/unixnu-akita/scratch/sshkeys/ssh_config akita
+#   ./akita-usb-shell.sh setup   leaves sshd running on the phone (own keys in scratch/sshkeys)
+#                                then: ssh -F /Volumes/datos2/unixnu-akita/scratch/sshkeys/ssh_config akita
 #
-# Cómo arranca: si ssh aún no responde, escribe por control remoto (akita-live.py, UDP 5141) en el Terminal que
-# tenga el foco la orden  nc -l 2323|bash|nc -l 2324  y, por ese canal de un solo uso (entrada por 2323, salida por
-# 2324), instala las claves y lanza sshd. No se sondean 2323/2324 con nc -z: cada nc -l acepta UNA conexión.
-# Recovery no trae sftp-server: para copiar archivos usa  scp -O -F .../ssh_config akita:/ruta .
+# How it starts: if ssh does not answer yet, it types through remote control (akita-live.py, UDP 5141) into the focused
+# Terminal the command  nc -l 2323|bash|nc -l 2324  and, through that one-shot channel (input on 2323, output on
+# 2324), installs the keys and starts sshd. 2323/2324 are not probed with nc -z: each nc -l accepts ONE connection.
+# Recovery has no sftp-server: to copy files use  scp -O -F .../ssh_config akita:/path .
 set -u
 PHONE=169.254.7.2
 BASE=/Volumes/datos2/unixnu-akita
@@ -16,7 +16,7 @@ KEYS=$BASE/scratch/sshkeys
 WORK=$BASE/scratch/shell
 mkdir -p "$WORK" "$KEYS"
 IF=$(for i in $(ifconfig -l); do ifconfig "$i" 2>/dev/null | grep -q "ether 02:a5:1a:00:00:01" && echo "$i"; done | head -1)
-[ -z "$IF" ] && { echo "no encuentro la interfaz USB del Pixel (ether 02:a5:1a:00:00:01)"; exit 1; }
+[ -z "$IF" ] && { echo "can't find the Pixel's USB interface (ether 02:a5:1a:00:00:01)"; exit 1; }
 
 [ -f "$KEYS/host_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C akita-host -f "$KEYS/host_ed25519"
 [ -f "$KEYS/client_ed25519" ] || ssh-keygen -q -t ed25519 -N "" -C akita-client -f "$KEYS/client_ed25519"
@@ -60,7 +60,7 @@ for _ in $(seq 1 15); do sshok && break; sleep 1; done
 exec 3>&-
 sleep 1; kill $reader $writer 2>/dev/null
 if sshok; then
-  ssh -F "$KEYS/ssh_config" akita 'echo "sshd listo: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -r)"'
+  ssh -F "$KEYS/ssh_config" akita 'echo "sshd ready: macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -r)"'
 else
   echo "sshd no responde; salida del canal:"; cat "$out"; exit 1
 fi

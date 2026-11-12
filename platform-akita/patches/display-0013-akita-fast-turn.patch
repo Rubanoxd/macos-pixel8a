@@ -1,0 +1,113 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -385,7 +385,7 @@
+     }
+     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
+         fStalled++;
+-    else if (fLastSurface && fTicks < fRecopyUntil && fTicks % 6 == 0 && !at<IOMFBSwapIORequest *>(this, kCurrentSwap))
++    else if (!fFenceOn && fLastSurface && fTicks < fRecopyUntil && fTicks % 6 == 0 && !at<IOMFBSwapIORequest *>(this, kCurrentSwap))   // akita: the fence makes it unneeded
+         fpsCopy(fLastSurface);   // pick up what the GPU finished after the swap
+     fpsReport();
+     if (++fTicks % 3750 == 0 && fSubmitted + fFrames + fDropped + fStalled != fReported) {   // about every 60 s while swaps arrive
+@@ -742,28 +742,37 @@
+     uint64_t lit = 0, raw = 0, center = 0;
+     bool sample = true;   // bring-up: the first frames and every 50th are logged, the last one goes into the periodic report
+     if (fLandscape) {
+-        // akita: landscape. The surface is read row by row exactly as in portrait (reading it by columns straight from the mapping
+-        // faulted on the first frame, fullos131), each row converted and written into the columns of a turned frame in our own memory;
+-        // then the panel is written from that frame row by row, with the shadow's diff. Panel pixel (x, y) = surface pixel
+-        // (y * width / copyHeight, (copyWidth - 1 - x) * height / copyWidth): the top of the phone on the left.
+-        const uint64_t turnedBytes = copyWidth * copyHeight * 4;
+-        if (fTurnedBytes != turnedBytes) {
++        // akita (Generated-by: LLM): landscape. The surface is read row by row exactly as in portrait (reading it by columns straight from
++        // the mapping faulted on the first frame, fullos131). The panel is done in bands of kBand columns: the surface rows of a band
++        // (converted to 32 bits, a few KiB each) are loaded first, then each panel row of the band is a run of kBand pixels, one cache
++        // line, compared with the shadow and written only where it changed. (Writing a turned copy column by column took 90-160 ms a frame.)
++        // Panel pixel (x, y) = surface pixel (y * width / copyHeight, (copyWidth - 1 - x) * height / copyWidth): the top of the phone on the left.
++        constexpr uint64_t kBand = 16;
++        const uint64_t bandRows = kBand * height / copyWidth + 2;   // surface rows one band can touch
++        const uint64_t needed = bandRows * width * 4;
++        if (fTurnedBytes < needed) {
+             if (fTurned) IOFree(fTurned, fTurnedBytes);
+-            fTurned = static_cast<uint32_t *>(IOMalloc(turnedBytes));
+-            fTurnedBytes = fTurned ? turnedBytes : 0;
++            fTurned = static_cast<uint32_t *>(IOMalloc(needed));
++            fTurnedBytes = fTurned ? needed : 0;
+             if (!fTurned) return;
+         }
+-        if (fConvertedBytes < width * 4) {
+-            auto *replacement = static_cast<uint32_t *>(IOMalloc(width * 4));
+-            if (!replacement) return;
+-            if (fConverted) IOFree(fConverted, fConvertedBytes);
+-            fConverted = replacement;
+-            fConvertedBytes = width * 4;
++        if (!shadow) {
++            static unsigned told;
++            if (told++ < 4) IOLog("NativeGOPDisplay: landscape needs a shadow, frame skipped\n");
++            return;
+         }
+-        uint64_t loaded = ~0ULL;
+-        for (uint64_t xx = copyWidth; xx-- > 0;) {          // panel columns right to left = surface rows top to bottom
+-            const uint64_t sy = (copyWidth - 1 - xx) * height / copyWidth;
+-            if (sy != loaded) {
++        for (uint64_t x0 = 0; x0 < copyWidth; x0 += kBand) {
++            const uint64_t n = copyWidth - x0 < kBand ? copyWidth - x0 : kBand;
++            const uint64_t syLow = (copyWidth - 1 - (x0 + n - 1)) * height / copyWidth;   // the band's last column reads the lowest row
++            const uint32_t *rowOf[kBand];
++            for (uint64_t j = 0; j < n; j++) {
++                const uint64_t sy = (copyWidth - 1 - (x0 + j)) * height / copyWidth;
++                const uint64_t k = sy - syLow;
++                if (k >= bandRows) return;
++                uint32_t *row = fTurned + k * width;
++                rowOf[j] = row;
++                if (j && sy == (copyWidth - 1 - (x0 + j - 1)) * height / copyWidth)
++                    continue;   // the same surface row as the previous column: loaded already
+                 if (source) {
+                     memcpy(fRow, source + sy * rowBytes, sourceRowBytes);
+                 } else if (memory->readBytes(base + sy * rowBytes, fRow, sourceRowBytes) != sourceRowBytes) {
+@@ -773,31 +782,26 @@
+                 if (format == kFormatRGhA) {
+                     for (uint64_t i = 0; i < width; i++) {
+                         const uint16_t *rgba = fRow + i * 4;
+-                        fConverted[i] = 0xff000000u | static_cast<uint32_t>(fHalfToByte[rgba[0]]) << 16 |
+-                                        static_cast<uint32_t>(fHalfToByte[rgba[1]]) << 8 | fHalfToByte[rgba[2]];
++                        row[i] = 0xff000000u | static_cast<uint32_t>(fHalfToByte[rgba[0]]) << 16 |
++                                 static_cast<uint32_t>(fHalfToByte[rgba[1]]) << 8 | fHalfToByte[rgba[2]];
+                     }
+                 } else {
+-                    memcpy(fConverted, fRow, width * 4);
++                    memcpy(row, fRow, width * 4);
+                 }
+-                loaded = sy;
+             }
+-            uint32_t *column = fTurned + xx;
+-            for (uint64_t yy = 0; yy < copyHeight; yy++)
+-                column[yy * copyWidth] = fConverted[yy * width / copyHeight];
+-        }
+-        for (uint64_t y = 0; y < copyHeight; y++) {
+             uint64_t saved;
+             if (!sheng_fb_begin(SHENG_FB_GUI, &saved)) return;
+-            auto *pixels = reinterpret_cast<volatile uint32_t *>(fScanout + y * fVideo.v_rowBytes);
+-            const uint32_t *turned = fTurned + y * copyWidth;
+-            uint32_t *previous = shadow ? shadow->pixels + y * copyWidth : nullptr;
+-            for (uint64_t x = 0; x < copyWidth; x++) {
+-                if (!previous) {
+-                    pixels[x] = turned[x];
+-                } else if (fresh || previous[x] != turned[x]) {
+-                    pixels[x] = turned[x];
+-                    previous[x] = turned[x];
+-                    changed++;
++            for (uint64_t y = 0; y < copyHeight; y++) {
++                const uint64_t sx = y * width / copyHeight;   // (a table of these would not fit the kernel stack)
++                uint32_t *previous = shadow->pixels + y * copyWidth + x0;
++                volatile uint32_t *pixels = reinterpret_cast<volatile uint32_t *>(fScanout + y * fVideo.v_rowBytes) + x0;
++                for (uint64_t j = 0; j < n; j++) {
++                    const uint32_t value = rowOf[j][sx];
++                    if (fresh || previous[j] != value) {
++                        pixels[j] = value;
++                        previous[j] = value;
++                        changed++;
++                    }
+                 }
+             }
+             sheng_fb_end(saved);

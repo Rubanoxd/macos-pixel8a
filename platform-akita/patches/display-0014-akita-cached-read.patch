@@ -1,0 +1,27 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -713,9 +713,22 @@
+     // readBytes rebuilds physical copy windows for every row. Keep one bounded
+     // read-only mapping for this frame; retain row reads when mapping is unavailable.
+     const uint64_t span = (height - 1) * rowBytes + sourceRowBytes;
+-    if (span <= (512ULL << 20))
++    // akita (Generated-by: LLM): the surface's own cache mode is uncached or write-combined: reading 2.6 MB of it took 70-280 ms a
++    // frame (fullos136). native-gop-cached-read=1 (the default) maps it cached and cleans + invalidates the range first, so lines
++    // the CPU cached from an earlier frame are not read again: the GPU wrote memory, the fence said it is done.
++    static int cachedRead = -1;
++    if (cachedRead < 0) {
++        unsigned value = 1;
++        PE_parse_boot_argn("native-gop-cached-read", &value, sizeof(value));
++        cachedRead = value ? 1 : 0;
++        IOLog("NativeGOPDisplay: surfaces read %s\n", cachedRead ? "through a cached mapping (invalidated first)" : "with their own cache mode");
++    }
++    if (span <= (512ULL << 20)) {
++        if (cachedRead)
++            memory->performOperation(kIOMemoryIncoherentIOFlush, base, span);
+         frame.mapping = memory->createMappingInTask(kernel_task, 0,
+-            kIOMapAnywhere | kIOMapReadOnly, base, span);
++            kIOMapAnywhere | kIOMapReadOnly | (cachedRead ? kIOMapCopybackCache : 0), base, span);
++    }
+     const uint8_t *source = frame.mapping && frame.mapping->getLength() >= span
+         ? reinterpret_cast<const uint8_t *>(frame.mapping->getVirtualAddress()) : nullptr;
+     // The work loop serializes frames. Only bounded wired scanlines hold the pixel lease.

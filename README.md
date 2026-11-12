@@ -1,102 +1,138 @@
-# macOS 26 en un Google Pixel 8a (akita), con GPU Mali acelerando WindowServer
+# macOS 26 on a Google Pixel 8a (akita), GPU-accelerated on the Mali
 
-Port experimental de **macOS 26.5 Tahoe (25F71)** a un **Google Pixel 8a** (“akita”, SoC Google Tensor G3 “zuma”,
-GPU **Mali-G715 MC7**). El sistema completo arranca desde RAM (`fastboot boot`, sin flashear nada), llega al escritorio,
-y desde el 8 de noviembre de 2026 **WindowServer compone la pantalla con la GPU Mali** a través de Metal → Vulkan → PanVK.
+Experimental port of **macOS 26.5 Tahoe (25F71)** to the **Google Pixel 8a** ("akita": Google Tensor G3 "zuma" SoC,
+**Mali-G715 MC7** GPU). The full OS boots from RAM (`fastboot boot`, nothing is flashed) to the desktop.
+**WindowServer composites on the Mali GPU** through Metal → metal2vulkan → Mesa PanVK, driven by our own IOKit
+Mali CSF driver in the kernel. The touchscreen works, with gestures.
 
 <p align="center">
-  <img src="photos/macos-windowserver-gpu-lockscreen.jpg" width="320" alt="Pantalla de bloqueo de macOS compuesta por la GPU Mali del Pixel 8a">
-  <img src="photos/macos-fullos-desktop-first.jpg" width="320" alt="Primer escritorio de macOS en el Pixel 8a">
+  <img src="photos/macos-dark-glass-desktop.png" width="640" alt="macOS 26 desktop in dark mode with Liquid Glass, rendered by the Pixel 8a's Mali GPU">
+</p>
+<p align="center">
+  <img src="photos/macos-windowserver-gpu-lockscreen.jpg" width="300" alt="macOS lock screen composited by the Pixel 8a's Mali GPU">
+  <img src="photos/macos-fullos-desktop-first.jpg" width="300" alt="First macOS desktop on the Pixel 8a">
 </p>
 
-> **English summary.** Experimental port of macOS 26.5 (25F71) to the Pixel 8a. The full OS boots from RAM to the desktop,
-> and WindowServer now composites on the Mali-G715 GPU through Metal → metal2vulkan → Mesa PanVK, driven by a custom IOKit
-> Mali CSF driver in the kernel. This repo holds our patches, drivers, the Metal plugin, tools and notes — no Apple binaries.
+> ⚠️ **Research project, not a daily driver.** This repository contains **no Apple binaries and no ARM firmware**:
+> get them legally yourself (Apple's IPSW, the vendor partition of your own phone).
 
-> ⚠️ **Proyecto de investigación, no un sistema de uso diario.** No incluye ningún binario de Apple ni el firmware de ARM:
-> cada uno debe obtenerlos legalmente (IPSW de Apple, partición vendor de su propio teléfono).
+## Status
 
-## Estado
-
-| Hito | Estado |
+| Milestone | Status |
 |---|---|
-| Arranque de XNU (kernel DEVELOPMENT) en el Tensor G3, desde RAM con `fastboot boot` | ✅ |
-| macOS Recovery con barra de menús, Utilidad de Discos, Terminal, Safari | ✅ |
-| macOS completo hasta el escritorio (Finder, Dock, Ajustes del Sistema, Terminal) | ✅ |
-| Driver IOKit propio para la Mali-G715 (CSF: firmware MCU, MMU, grupos de colas) | ✅ |
-| Vulkan (Mesa PanVK portado a Darwin arm64e): compute y primer triángulo | ✅ |
-| Metal sobre Vulkan (metal2vulkan): `MTLCreateSystemDefaultDevice` = “Mali-G715 MC7” | ✅ |
-| **WindowServer componiendo con la GPU (compositor Metal de SkyLight)** | ✅ (8 nov 2026) |
-| Cola de la Mali estable (hay atascos periódicos de ~15 s) | 🔧 en curso |
-| Autologin tras reiniciar WindowServer, CPU de WindowServer | 🔧 pendiente |
+| XNU (DEVELOPMENT kernel) boots on the Tensor G3, from RAM with `fastboot boot` | ✅ |
+| macOS Recovery with menu bar, Disk Utility, Terminal, Safari | ✅ |
+| Full macOS to the desktop (Finder, Dock, System Settings, Terminal), autologin | ✅ |
+| Own IOKit driver for the Mali-G715 (CSF: MCU firmware, MMU, queue groups) | ✅ |
+| Vulkan (Mesa PanVK ported to Darwin arm64e) | ✅ |
+| Metal over Vulkan (metal2vulkan): `MTLCreateSystemDefaultDevice` = "Mali-G715 MC7" | ✅ |
+| **WindowServer composites on the GPU** (SkyLight's Metal compositor) | ✅ |
+| Dark mode, Liquid Glass (transparency) and wallpaper at boot | ✅ |
+| **Touchscreen** (Goodix on SPI, our own driver) with gestures: tap, drag, long press = right click, two-finger scroll | ✅ |
+| Window dragging: 15.7 → **~22 fps** (batched GPU submits, early swap completion, PanVK fast paths) | ✅ (goal: 60) |
+| GPU stable under stress (ring-full fault fixed) | ✅ |
+| CPU thermal regulator (step down at 85 °C, step back up below 75 °C) | ✅ |
+| RAM: macOS sees 5.26 GiB (was 4 GiB) | ✅ short test |
+| 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
+| Video out over USB-C (DisplayPort alt mode) | 📋 researched, see `docs/research-hdmi-usbc.md` |
 
-Más fotos en [`photos/`](photos/): Recuperación, Utilidad de Discos, Terminal, Safari, el primer triángulo Vulkan…
+More photos in [`photos/`](photos/).
 
-## Cómo funciona la aceleración gráfica
+## How graphics acceleration works
 
 ```
 WindowServer (SkyLight, CompositorMetal) ─┐
 CoreAnimation / apps                      ├─ Metal.framework
-                                          │    └─ NativeMaliMetal.bundle  (plugin Metal, /System/Library/Extensions)
+                                          │    └─ NativeMaliMetal.bundle  (Metal plugin, /System/Library/Extensions)
                                           │         └─ NativeBridgeMetalFrontend (UniXNU) + metal2vulkan (Rust)
-                                          │              └─ Mesa PanVK (libvulkan_panfrost.dylib, portado a macOS arm64e)
-                                          │                   └─ MaliClient (IOUserClient)
-kernel XNU ───────────────────────────────┘                        └─ Mali.cpp: driver CSF de la Mali-G715 + IOAccelerator
+                                          │              └─ Mesa PanVK (libvulkan_panfrost.dylib, ported to macOS arm64e)
+                                          │                   └─ darwin-drm (libdrm stand-in: Panthor ioctls → IOKit)
+                                          │                        └─ MaliClient (IOUserClient)
+XNU kernel ───────────────────────────────┘                             └─ Mali.cpp: Mali-G715 CSF driver + IOAccelerator
+                                                                         NativeGOPDisplay: copies frames to the panel
 ```
 
-Lo que hizo falta para que WindowServer use la GPU (detalles en el código del plugin y en los parches del kernel):
+What WindowServer needed to use the GPU (details in the plugin code and the kernel patches):
 
-1. **Descubrimiento de Metal**: el driver publica un `IOAccelerator` con `MetalPluginName = NativeMaliMetal`; Metal carga el
-   bundle y llama a `initWithAcceleratorPort:`.
-2. **WindowServer es binario de plataforma con validación de librerías y sandbox**: el kernel (con el boot-arg
-   `akita-mali-platform=1`) marca como código de plataforma el bundle firmado ad-hoc y deja abrir `MaliClient` saltando
-   el chequeo MACF y el filtro del sandbox.
-3. **`[MTLDevice acceleratorPort]`**: CoreDisplay asocia cada pantalla al acelerador que devuelve este método. Nuestro device
-   no pasa por el `init` interno de `_MTLDevice` y devolvía 0, así que la pantalla quedaba sin acelerador y SkyLight usaba
-   `compositor_sw`. El plugin ahora responde con el servicio `IOAccelerator` real.
-4. **`WSSystemCanCompositeWithMetal`**: en 25F71 esta comprobación de SkyLight se queda en “no” aunque hay device (causa aún
-   sin aclarar). Como solución temporal, el plugin la marca como superada al cargarse dentro de WindowServer (solo si existe
-   `/System/Volumes/Data/ak/ws-force-metal` y solo en 25F71, comprobando las instrucciones esperadas).
+1. **Metal discovery**: the driver publishes an `IOAccelerator` with `MetalPluginName = NativeMaliMetal`; Metal loads the
+   bundle and calls `initWithAcceleratorPort:`.
+2. **WindowServer is a platform binary with library validation and a sandbox**: with the boot-arg `akita-mali-platform=1` the
+   kernel marks the ad-hoc signed bundle as platform code and lets it open `MaliClient`, skipping the MACF check and the
+   sandbox filter.
+3. **`[MTLDevice acceleratorPort]`**: CoreDisplay ties each display to the accelerator this method returns. Our device returned 0,
+   so SkyLight fell back to `compositor_sw`. The plugin now answers with the real `IOAccelerator` service.
+4. **`WSSystemCanCompositeWithMetal`**: on 25F71 this SkyLight check stays "no" even with a device. As a workaround the plugin
+   marks it passed when loaded inside WindowServer (only on 25F71, after checking the expected instructions).
 
-Para encontrar esto se leyó la memoria de WindowServer en vivo (`tools/ws*.c`, con el boot-arg `akita-tfp=1` que deja a root
-obtener el puerto de lectura de cualquier tarea) y se desensambló SkyLight, QuartzCore y CoreDisplay de 25F71 con
-[ipsw](https://github.com/blacktop/ipsw).
+### Performance work (Nov 2026)
 
-## Contenido del repositorio
+- **Batched queue submits** (`MALI_GROUP_SUBMIT_BATCH`): one IOKit call per ~32 jobs instead of one per job (each call cost ~36 µs,
+  ~170 per frame). Cross-queue waits are done by the GPU (`SYNC_WAIT64`), not by the CPU.
+- **Flush-ID page** mapped read-only to user space, so PanVK skips cache flushes the GPU already did.
+- **Early swap completion** in the display driver: the swap completes when it is taken and the copy waits on the GPU fence.
+- **PanVK**: 128-byte alignment for tiled images (Metal's alignment), so the bridge no longer keeps shadow copies of heap
+  textures; render target and push-constant descriptors built locally and stored once (GPU memory is uncached).
+- **GPU ring protection**: a queue's 64 KiB ring is never filled completely (a full ring raised `CS_CONFIG_FAULT`).
+- Profiling tools for live stacks of WindowServer: `scripts/stacks.py`, `allstacks.py`, `sysyms.py`, and `drag60.py` to
+  measure window-drag fps over the USB input channel.
 
-| Ruta | Qué es |
+The remaining limit is CPU time in the Metal → Vulkan bridge on WindowServer's main thread (~150 µs per draw).
+
+## Touchscreen
+
+The Pixel 8a's touch controller is a Goodix "nottingham" (Berlin family) on SPI. The firmware runs from the chip's own flash,
+so the driver only powers it and reads touches (it never writes the chip's flash). `platform-akita/drivers/Acpm/AkitaTouch.inc`:
+
+- rails through the PMIC (S2MPG14 via ACPM): LDO25M 1.8 V and LDO4M 3.0 V; reset and interrupt GPIOs;
+- USI/SPI master setup, chip info at `0x10070`, touch data read and acknowledged when the interrupt line drops;
+- a gesture state machine: tap = click, drag, long press = right click, two fingers = scroll wheel;
+- delivery into `NativeRecoveryInput`'s absolute HID tablet, rotated to the landscape desktop.
+
+Protocol notes in [`docs/research-touch.md`](docs/research-touch.md).
+
+## Repository layout
+
+| Path | What it is |
 |---|---|
-| `patches/xnu-12377.121.6-akita.patch` | Cambios sobre XNU 12377.121.6 (incluye los de macOS-ForSheng y los de akita: rc.server del sistema completo, MaliClient, plataforma, `akita-tfp`…). Las claves SSH van como marcadores: genera las tuyas. |
-| `patches/macOS-ForSheng-ca57db7.patch` | Cambios sobre [CrossDarwin/macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng) `ca57db7`. |
-| `platform-akita/` | Plataforma akita para macOS-ForSheng: drivers Mali (CSF), UFS, RAM disk, entrada táctil/botones, ADT, empaquetado de la imagen. Va en `platform/akita/` del árbol de ForSheng. |
-| `patches/mesa-2648b20-akita.patch` | Mesa main `2648b20`: PanVK en Darwin (kmod sobre MaliClient, memoria, caché). |
-| `patches/UniXNU-a3faa4a.patch` | Cambios sobre [UniXNU](https://github.com/UniXNU/UniXNU) `a3faa4a`. |
-| `plugin/` | `NativeMaliMetal.bundle`: plugin de Metal (frontend de UniXNU + metal2vulkan + PanVK). |
-| `tools/` | Pruebas (Vulkan, Metal, `metaldiscover`) e inspección de WindowServer (`wsvars`, `wswatch`, `wssample`, `wsstack`, `wsfind`…). |
-| `scripts/` | Construcción de la imagen (`build-fullos.sh`), ciclos de prueba (`metal-cycle.sh`, `ws-metal-cycle.sh`), shell/log por USB, etc. |
-| `docs/` | Guía práctica, plan del sistema completo e investigaciones previas (en español). |
+| `patches/xnu-12377.121.6-akita.patch` | Changes on XNU 12377.121.6 (macOS-ForSheng's and akita's: full-OS rc.server, MaliClient, platform, dark mode at boot, `akita-tfp`…). SSH keys are placeholders: generate your own. |
+| `patches/macOS-ForSheng-ca57db7.patch` | Changes on [CrossDarwin/macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng) `ca57db7`. |
+| `platform-akita/` | akita platform for macOS-ForSheng (goes in `platform/akita/`): Mali CSF driver, ACPM (CPU clocks, thermal regulator, PMIC) and touch, UFS, input, ADT, image packaging, display driver patches (`patches/display-*`) and the ArmCpu patch. |
+| `patches/mesa-2648b20-akita.patch` | Mesa main `2648b20`: PanVK on Darwin (kmod over MaliClient, memory, cache, fast paths). |
+| `darwin-drm/` | libdrm stand-in that serves PanVK's Panthor ioctls and DRM syncobjs through the Mali IOKit user client (batched submits, GPU-side waits, flush-ID page). |
+| `patches/UniXNU-a3faa4a.patch` | Changes on [UniXNU](https://github.com/UniXNU/UniXNU) `a3faa4a`, including its AdrenoMetal Metal frontend and bridge (`8160223`) and a new metal2vulkan patch (`0031`). |
+| `patches/metal2vulkan-624bab39-akita-heap-diag.patch` | A diagnostic in metal2vulkan's heap textures (why a texture gets a shadow image). |
+| `plugin/` | `NativeMaliMetal.bundle`: the Metal plugin (UniXNU frontend + metal2vulkan + PanVK), with live profilers. |
+| `tools/` | Tests (Vulkan, Metal, `metaldiscover`) and WindowServer inspection (`wsvars`, `wswatch`, `wssample`, `wsstack`, `wsfind`…). |
+| `scripts/` | Image build (`build-fullos.sh`), Mali/ACPM/bridge/darwin-drm/PanVK builds, test cycles, USB shell/log, profilers. |
+| `docs/` | Practical guide, full-OS plan, research notes (GPU, touch, USB-C video), development log. |
 
-Los scripts tienen rutas absolutas de la máquina de desarrollo (`/Volumes/datos2/unixnu-akita/...`): adáptalas.
+The scripts contain absolute paths of the development machine (`/Volumes/datos2/unixnu-akita/...`): adapt them.
 
-## Requisitos (resumen)
+## Requirements (summary)
 
-- Pixel 8a con bootloader desbloqueado. Se arranca siempre con `fastboot boot` (RAM); no hace falta flashear.
-- IPSW de macOS 26.5 (25F71) de Apple para el sistema y el kernelcache de referencia.
-- Firmware CSF de tu propio teléfono: `adb pull /vendor/firmware/mali_csffw-r54p2.bin` y
-  `scripts/make-mali-csffw-inc.py` para generar `platform-akita/drivers/Mali/mali_csffw.inc` (no se redistribuye).
-- macOS en Apple Silicon con Xcode para compilar XNU, Mesa (meson/ninja), Rust 1.98 (metal2vulkan con `-Z build-std`).
+- Pixel 8a with an unlocked bootloader. Always booted with `fastboot boot` (RAM); no flashing needed.
+- Apple's macOS 26.5 (25F71) IPSW for the system and the reference kernelcache.
+- CSF firmware from your own phone: `adb pull /vendor/firmware/mali_csffw-r54p2.bin`, then
+  `scripts/make-mali-csffw-inc.py` generates `platform-akita/drivers/Mali/mali_csffw.inc` (not redistributed).
+- macOS on Apple Silicon with Xcode to build XNU, Mesa (meson/ninja), Rust 1.98 (metal2vulkan with `-Z build-std`).
 
-## Créditos
+## Credits
 
-- [macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng) — base del arranque de macOS 26 en hardware no Apple.
-- [UniXNU](https://github.com/UniXNU/UniXNU) — frontend nativo de Metal y puente metal2vulkan.
-- [Mesa](https://gitlab.freedesktop.org/mesa/mesa) — PanVK / panthor.
-- [nullarc](https://github.com/luuumi-dev/nullarc) — referencia de WindowServer con GPU sobre Vulkan.
-- [ipsw](https://github.com/blacktop/ipsw) — análisis del dyld shared cache.
-- Apple — XNU es código abierto bajo APSL 2.0. macOS, sus frameworks y su marca son de Apple; este proyecto no está afiliado a Apple ni a Google.
+- [macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng): the base for booting macOS 26 on non-Apple hardware.
+- [UniXNU](https://github.com/UniXNU/UniXNU): native Metal frontend and metal2vulkan bridge.
+- [MaliMetal](https://github.com/Ken-u): darwin-drm, the Mali user-space stack for Darwin we built on.
+- [Mesa](https://gitlab.freedesktop.org/mesa/mesa): PanVK / panthor.
+- Google's [goodix_touch](https://android.googlesource.com/kernel/google-modules/touch/goodix_touch/) driver (GPL): reference for the touch protocol.
+- [nullarc](https://github.com/luuumi-dev/nullarc): reference for a GPU WindowServer over Vulkan.
+- [ipsw](https://github.com/blacktop/ipsw): dyld shared cache analysis.
+- Apple: XNU is open source under APSL 2.0. macOS, its frameworks and its trademarks belong to Apple; this project is not
+  affiliated with Apple or Google.
 
-## Licencia
+Much of the late-2026 work (GPU performance, touch, display) was done with Claude (Anthropic); those local changes to PanVK
+and the bridge are marked `akita (Generated-by: LLM)` and are not submitted upstream.
 
-Código propio bajo **GPL-3.0** (ver `LICENSE`), compatible con macOS-ForSheng. Los parches sobre proyectos de terceros
-mantienen la licencia de cada proyecto (XNU: APSL 2.0; Mesa: MIT; UniXNU y los drivers de `platform-akita`:
-BSD-2-Clause-Patent, ver los `LICENSE` de cada carpeta). Ver `THIRD_PARTY.md`.
+## License
+
+Our own code is **GPL-3.0** (see `LICENSE`), compatible with macOS-ForSheng. Patches on third-party projects keep each
+project's license (XNU: APSL 2.0; Mesa: MIT; UniXNU, darwin-drm and the drivers in `platform-akita`: BSD-2-Clause-Patent, see
+each folder's `LICENSE`). See `THIRD_PARTY.md`.

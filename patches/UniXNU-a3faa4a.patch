@@ -230,6 +230,21 @@ index 7d4def5..a06acae 100644
 +
    return EFI_SUCCESS;
  }
+diff --git a/scripts/build-adreno-metal-bridge.py b/scripts/build-adreno-metal-bridge.py
+index c89881a..75d29fe 100644
+--- a/scripts/build-adreno-metal-bridge.py
++++ b/scripts/build-adreno-metal-bridge.py
+@@ -75,7 +75,9 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
+     '0029-latency-stage-selection.patch',
+     # Spare image blocks have no byte limit (they age, go when a block cannot be made and on memory pressure), and the room keeper takes
+     # a spare block before it makes a new one: the limit freed spares the render server made again within seconds, each a fresh wiring.
+-    '0030-spare-image-blocks-give-room.patch']]
++    '0030-spare-image-blocks-give-room.patch',
++    # A known boolean can determine an AIR gate even with an omitted optional constant.
++    '0031-fold-static-boolean-gates.patch']]
+ 
+ 
+ def git_tree(*steps):
 diff --git a/scripts/patch-xnu-entry-probe.py b/scripts/patch-xnu-entry-probe.py
 index 9e3e598..7b93244 100644
 --- a/scripts/patch-xnu-entry-probe.py
@@ -308,3 +323,452 @@ index 9e3e598..7b93244 100644
              code = assemble(source, CAVES[stage], symbols, Path(tmp))
              if len(code) > CAVE_SIZE:
                  raise SystemExit(f'Stage {stage} code is too large')
+diff --git a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.h b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.h
+index 25ed8e5..78913fc 100644
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.h
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.h
+@@ -26,6 +26,8 @@ size_t native_bridge_metal_telemetry(char *out, size_t size);
+ struct NmbShaderCacheStats;
+ bool native_bridge_metal_shader_cache_stats(struct NmbShaderCacheStats *out);
+ bool native_bridge_metal_work_stats(uint64_t out[10]);
++// Arms a readback of the next four app command buffers and returns the first index.
++uint32_t native_bridge_metal_dump_next_commands(void);
+ // The same fixed CPU, memory and pipeline workload on the tablet and the host, so their times compare directly (int-145): compute, first-touch
+ // page faults, memset bandwidth, CommonCrypto SHA-256, then the first `pairs` vertex/fragment pairs of the given QuartzCore metallib made into
+ // BGRA8 render states and drawn once each (pipeline_timing_host's draw=1 order). The results become the telemetry's Y rows; also returned.
+diff --git a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+index aec500d..7310090 100644
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -91,6 +91,35 @@ static void abortProbe(int signal, siginfo_t *si, void *context) {
+  at = probeText(at, " address "); at = probeHex(at, (uint64_t)(uintptr_t)si->si_addr); *at++ = '\n';
+  (void)!write(2, line, (size_t)(at - line)); at = line;
+  const __darwin_arm_thread_state64 &ss = ((ucontext_t *)context)->uc_mcontext->__ss;
++ if (signal == SIGTRAP) {
++  const uint64_t pc = (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_pc_fptr(ss) & 0x0000ffffffffffffull;
++  const uint64_t lr = (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr_fptr(ss) & 0x0000ffffffffffffull;
++  uint64_t addresses[10] = {pc, lr};
++  size_t count = 2;
++  uint64_t fp = __darwin_arm_thread_state64_get_fp(ss);
++  while (count < 10 && fp && !(fp & 7) && probeReadable(fp) && probeReadable(fp + 15)) {
++   const volatile uint64_t *frame = (const volatile uint64_t *)fp;
++   addresses[count++] = frame[1] & 0x0000ffffffffffffull;
++   if (frame[0] <= fp) break;
++   fp = frame[0];
++  }
++  for (size_t i = 0; i < count; ++i) {
++   Dl_info info = {};
++   const auto address = (const void *)(uintptr_t)addresses[i];
++   // Best-effort symbol lookup in the diagnostic process, after recording the raw fault PC.
++   char symbol[480];
++   const bool resolved = dladdr(address, &info) != 0;
++   int length = snprintf(symbol, sizeof symbol, "native-metal trap frame %zu %#llx %s+%#llx %s\n",
++      i, (unsigned long long)addresses[i], resolved && info.dli_fname ? info.dli_fname : "?",
++      resolved ? (unsigned long long)(addresses[i] - (uintptr_t)info.dli_fbase) : 0,
++      resolved && info.dli_sname ? info.dli_sname : "?");
++   if (length > 0) (void)!write(2, symbol, std::min((size_t)length, sizeof symbol - 1));
++  }
++  struct sigaction fallback = {};
++  fallback.sa_handler = SIG_DFL;
++  sigaction(signal, &fallback, nullptr);
++  return;
++ }
+  for (int r = 0; r < 33; ++r) {
+   const uint64_t value = r < 29 ? ss.__x[r] : r == 29 ? __darwin_arm_thread_state64_get_fp(ss) : r == 30 ? (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_lr_fptr(ss) : r == 31 ? __darwin_arm_thread_state64_get_sp(ss) : (uint64_t)(uintptr_t)__darwin_arm_thread_state64_get_pc_fptr(ss);
+   at = line; at = probeText(at, "  r"); *at++ = char('0' + r / 10); *at++ = char('0' + r % 10); *at++ = ' ';
+@@ -150,11 +179,17 @@ __attribute__((constructor)) static void installTimingReport() {
+  if(!pthread_create(&thread,nullptr,reportTiming,nullptr))pthread_detach(thread);
+ }
+ __attribute__((constructor)) static void installAbortProbe() {
+- if (!getenv("NATIVE_METAL_ABORT_PROBE")) return;
++ const bool fullProbe = getenv("NATIVE_METAL_ABORT_PROBE") != nullptr;
++ const bool akitaTrapProbe = !strcmp(getprogname(), "WindowServer")
++     && !access("/System/Volumes/Data/ak/m2v-log-pipelines", F_OK);
++ if (!fullProbe && !akitaTrapProbe) return;
+  gGuardAtLoad = __stack_chk_guard;
+  struct sigaction action = {};
+  action.sa_sigaction = abortProbe; action.sa_flags = SA_SIGINFO;
+- sigaction(SIGABRT, &action, nullptr); sigaction(SIGSEGV, &action, nullptr); sigaction(SIGBUS, &action, nullptr);
++ sigaction(SIGTRAP, &action, nullptr);
++ if (fullProbe) {
++  sigaction(SIGABRT, &action, nullptr); sigaction(SIGSEGV, &action, nullptr); sigaction(SIGBUS, &action, nullptr);
++ }
+ }
+ static uint64_t gRegistryID;
+ static NSString *gName;
+@@ -1827,7 +1862,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
+ // waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
+ @property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
+ @property(nonatomic) uint32_t dumpPasses,dumpKernels;
+-@property(nonatomic) BOOL dumpReadback;
++@property(nonatomic) BOOL dumpReadback,dumpMenuBarProducer;
+ @property(nonatomic,strong) NBTexture *wallpaperOutput;
+ @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
+ - (void)refuse:(NSString *)what;
+@@ -1872,18 +1907,42 @@ struct SingleSampleCopy {
+ // maximum and mean, its NaNs and infinities, and a 32x8 grid of brightness ('.' exactly black, 0-9, '+' above 1, '!' a NaN), from 64
+ // rows spread down it: where a frame goes black or wrong, the first texture that does names the pass.
+ static std::atomic<uint64_t> gAppCommits;
++static std::atomic<uint32_t> gLiveDumpFirst;
++static constexpr uint32_t liveDumpCount = 4;
++
++extern "C" uint32_t native_bridge_metal_dump_next_commands(void) {
++ const uint32_t first = static_cast<uint32_t>(gAppCommits.load() + 1);
++ gLiveDumpFirst.store(first);
++ return first;
++}
+ static std::pair<uint32_t,uint32_t> dumpRange() {
+  static const std::pair<uint32_t,uint32_t> range=[]{
+   unsigned first=0,count=0;const char *v=getenv("NATIVE_METAL_DUMP_CB");
+   if(v && sscanf(v,"%u:%u",&first,&count)>=1)return std::make_pair((uint32_t)first,(uint32_t)(count?count:1));
+   return std::make_pair(0u,0u);
+  }();
+- return range;
++ const uint32_t first = gLiveDumpFirst.load();
++ return first ? std::make_pair(first, liveDumpCount) : range;
++}
++
++static bool dumpLiveEnabled() {
++ static const bool live = getenv("NATIVE_METAL_DUMP_LIVE") != nullptr;
++ return live;
++}
++static bool dumpPipelineInfoEnabled() {
++ return dumpLiveEnabled() || dumpRange().first;
++}
++static bool isAkitaMenuBarSurface(NBTexture *texture) {
++ if(!texture.surface || texture.pixelFormat!=MTLPixelFormatBGRA8Unorm || texture.height!=30)return false;
++ const NSUInteger width=texture.width;
++ return width==44 || width==496 || width==540;
+ }
+ // Whether a command buffer being encoded now may be one to dump: its number is not known until it commits, and others may commit first.
+ static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
++ if(commandBuffer.dumpReadback)return false;
++ if(commandBuffer.dumpMenuBarProducer)return true;
+  const auto range=dumpRange();
+- if(!range.first || commandBuffer.dumpReadback)return false;
++ if(!range.first)return false;
+  const uint64_t next=gAppCommits.load()+1;
+  return next+16>=range.first && next<(uint64_t)range.first+range.second;
+ }
+@@ -2220,6 +2279,26 @@ static uint64_t encodeCommandOf(id object) {
+  if(!dumpShown(++_dumpDraws) && !dumpMatched(pipeline))return;
+  dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u draw %u: %@ | %@ | depth %@",_commandBuffer.dumpPasses,_dumpDraws,what,
+                           [_dumpPipeline dumpInfo]?:@"no pipeline",_dumpDepth?[_dumpDepth dumpInfo]:@"none"]);
++ // Save one real glyph draw so it can be replayed without restarting WindowServer.
++ FILE *replay=nullptr;
++ if(_commandBuffer.dumpMenuBarProducer && [pipeline containsString:@"A2Xghfc"]) {
++  static std::atomic<bool> saved;
++  if(!saved.exchange(true)) {
++   char path[]="/tmp/akita-glyph-replay.XXXXXX";
++   const int fd=mkstemp(path);
++   if(fd>=0) {
++    replay=fdopen(fd,"wb");
++    if(replay)fprintf(stderr,"native-metal glyph replay: %s\n",path);
++    else close(fd);
++   }
++  }
++ }
++ auto saveBinding=[&](uint32_t key,uint32_t type,uint32_t offset,const void *bytes,size_t size) {
++  if(!replay || !bytes || !size)return;
++  const uint32_t header[]={key,type,offset,static_cast<uint32_t>(size)};
++  fwrite(header,sizeof header,1,replay);
++  fwrite(bytes,1,size,replay);
++ };
+  for(NSNumber *key in [_dumpBound.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+   const uint32_t k=key.unsignedIntValue;id value=_dumpBound[key];
+   // Key stage << 8 | index: stages 0-2 buffers and bytes, 4-6 textures, 8-10 samplers (compute, vertex, fragment).
+@@ -2228,6 +2307,26 @@ static uint64_t encodeCommandOf(id object) {
+                    k&0xff];
+   if(kind==1 && [value isKindOfClass:[NBTexture class]]) {
+    NBTexture *t=value;const NmbTextureDescriptor d=t.descriptor;
++   if(_commandBuffer.dumpMenuBarProducer && t.surface)
++    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ IOSurface %u",where,IOSurfaceGetID(t.surface)]);
++   if(_commandBuffer.dumpMenuBarProducer && stage==2 && d.format==MTLPixelFormatA8Unorm) {
++    dumpNote(_commandBuffer,_commandBuffer.dumpTargets,t,0,0,
++             [NSString stringWithFormat:@"producer input pass %u draw %u texture %u",_commandBuffer.dumpPasses,_dumpDraws,k&0xff]);
++    id<MTLBuffer> buffer=t.buffer;
++    const uint8_t *bytes=static_cast<const uint8_t *>(buffer.contents);
++    const NSUInteger row=t.rowBytes,offset=t.offset;
++    if(bytes && row && offset<buffer.length && d.width<=row && d.height<=(buffer.length-offset)/row) {
++     size_t lit=0;
++     for(size_t y=0;y<d.height;y++)for(size_t x=0;x<d.width;x++)lit+=bytes[offset+y*row+x]!=0;
++     if(replay) {
++      const uint32_t dimensions[]={static_cast<uint32_t>(d.width),static_cast<uint32_t>(d.height),static_cast<uint32_t>(row)};
++      saveBinding(k,2,static_cast<uint32_t>(offset),dimensions,sizeof dimensions);
++      saveBinding(k,3,static_cast<uint32_t>(offset),bytes+offset,row*d.height);
++     }
++     dumpLine(_commandBuffer,[NSString stringWithFormat:@"  producer A8 host buffer row %lu offset %lu nonzero %zu",
++                             (unsigned long)row,(unsigned long)offset,lit]);
++    }
++   }
+    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@: type %llu f%llu %llux%llux%llu array %llu mips %llu%@",where,(unsigned long long)d.type,
+                             (unsigned long long)d.format,(unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.depth,
+                             (unsigned long long)d.array_length,(unsigned long long)d.levels,t.label.length?[@" " stringByAppendingString:t.label]:@""]);
+@@ -2239,14 +2338,28 @@ static uint64_t encodeCommandOf(id object) {
+                             (unsigned long long)d.compare,d.lod_min,d.lod_max]);
+   } else if([value isKindOfClass:[NSData class]]) {
+    NSData *data=value;
++   saveBinding(k,0,0,data.bytes,std::min<NSUInteger>(data.length,4096));
+    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ bytes %lu:%@",where,(unsigned long)data.length,dumpWords((const uint8_t *)data.bytes,data.length)]);
+   } else if([value isKindOfClass:[NSArray class]]) {
+    id<MTLBuffer> buffer=value[0];const NSUInteger offset=[value[1] unsignedIntegerValue];const uint8_t *contents=(const uint8_t *)buffer.contents;
++   if(replay && contents && offset<buffer.length) {
++    const uint32_t index=k&0xff;
++    const NSUInteger limit=stage==2 && index==7?131072:stage==2 && index==8?6144:512;
++    saveBinding(k,1,static_cast<uint32_t>(offset),contents+offset,std::min(limit,buffer.length-offset));
++   }
++   if(_commandBuffer.dumpMenuBarProducer && (k&0xff)==0 && [pipeline containsString:@"A2Xghfc"] &&
++      contents && offset<buffer.length) {
++    NSMutableString *hex=[NSMutableString string];
++    const NSUInteger length=std::min<NSUInteger>(48,buffer.length-offset);
++    for(NSUInteger i=0;i<length;i++)[hex appendFormat:@"%02x",contents[offset+i]];
++    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ glyph config %@",where,hex]);
++   }
+    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ buffer %lu+%lu%@:%@",where,(unsigned long)buffer.length,(unsigned long)offset,
+                             buffer.label.length?[@" " stringByAppendingString:buffer.label]:@"",
+                             contents && offset<buffer.length?dumpWords(contents+offset,buffer.length-offset):@" not CPU-visible"]);
+   } else dumpLine(_commandBuffer,[where stringByAppendingString:@" nil"]);
+  }
++ if(replay)fclose(replay);
+ }
+ // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
+ - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+@@ -2267,6 +2380,14 @@ static uint64_t encodeCommandOf(id object) {
+            [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
+   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
+  }
++ if(texture && stage==2 && gLiveDumpFirst.load() && dumpMaybe(_commandBuffer) &&
++    [texture.label hasPrefix:@"menubar."]) {
++  NBTexture *input=(NBTexture *)texture;
++  if(!_commandBuffer.dumpTargets)_commandBuffer.dumpTargets=[NSMutableArray array];
++  const IOSurfaceID surfaceID=input.surface?IOSurfaceGetID(input.surface):0;
++  dumpNote(_commandBuffer,_commandBuffer.dumpTargets,input,0,0,
++           [NSString stringWithFormat:@"sampled %@ (IOSurface %u)",input.label,surfaceID]);
++ }
+  if(texture){[_commandBuffer.resourceOwners addObject:texture];}
+  [self dumpBind:texture index:index stage:stage+4];
+  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+@@ -2361,7 +2482,7 @@ static uint64_t encodeCommandOf(id object) {
+ @implementation NBRenderEncoder
+ - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
+  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+- if(dumpRange().first)self.dumpPipeline=state;
++ if(dumpMaybe(self.commandBuffer))self.dumpPipeline=state;
+  noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
+  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
+  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
+@@ -2401,7 +2522,7 @@ static uint64_t encodeCommandOf(id object) {
+ }
+ - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
+  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+- if(dumpRange().first)self.dumpDepth=state;
++ if(dumpMaybe(self.commandBuffer))self.dumpDepth=state;
+  if(gDrawStats)[self noteState:kDSDepth key:0 object:(__bridge const void *)state value:0];
+  ENCODE([self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"]);
+ }
+@@ -2693,6 +2814,7 @@ static float dumpSmallFloat(uint32_t bits,int mantissa) {
+ static unsigned dumpTexel(uint32_t format,const uint8_t *p,float c[4],unsigned *channels) {
+  uint32_t v=0;
+  switch(format) {
++  case MTLPixelFormatA8Unorm: *channels=4;c[3]=p[0]/255.f;return 1;
+   case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: *channels=1;c[0]=p[0]/255.f;return 1;
+   case MTLPixelFormatR8Uint: *channels=1;c[0]=p[0];return 1;
+   case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: *channels=2;c[0]=p[0]/255.f;c[1]=p[1]/255.f;return 2;
+@@ -2807,6 +2929,21 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
+  for(NSDictionary *t in targets) {
+   NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
+   const NSUInteger level=[t[@"level"] unsignedIntegerValue],slice=[t[@"slice"] unsignedIntegerValue];
++  NSString *where=t[@"where"];
++  if(texture.surface && d.format==MTLPixelFormatBGRA8Unorm && [where hasPrefix:@"sampled menubar."]) {
++   const uint8_t *bytes=static_cast<const uint8_t *>(IOSurfaceGetBaseAddress(texture.surface));
++   const size_t row=texture.rowBytes,offset=texture.offset,allocation=IOSurfaceGetAllocSize(texture.surface);
++   if(bytes && row && offset<allocation && d.width<=row/4 && d.height<=(allocation-offset)/row) {
++    size_t color=0,alpha=0;
++    for(size_t y=0;y<d.height;y++)for(size_t x=0;x<d.width;x++) {
++     const uint8_t *pixel=bytes+offset+y*row+4*x;
++     color+=(pixel[0]|pixel[1]|pixel[2])!=0;
++     alpha+=pixel[3]!=0;
++    }
++    fprintf(stderr,"native-metal dump cb %llu: CPU %s: row %zu offset %zu RGB nonzero %zu alpha nonzero %zu\n",
++            (unsigned long long)appIndex,where.UTF8String,row,offset,color,alpha);
++   }
++  }
+   float c[4];unsigned channels=0;const uint8_t zero[16]={};
+   const unsigned bpp=texture.pvrtc?0:dumpTexel((uint32_t)d.format,zero,c,&channels);
+   NSString *skip=!bpp?@"format not read back":d.samples>1?@"multisampled":d.type==MTLTextureType3D?@"3D":
+@@ -2939,6 +3076,19 @@ static char kUserDictionaryKey;
+  NmbRenderPassDescriptor pass={};
+  std::vector<SingleSampleCopy> resolveCopies;
+  _dumpPasses++;
++ if(dumpLiveEnabled() && !self.dumpReadback && !self.dumpMenuBarProducer &&
++    [(id)d.colorAttachments[0].texture isKindOfClass:[NBTexture class]]) {
++  NBTexture *destination=(NBTexture *)d.colorAttachments[0].texture;
++  if(isAkitaMenuBarSurface(destination)) {
++   static std::atomic<unsigned> producerDumps;
++   if(producerDumps.fetch_add(1)<4) {
++    self.dumpMenuBarProducer=YES;
++    dumpLine(self,[NSString stringWithFormat:@"producer pass %u IOSurface %u %lux%lu",
++                   _dumpPasses,IOSurfaceGetID(destination.surface),(unsigned long)destination.width,
++                   (unsigned long)destination.height]);
++   }
++  }
++ }
+  if(dumpMaybe(self)) {
+   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
+   _dumpPending=[NSMutableArray array];
+@@ -3201,7 +3351,8 @@ static char kUserDictionaryKey;
+    frontStage(traceNumber,self.commitIndex,7);
+    const auto range=dumpRange();
+    self.submitted=YES;
+-   if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
++   if(appIndex && (self.dumpMenuBarProducer ||
++      (range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)))dumpReadback(self,appIndex);
+    [self fireEarly];return;
+   }
+   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
+@@ -4191,7 +4342,19 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
++ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];
++ if(dumpLiveEnabled() && isAkitaMenuBarSurface(texture)) {
++  static std::atomic<unsigned> imports;
++  if(imports.fetch_add(1)<32) {
++   const void *caller=__builtin_return_address(0);
++   Dl_info info={};
++   dladdr(caller,&info);
++   fprintf(stderr,"native-metal menubar import: IOSurface %u %lux%lu row %zu caller %s+%#llx\n",
++           IOSurfaceGetID(surface),(unsigned long)texture.width,(unsigned long)texture.height,row,
++           info.dli_fname?: "?",(unsigned long long)((uintptr_t)caller-(uintptr_t)info.dli_fbase));
++  }
++ }
++ return (id<MTLTexture>)texture;
+ }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
+@@ -4401,7 +4564,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+   return nil;
+  }
+  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.stateFormat=(uint32_t)d.colorAttachments[0].pixelFormat;gPipelines++;if(error)*error=nil;
+- if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
++ if(dumpPipelineInfoEnabled())state.dumpInfo=renderDumpInfo(d);
++ if(dumpLiveEnabled() && [d.fragmentFunction.name isEqualToString:@"A2Xghfc"]) {
++  NBFunction *vertex=(NBFunction *)d.vertexFunction,*fragment=(NBFunction *)d.fragmentFunction;
++  fprintf(stderr,"native-metal glyph pipeline: v=%s f=%s masks=%lu,%lu blend=%d,%d\n",
++          vertex.sourceName.UTF8String?:"?",fragment.sourceName.UTF8String?:"?",
++          (unsigned long)d.colorAttachments[0].writeMask,(unsigned long)d.colorAttachments[1].writeMask,
++          d.colorAttachments[0].blendingEnabled,d.colorAttachments[1].blendingEnabled);
++  fprintf(stderr,"native-metal glyph vertex constants: %s\n",vertex.constantsText.c_str());
++  fprintf(stderr,"native-metal glyph fragment constants: %s\n",fragment.constantsText.c_str());
++ }
+  return (id<MTLRenderPipelineState>)state;
+ }
+ // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
+@@ -4458,7 +4630,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+  NmbDepthStencil *handle=nmb_depth_stencil_new(gDevice,&s);
+  if(!handle){NBLOG(@"native-metal: depth/stencil state refused: %@",lastError());return nil;}
+  NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;
+- if(dumpRange().first)state.dumpInfo=[NSString stringWithFormat:@"compare %lu write %d%@",(unsigned long)d.depthCompareFunction,d.depthWriteEnabled,
++ if(dumpPipelineInfoEnabled())state.dumpInfo=[NSString stringWithFormat:@"compare %lu write %d%@",(unsigned long)d.depthCompareFunction,d.depthWriteEnabled,
+                                       d.frontFaceStencil.stencilCompareFunction!=MTLCompareFunctionAlways || d.frontFaceStencil.depthStencilPassOperation?@" stencil":@""];
+  return (id<MTLDepthStencilState>)state;
+ }
+@@ -4489,10 +4661,26 @@ static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
+ static NSUInteger countArgAnswer(id,SEL cmd,NSUInteger arg) {return (NSUInteger)askAnswer(cmd,arg);}
+ static BOOL flagArgAnswer(id,SEL cmd,NSUInteger arg) {return askAnswer(cmd,arg)!=0;}
+ static BOOL (*gFamilyAnswer)(id,SEL,NSInteger);
++// akita (Generated-by: LLM, local only): QuartzCore asks supportsFamily: at every draw, and dladdr() per call was ~7% of WindowServer's
++// main thread while dragging a window (fullos152 profile: dyld's image lookup). Whether a return address is RenderBox's is remembered in
++// a small direct-mapped table (address -> answer), filled by the first dladdr of that address.
++static BOOL callerIsRenderBox(const void *ret) {
++ enum { kSlots = 256 };
++ static std::atomic<uintptr_t> keys[kSlots];
++ static std::atomic<uint8_t> answers[kSlots];
++ const uintptr_t key = (uintptr_t)ret;
++ const unsigned slot = (unsigned)((key >> 2) * 0x9e3779b1u) % kSlots;
++ if (keys[slot].load(std::memory_order_acquire) == key) return answers[slot].load(std::memory_order_relaxed) != 0;
++ Dl_info caller;
++ const BOOL renderBox = dladdr(ret,&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/");
++ keys[slot].store(0, std::memory_order_relaxed);
++ answers[slot].store(renderBox ? 1 : 0, std::memory_order_relaxed);
++ keys[slot].store(key, std::memory_order_release);
++ return renderBox;
++}
+ static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
+  if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 and up
+-  Dl_info caller;
+-  if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/"))return NO;
++  if(callerIsRenderBox(__builtin_return_address(0)))return NO;
+  }
+  return gFamilyAnswer(self,_cmd,family);
+ }
+diff --git a/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs b/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs
+index ccea667..7a43abb 100644
+--- a/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs
++++ b/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs
+@@ -182,11 +182,23 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+         // A texture over host pages or a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window
+         // server's surfaces and padded framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a
+         // shadow image every pass.
+-        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
++        options.policy.host_page_textures = if std::env::var_os("NATIVE_METAL_SHADOW_HOST_PAGES").is_some() {
++            metal2vulkan::device::HostPageTexturePolicy::Shadow
++        } else {
++            metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites
++        };
+         // Metal makes a pipeline state's pipeline at its creation and never drops a draw for a pipeline being made; the runtime's
+         // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
+         // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
+         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
++        // akita (Generated-by: LLM): render encoders lowered on the runtime's lowering thread, not inside each call: the window
++        // server's main thread was CPU-bound (76% busy dragging a window), a third of it lowering draws and a seventh ending
++        // encoders, while other cores sat idle. A refusal only the lowering finds then fails its command buffer.
++        // Opt-in (NATIVE_METAL_LOWER_WORKER=1): fullos177 showed no gain, since opening the command buffer's next encoder lowers on
++        // the program's thread what the worker had not (CommandBuffer::settle_end), and Core Animation opens encoders back to back.
++        if std::env::var_os("NATIVE_METAL_LOWER_WORKER").is_some() {
++            options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
++        }
+         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
+         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
+         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
+diff --git a/drivers/AdrenoMetal/bridge/patches/0031-fold-static-boolean-gates.patch b/drivers/AdrenoMetal/bridge/patches/0031-fold-static-boolean-gates.patch
+new file mode 100644
+index 0000000..1518fd6
+--- /dev/null
++++ b/drivers/AdrenoMetal/bridge/patches/0031-fold-static-boolean-gates.patch
+@@ -0,0 +1,34 @@
++diff --git a/crates/metal2vulkan-air/src/canon/static_init.rs b/crates/metal2vulkan-air/src/canon/static_init.rs
++--- a/crates/metal2vulkan-air/src/canon/static_init.rs
+++++ b/crates/metal2vulkan-air/src/canon/static_init.rs
++@@ -50,7 +50,7 @@
++ use crate::error::{Error, Feature, MissingInput, Unsupported};
++ use crate::intrinsics::{AirIntrinsic, FunctionConstant, LlvmIntOp, LlvmIntrinsic, NumKind};
++ use crate::ir::layout::Endian;
++-use crate::ir::{AddrSpace, Arena, BlockId, Body, Callee, CastOp, Const, ConstExpr, ConstId};
+++use crate::ir::{AddrSpace, Arena, BinOp, BlockId, Body, Callee, CastOp, Const, ConstExpr, ConstId};
++ use crate::ir::{Constant, FuncId, Function, Global, GlobalId, Idx, InstId, InstKind};
++ use crate::ir::{Linkage, ModuleParts, Section, Type, TypeId, TypeLayouts, TypeTable, Value};
++ 
++@@ -558,7 +558,20 @@
++             }
++             InstKind::BinOp { op, a, b, .. } => {
++                 let (op, a, b) = (*op, val(*a)?, val(*b)?);
++-                self.pure2(a, b, &at, m, |f, x, y, m| f.binop(op, ty, x, y, m))?
+++                // A known boolean can determine the result even when an optional function
+++                // constant was omitted. Do not propagate that dependency through the gate.
+++                match (a, b) {
+++                    (SVal::C(c), SVal::Fc(_)) | (SVal::Fc(_), SVal::C(c))
+++                        if self.folder.types.int_bits(ty) == Some(1)
+++                            && matches!(
+++                                (op, self.folder.int(c)),
+++                                (BinOp::And, Some(0)) | (BinOp::Or, Some(1))
+++                            ) =>
+++                    {
+++                        SVal::C(c)
+++                    }
+++                    _ => self.pure2(a, b, &at, m, |f, x, y, m| f.binop(op, ty, x, y, m))?,
+++                }
++             }
++             InstKind::FNeg { v, .. } => {
++                 let x = val(*v)?;

@@ -379,6 +379,8 @@ void usbProbeThread(void *, wait_result_t)
 
 }  // namespace
 
+extern "C" void akita_touch_set_sink(void (*sink)(void *, int, int, int), void *ctx);   // akita: kernel, AkitaTouch.inc
+
 class NativeRecoveryHID : public IOHIDDevice {
   OSDeclareDefaultStructors(NativeRecoveryHID)
 
@@ -446,9 +448,12 @@ class NativeRecoveryInput : public IOService {
 
 public:
   void queueRemote(const char *steps, unsigned length);
+  // akita (Generated-by: LLM): the touchscreen's first finger (AkitaTouch.inc in the kernel), panel coordinates 1080 x 2400 portrait
+  static void touchSink(void *self, int panelX, int panelY, int down);
 
 private:
   void sendTablet(bool button);
+  void sendTabletQuiet(uint8_t buttons, int8_t wheel);
   void positionWithMouse(unsigned targetX, unsigned targetY);
   void describe();
   void poll();
@@ -481,6 +486,13 @@ bool NativeRecoveryInput::start(IOService *provider)
       modeWidth < panelWidth && modeWidth * 4 >= panelWidth && (panelHeight * modeWidth) % panelWidth == 0) {
     fScreenWidth = modeWidth;
     fScreenHeight = panelHeight * modeWidth / panelWidth;
+  }
+  // akita (Generated-by: LLM): native-gop-landscape=1, the display's landscape mode: the same mode turned on its side.
+  unsigned landscape = 0;
+  if (PE_parse_boot_argn("native-gop-landscape", &landscape, sizeof(landscape)) && landscape == 1) {
+    const unsigned w = fScreenWidth;
+    fScreenWidth = fScreenHeight;
+    fScreenHeight = w;
   }
   fTabletX = fScreenWidth / 2;
   fTabletY = fScreenHeight / 2;
@@ -545,6 +557,7 @@ bool NativeRecoveryInput::start(IOService *provider)
       gRemoteInputOwner = this;
       gadget::gRemoteInput = remoteInputHook;
       IOLog("NativeRecoveryInput: remote input on UDP 5141\n");
+      akita_touch_set_sink(touchSink, this);   // akita: the touchscreen moves and presses the same tablet
     } else {
       release();
     }
@@ -824,6 +837,53 @@ void NativeRecoveryInput::remoteThread(void *self, wait_result_t)
     input->fRemotePending = false;
     IOLockUnlock(input->fRemoteLock);
     input->runSteps(steps);
+  }
+}
+
+// akita (Generated-by: LLM): a finger on the glass as the tablet: down presses its button where the finger is, up lets go. The panel
+// is portrait (1080 x 2400); in the landscape mode the desktop is the panel turned on its side as NativeGOPDisplay turns it: the
+// desktop's x runs down the panel's long side, its y from the panel's right edge to its left.
+void NativeRecoveryInput::touchSink(void *self, int panelX, int panelY, int down)
+{
+  NativeRecoveryInput *input = static_cast<NativeRecoveryInput *>(self);
+  if (!input || !input->fTablet) return;
+  const unsigned px = panelX < 0 ? 0u : panelX > 1079 ? 1079u : static_cast<unsigned>(panelX);
+  const unsigned py = panelY < 0 ? 0u : panelY > 2399 ? 2399u : static_cast<unsigned>(panelY);
+  unsigned x, y;
+  if (input->fScreenWidth > input->fScreenHeight) {
+    x = py * input->fScreenWidth / 2400;
+    y = (1079 - px) * input->fScreenHeight / 1080;
+  } else {
+    x = px * input->fScreenWidth / 1080;
+    y = py * input->fScreenHeight / 2400;
+  }
+  // codes (AkitaTouch.inc): 0 up, 1 left button down at, 2 right click at, 3 wheel by panelX (no move), 4 move to
+  if (down == 3) {
+    input->sendTabletQuiet(0, static_cast<int8_t>(panelX));
+    return;
+  }
+  input->fTabletX = x < input->fScreenWidth ? x : input->fScreenWidth - 1;
+  input->fTabletY = y < input->fScreenHeight ? y : input->fScreenHeight - 1;
+  if (down == 2) {
+    input->sendTabletQuiet(2, 0);
+    IOSleep(30);
+    input->sendTabletQuiet(0, 0);
+    return;
+  }
+  input->sendTabletQuiet(down == 1 ? 1 : 0, 0);
+}
+
+// akita: a tablet report without its log line (a finger sends one every ~8 ms): buttons bit 0 left, bit 1 right; a relative wheel.
+void NativeRecoveryInput::sendTabletQuiet(uint8_t buttons, int8_t wheel)
+{
+  uint32_t x = fTabletX * 32767 / (fScreenWidth - 1), y = fTabletY * 32767 / (fScreenHeight - 1);
+  uint8_t bytes[6] = {buttons, (uint8_t)x, (uint8_t)(x >> 8), (uint8_t)y, (uint8_t)(y >> 8), (uint8_t)wheel};
+  IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, sizeof(bytes), kIODirectionNone);
+  if (report) {
+    IOLockLock(fSendLock);
+    fTablet->handleReport(report);
+    IOLockUnlock(fSendLock);
+    report->release();
   }
 }
 

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Arranca en RAM (fastboot boot) una imagen de macOS para el Pixel 8a y deja todo listo para trabajar sin cámara:
-#   1. espera a que el teléfono esté en fastboot y arranca la imagen
-#   2. espera la interfaz USB (gadget CDC-ECM) y guarda el log del kernel en vivo (akita-live.py log)
-#   3. espera a que el guion de entrada termine (Terminal abierto con  nc -l 2323|bash|nc -l 2324 )
-#   4. deja sshd listo (akita-usb-shell.sh setup)
-# Uso: akita-boot.sh <dir de imagen, p. ej. out/akita-macos-live3>  [etiqueta]
+# Boots a macOS image for the Pixel 8a from RAM (fastboot boot) and gets everything ready to work without a camera:
+#   1. waits for the phone in fastboot and boots the image
+#   2. waits for the USB interface (CDC-ECM gadget) and saves the live kernel log (akita-live.py log)
+#   3. waits for the input script to finish (Terminal open with  nc -l 2323|bash|nc -l 2324 )
+#   4. leaves sshd ready (akita-usb-shell.sh setup)
+# Usage: akita-boot.sh <image dir, e.g. out/akita-macos-live3>  [label]
 set -u
 BASE=/Volumes/datos2/unixnu-akita
 FS=$BASE/ref/macOS-ForSheng
@@ -22,7 +22,7 @@ for _ in $(seq 1 240); do
   [ -n "$IF" ] && ifconfig "$IF" | grep -q "inet " && break
   sleep 5
 done
-[ -z "$IF" ] && { echo "sin interfaz USB"; exit 1; }
+[ -z "$IF" ] && { echo "no USB interface"; exit 1; }
 echo "red $IF $(date +%H:%M:%S)"
 pkill -f "akita-live.py log" 2>/dev/null
 nohup python3 "$BASE/akita-live.py" log "$LOG" > /dev/null 2>&1 &

@@ -1,0 +1,11 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -526,7 +526,7 @@
+         absolutetime_to_nanoseconds(fFpsCopyAbs / fFpsCopies, &meanNs);
+         absolutetime_to_nanoseconds(fFpsCopyMaxAbs, &maxNs);
+         const uint64_t tenths = fFpsFrames * 10000000000ULL / ns;
+-        if (tenths >= 120 && fTimelineDumps < 2) {
++        if (tenths >= 120 && fFpsChanged / fFpsCopies > 300000 && fTimelineDumps < 2) {   // akita: heavy frames only (a drag, not a blink)
+             fTimelineDumps++;
+             timelineDump();
+         }

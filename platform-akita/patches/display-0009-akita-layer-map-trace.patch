@@ -1,0 +1,11 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -801,7 +801,7 @@
+     return 1;
+ }
+ // akita bring-up: which layers the family maps, and with which surfaces (menus and the cursor arrive as extra layers).
+-static unsigned gLayerTrace = 48;   // map/unmap trace retired: the family maps no extra layer surfaces
++static unsigned gLayerTrace = 0;    // akita: re-armed to see whether the Metal compositor maps the menu bar as its own layer
+ IOReturn NativeGOPDisplay::swap_layer_map(IOMFBSwapIORequest *swap, unsigned int layer)
+ {
+     if (gLayerTrace < 48 && layerTraceOpen()) {

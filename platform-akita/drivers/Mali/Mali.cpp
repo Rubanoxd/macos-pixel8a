@@ -24,6 +24,8 @@
 //            mali-skipslot=M  a mask of CSG slots no group is put into
 #include <IOKit/IOLib.h>
 #include <kern/thread_call.h>
+#include <kern/sched_prim.h>
+#include <kern/thread.h>
 #include <kern/clock.h>
 #include <kern/cpu_number.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -300,7 +302,8 @@ void l2Test() {
 extern "C" void pmap_set_cache_attributes(unsigned int pn, unsigned int attributes);
 // macOS kernels use 16 KiB pages: ppnum_t counts PAGE_SIZE pages, not 4 KiB ones (the RK3588 kernel this came from was 4 KiB).
 // Callers step in 4 KiB; a 16 KiB page just gets the same attribute up to four times.
-unsigned gTraceAlloc = 1;   // akita bring-up: trace allocations (with a pause so the USB log gets out before a hang)
+unsigned gTraceAlloc = 0;   // akita bring-up: trace allocations (with a pause so the USB log gets out before a hang); boot-arg mali-trace-alloc=1
+                            // (it was on by default: every memAlloc slept 600 ms under the driver lock, VM_BIND calls took up to 2.4 s)
 #define MALI_STEP(...) do { if (gTraceAlloc) { printf("mali: step: " __VA_ARGS__); IOSleep(150); } } while (0)
 inline void setCacheAttr(uint64_t pa, unsigned int attr) { pmap_set_cache_attributes(static_cast<unsigned int>(pa >> PAGE_SHIFT), attr); }
 
@@ -507,7 +510,7 @@ bool loadFirmware() {
 }
 
 // ---- address space 0 belongs to the MCU
-enum : uint32_t { kMmuIntRaw = 0x2000, kMmuIntClear = 0x2004, kMmuIntMask = 0x2008, kJobIntRaw = 0x1000, kJobIntClear = 0x1004, kJobIntMask = 0x1008,
+enum : uint32_t { kMmuIntRaw = 0x2000, kMmuIntClear = 0x2004, kMmuIntMask = 0x2008, kJobIntRaw = 0x1000, kJobIntClear = 0x1004, kJobIntMask = 0x1008, kJobIntStat = 0x100c,
                   kDoorbell0 = 0x80000, kGpuFaultStatus = 0x3c, kGpuFaultAddr = 0x40 };
 constexpr uint32_t kJobGlobalIf = 1u << 31;
 constexpr uint32_t asReg(unsigned as, uint32_t off) { return 0x2400 + (as << 6) + off; }
@@ -623,6 +626,8 @@ struct CsOutput {
   uint64_t statusWaitSyncPtr;
   uint32_t statusWaitSyncValue, statusScoreboards, statusBlockedReason, statusWaitSyncValueHi, reserved2[6], fault, fatal;
   uint64_t faultInfo, fatalInfo;
+  uint32_t reserved3[10], heapVtStart, heapVtEnd, reserved4, heapFragEnd;   // akita: what a tiler that ran out of heap reports (Panthor's cs output)
+  uint64_t heapAddress;
 };
 struct CsgInput {
   uint32_t req, ackIrqMask, doorbellReq, csIrqAck, reserved1[4];
@@ -638,6 +643,12 @@ struct RingOutput { uint64_t extract; uint32_t active; };  // page 1
 enum : uint32_t {
   kCsStateMask = 7, kCsStateStart = 1, kCsExtractEvent = 1u << 4, kCsIdleSyncWait = 1u << 8, kCsIdleEmpty = 1u << 10,
   kCsgStateMask = 7, kCsgStateStart = 1, kCsgEndpointConfig = 1u << 4,
+  // events the firmware raises on a group (CSG_ACK toggles them; the host answers by toggling the same bits of CSG_REQ)
+  kCsgSyncUpdate = 1u << 28, kCsgIdle = 1u << 29, kCsgProgressTimer = 1u << 31,
+  kCsgEvents = kCsgSyncUpdate | kCsgIdle | kCsgProgressTimer,
+  // akita: events the firmware raises on a queue (CS_ACK toggles them, the host answers in CS_REQ)
+  kCsTilerOom = 1u << 26, kCsFatal = 1u << 30, kCsFault = 1u << 31,
+  kCsEvents = kCsTilerOom | kCsFatal | kCsFault,
 };
 
 constexpr uint64_t kRingVa = 0x20000000ULL, kDataVa = 0x20010000ULL, kCodeVa = 0x20020000ULL, kDescVa = 0x20030000ULL, kData2Va = 0x20040000ULL;   // in the GPU's address space (AS1)
@@ -863,7 +874,7 @@ constexpr unsigned kAsCount = 8, kMaxGroups = 8, kMaxQueues = 4, kCtxPtPages = 1
 constexpr unsigned kMaxCtx = 48, kMaxGroupObjs = 64, kNoSlot = ~0u;
 constexpr uint64_t kKernelVaBase = 0x7ff000000000ULL;   // kernel-chosen objects (rings, syncobjs) live below 2^47, away from what a client maps
 constexpr uint32_t kMcuSharedEnd = kSharedVa + 0x04000000;
-constexpr unsigned kJobSlots = 16, kJobBytes = kJobSlots * 8;   // Panthor pads every job to two cache lines
+constexpr unsigned kJobSlots = 32, kJobBytes = kJobSlots * 8;   // Panthor pads every job to two cache lines; akita: four, for the waits
 
 void memFree(Mem &m) {
   if (!m.md) return;
@@ -1317,6 +1328,7 @@ struct Heap {
   Ctx *ctx;
   void *owner;
   uint32_t chunkSize, chunkCount, maxChunks;
+  uint32_t chunkCap, targetInFlight;   // akita: room in the two arrays; render passes in flight above which the heap does not grow
   Bo **chunks;
   uint64_t *chunkVa;
   uint64_t ctxVa;
@@ -1343,8 +1355,8 @@ void heapFree(Heap &h) {
     vmUnmap(h.ctx->pt, h.chunkVa[i], h.chunks[i]->size);
     boRelease(h.chunks[i]);
   }
-  if (h.chunks) IODelete(h.chunks, Bo *, h.chunkCount);
-  if (h.chunkVa) IODeleteData(h.chunkVa, uint64_t, h.chunkCount);
+  if (h.chunks) IODelete(h.chunks, Bo *, h.chunkCap);
+  if (h.chunkVa) IODeleteData(h.chunkVa, uint64_t, h.chunkCap);
   memset(&h, 0, sizeof h);
 }
 
@@ -1359,7 +1371,7 @@ void heapsFree(Ctx *c) {
 }
 
 // initialChunks chunks of chunkSize (a multiple of 4 KiB, 128 KiB .. 8 MiB), chained newest first. Returns the heap's index or -1.
-int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxChunks, void *owner, uint64_t *ctxVa, uint64_t *firstChunkVa) {
+int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxChunks, uint32_t targetInFlight, void *owner, uint64_t *ctxVa, uint64_t *firstChunkVa) {
   if (!initialChunks || initialChunks > maxChunks || (chunkSize & 0xfff) || chunkSize < 0x20000 || chunkSize > 0x800000) return -1;
   if (!c.heapPool) {
     Bo *pool = boCreate(kMaxHeapsPerCtx * kHeapCtxStride, nullptr);
@@ -1383,11 +1395,12 @@ int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxC
 
   Heap &h = gHeap[slot];
   memset(&h, 0, sizeof h);
-  h.ctx = &c; h.owner = owner; h.chunkSize = chunkSize; h.maxChunks = maxChunks;
+  h.ctx = &c; h.owner = owner; h.chunkSize = chunkSize; h.maxChunks = maxChunks; h.targetInFlight = targetInFlight;
   h.chunks = IONewZero(Bo *, initialChunks);
   h.chunkVa = IONewZeroData(uint64_t, initialChunks);
+  h.chunkCap = initialChunks;
   h.used = true;
-  if (!h.chunks || !h.chunkVa) { h.chunkCount = initialChunks; heapFree(h); return -1; }
+  if (!h.chunks || !h.chunkVa) { heapFree(h); return -1; }
   h.chunkCount = initialChunks;
   uint64_t previous = 0;
   for (uint32_t i = 0; i < initialChunks; ++i) {
@@ -1411,6 +1424,36 @@ int heapCreate(Ctx &c, uint32_t initialChunks, uint32_t chunkSize, uint32_t maxC
   printf("mali: tiler heap %u in address space %u: %u chunks of %#x at %#llx.. (head %#llx), context at %#llx\n", slot, c.as, initialChunks, chunkSize,
          static_cast<unsigned long long>(h.chunkVa[0]), static_cast<unsigned long long>(previous), static_cast<unsigned long long>(h.ctxVa));
   return static_cast<int>(slot);
+}
+
+// akita (Generated-by: LLM): one more chunk for a heap whose tiler ran out (Panthor's panthor_heap_grow). The firmware chains it itself, so
+// its header's link stays zero. Returns what the firmware wants to hear, the chunk's address ORed with its size in pages, or 0.
+uint64_t heapAddChunk(Heap &h) {
+  if (h.chunkCount >= h.maxChunks) return 0;
+  if (h.chunkCount == h.chunkCap) {
+    const uint32_t cap = h.chunkCap * 2 > h.maxChunks ? h.maxChunks : h.chunkCap * 2;
+    Bo **chunks = IONewZero(Bo *, cap);
+    uint64_t *vas = IONewZeroData(uint64_t, cap);
+    if (!chunks || !vas) {
+      if (chunks) IODelete(chunks, Bo *, cap);
+      if (vas) IODeleteData(vas, uint64_t, cap);
+      return 0;
+    }
+    memcpy(chunks, h.chunks, h.chunkCount * sizeof(Bo *));
+    memcpy(vas, h.chunkVa, h.chunkCount * sizeof(uint64_t));
+    IODelete(h.chunks, Bo *, h.chunkCap);
+    IODeleteData(h.chunkVa, uint64_t, h.chunkCap);
+    h.chunks = chunks; h.chunkVa = vas; h.chunkCap = cap;
+  }
+  Bo *bo = boCreate(h.chunkSize, nullptr);
+  if (!bo) return 0;
+  memset(bo->kva, 0, 64);
+  __asm__ volatile("dsb sy" ::: "memory");
+  const uint64_t va = ctxKernelVaAligned(*h.ctx, h.chunkSize, h.chunkSize >= 0x200000 ? 0x200000 : 0x1000);
+  if (!ctxMapKernelBo(*h.ctx, bo, va, kLeafCached)) { boRelease(bo); return 0; }
+  h.chunks[h.chunkCount] = bo; h.chunkVa[h.chunkCount] = va;
+  ++h.chunkCount;
+  return (va & ~0xfffull) | (h.chunkSize >> 12);
 }
 
 // What lives in the MCU's address space for a CSG slot: the queues' input / output pages and the suspend buffers. Allocated on first use, kept.
@@ -1493,6 +1536,18 @@ void ringGlobalDoorbell(unsigned csg) {
   gGlbInput->doorbellReq = (gGlbInput->doorbellReq & ~(1u << csg)) | ((~gGlbOutput->doorbellAck) & (1u << csg));
   __asm__ volatile("dsb sy" ::: "memory");
   gpuWrite(kDoorbell0, 1);
+}
+
+// Tell the firmware a stream has new work the way ARM's kbase does for kernel submissions (CSG_DB_REQ toggle for the stream, then the
+// group's bit in GLB_DB_REQ and the kernel doorbell), after answering the group's pending events. With interrupts unhandled, a group whose
+// IDLE event nobody acknowledged sometimes ignored the stream's user doorbell: the ring held a job (insert ahead of extract) for seconds.
+void kickStream(const SlotView &s, unsigned csg, unsigned q) {
+  const uint32_t events = (s.out->ack ^ s.in->req) & kCsgEvents;
+  if (events) s.in->req ^= events;
+  s.in->doorbellReq = (s.in->doorbellReq & ~(1u << q)) | ((~s.out->doorbellAck) & (1u << q));
+  __asm__ volatile("dsb sy" ::: "memory");
+  ringGlobalDoorbell(csg);
+  gpuWrite(kDoorbell0 + 0x10000 * (csg + 1), 1);
 }
 
 void groupRelease(Group &g) {
@@ -1700,15 +1755,21 @@ Group *groupCreate(Ctx &ctx, const GroupParams &gp, void *owner = nullptr, bool 
 
 // Panthor's prepare_job_instrs() without profiling: flush, CALL the user's stream, wait for everything, bump the syncobj, error barrier.
 // Returns the job's sequence number in *seqno, or false when the ring has no room (the caller waits and retries).
-bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t latestFlush, uint64_t *seqno) {
-  if (q >= g.queues) return false;
+uint64_t gFaultScanGap;   // akita: 5 ms of mach_absolute_time, set at the first submit
+uint64_t gSubPh[8];   // akita: 0 activate, 1 ring write, 2 kick, 3 fault scan, 4 stall scan, 5 events, 6 dispatch, 7 count
+static inline uint64_t cntvctNow() { return mach_absolute_time(); }   // (cntvct_el0 read here went backwards: the kernel's own clock)
+uint64_t gSubNeg;   // akita: spans whose end read an earlier counter than their start (cores whose counters disagree?)
+static inline void subPh(unsigned i, uint64_t from, uint64_t to) { if (to >= from) gSubPh[i] += to - from; else gSubNeg++; }
+bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t latestFlush, uint64_t *seqno,
+                 const mali_group_submit_wait *waits = nullptr, unsigned waitCount = 0, bool kick = true) {
+  if (q >= g.queues || waitCount > MALI_SUBMIT_MAX_WAITS) return false;
   Queue &qu = g.q[q];
   SlotView s;
   CsView c;
   if (g.csg == kNoSlot || !slotView(g.csg, s) || !csView(s, q, c)) return false;
   volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[g.csg].iface[q].kva);
   volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[g.csg].iface[q].kva + 0x1000);
-  if (qu.insert + kJobBytes - ro->extract > qu.ringSize) return false;
+  if (qu.insert + kJobBytes - ro->extract >= qu.ringSize) return false;   // akita: one job of slack, never a full ring
 
   const unsigned regs = (c.ctl->features & 0xff) + 1;
   if (regs < 8) return false;
@@ -1723,6 +1784,12 @@ bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t 
   const uint64_t zeroReg = addrReg - 1;
   uint64_t instrs[kJobSlots] = {};
   unsigned n = 0;
+  for (unsigned w = 0; w < waitCount; ++w) {   // akita: first the other queues this job depends on (before the flush below)
+    if (waits[w].queue >= g.queues || waits[w].queue == q || !waits[w].seqno) continue;
+    instrs[n++] = (1ull << 56) | (addrReg << 48) | (g.syncVa + waits[w].queue * 16);   // MOV48 addr, that queue's sync word
+    instrs[n++] = (1ull << 56) | (valReg << 48) | ((waits[w].seqno - 1) & 0xffffffffffffull);   // MOV48 val, seqno - 1
+    instrs[n++] = (53ull << 56) | (addrReg << 40) | (valReg << 32) | (1ull << 28);       // SYNC_WAIT64.gt addr, val
+  }
   instrs[n++] = (2ull << 56) | (valReg << 48) | latestFlush;                       // MOV32 val, latest_flush
   instrs[n++] = (36ull << 56) | (valReg << 40) | 0x233;                            // FLUSH_CACHE2.clean_inv_all.no_wait.signal(0) val
   instrs[n++] = (1ull << 56) | (addrReg << 48) | csVa;                             // MOV48 addr, cs.start
@@ -1749,8 +1816,30 @@ bool groupSubmit(Group &g, unsigned q, uint64_t csVa, uint32_t csSize, uint32_t 
   ri->extract = ro->extract;
   ri->insert = qu.insert;
   __asm__ volatile("dsb sy" ::: "memory");
-  gpuWrite(kDoorbell0 + 0x10000 * (g.csg + 1), 1);
+  if (!kick) return true;   // akita: the batch rings once per queue (kickStreams)
+  const uint64_t kick0 = cntvctNow();
+  kickStream(s, g.csg, q);
+  subPh(2, kick0, cntvctNow());
   return true;
+}
+
+// akita: room for one more job in queue q's ring (one job of slack kept, as groupSubmit checks).
+bool ringHasRoom(Group &g, unsigned q) {
+  if (q >= g.queues || g.csg == kNoSlot) return true;   // groupSubmit refuses those on its own terms
+  const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[g.csg].iface[q].kva + 0x1000);
+  return g.q[q].insert + kJobBytes - ro->extract < g.q[q].ringSize;
+}
+
+// akita: kickStream for several streams of a group's slot at once (the queues in mask): one global and one group doorbell.
+void kickStreams(Group &g, uint32_t mask) {
+  SlotView s;
+  if (!mask || g.csg == kNoSlot || !slotView(g.csg, s)) return;
+  const uint32_t events = (s.out->ack ^ s.in->req) & kCsgEvents;
+  if (events) s.in->req ^= events;
+  s.in->doorbellReq = (s.in->doorbellReq & ~mask) | ((~s.out->doorbellAck) & mask);
+  __asm__ volatile("dsb sy" ::: "memory");
+  ringGlobalDoorbell(g.csg);
+  gpuWrite(kDoorbell0 + 0x10000 * (g.csg + 1), 1);
 }
 
 bool groupWait(Group &g, unsigned q, uint64_t seqno, unsigned timeoutUs) {
@@ -1791,9 +1880,292 @@ void gpuFaultScan(const char *when) {
                static_cast<unsigned long long>(*reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16)), static_cast<unsigned long long>(g->q[q].seqno), when);
         lastFault[slot][q] = fault; lastFatal[slot][q] = fatal;
         ++shown;
+        {   // akita: where it stopped: the stream's command pointer, the ring's extract/insert and the ring words around extract
+          const volatile RingInput *ri = reinterpret_cast<volatile RingInput *>(gSlotRes[slot].iface[q].kva);
+          const volatile RingOutput *ro = reinterpret_cast<volatile RingOutput *>(gSlotRes[slot].iface[q].kva + 0x1000);
+          const Queue &qu = g->q[q];
+          const uint64_t ext = ro->extract, ins = ri->insert;
+          printf("mali:   queue %u: cmd %#llx blocked %u wait %#x, ring extract %#llx insert %#llx (driver insert %#llx, size %#x, %llu bytes queued)\n", q,
+                 static_cast<unsigned long long>(c.out->statusCmdPtr), c.out->statusBlockedReason, c.out->statusWait,
+                 static_cast<unsigned long long>(ext), static_cast<unsigned long long>(ins), static_cast<unsigned long long>(qu.insert), qu.ringSize,
+                 static_cast<unsigned long long>(qu.insert - ext));
+          const uint64_t *ring = reinterpret_cast<const uint64_t *>(qu.ring.kva);
+          const uint64_t at = ((ext & (qu.ringSize - 1)) / 8 + qu.ringSize / 8 - 8) % (qu.ringSize / 8);
+          for (unsigned k = 0; k < 16; k += 4)
+            printf("mali:   ring[%llu..]: %016llx %016llx %016llx %016llx\n", static_cast<unsigned long long>((at + k) % (qu.ringSize / 8)),
+                   static_cast<unsigned long long>(ring[(at + k) % (qu.ringSize / 8)]), static_cast<unsigned long long>(ring[(at + k + 1) % (qu.ringSize / 8)]),
+                   static_cast<unsigned long long>(ring[(at + k + 2) % (qu.ringSize / 8)]), static_cast<unsigned long long>(ring[(at + k + 3) % (qu.ringSize / 8)]));
+        }
       }
     }
   }
+}
+
+// ---- akita (Generated-by: LLM, local only): the firmware's events, the job interrupt, and waits that sleep ------------------------------
+// Until here nothing listened to the firmware: the job interrupt was masked, a group's events were answered only when its next job was
+// submitted, a queue's (fault, fatal, tiler out of memory) never, and every wait was a poll. Now:
+//  - gpuEventsProcess() (driver lock held) answers what the groups in the slots raised and gives a tiler that ran out one more chunk;
+//  - the job interrupt (zuma: SPI 347, level high) clears its source, moves gEventGen on, wakes the waits and queues gpuEventsProcess();
+//  - a wait (a fence, MALI_EVENT_WAIT, the display's fence) sleeps on gEventGen, with a short time limit as its safety net.
+// Boot-args: mali-events=0     none of this (the driver as it was: the interrupt masked, polls of 1 ms)
+//            mali-irq=0        the events are processed on the clients' calls and inside the waits, without the interrupt
+//            mali-heap-grow=0  a tiler heap keeps its initial chunks
+extern "C" IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback, uint64_t *router);
+extern "C" void armcpu_spi_disable(uint32_t intid);
+
+constexpr uint32_t kJobIntid = 32 + 347;   // IRQ_G3D_IRQJOB_G3D
+bool gEventsOn;
+unsigned gHeapGrow = 1;
+volatile uint64_t gEventGen;       // moves on whenever something a wait may be waiting for can have happened
+int gEventChannel;                 // what the waits sleep on
+volatile uint32_t gIrqLive;        // 1: the job interrupt is attached and unmasked
+volatile uint32_t gIrqGaveUp;      // why it was masked again: 1 fired with nothing pending, 2 a storm, 3 never fired
+uint64_t gIrqTaken, gIrqEmpty, gIrqWindow, gIrqInWindow;   // the handler's own (boot CPU, interrupts off)
+uint32_t gIrqEmptyRun;
+thread_call_t gEventCall;
+uint64_t gHeapGrown, gHeapRefused, gEventsAnswered, gWaitSlept, gWaitTimedOut;
+volatile uint32_t gIrqMissed;      // waits whose condition came true during a sleep that no interrupt ended, while none has ever fired
+
+inline uint64_t ticksNow() {
+  uint64_t v;
+  __asm__ volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(v));
+  return v;
+}
+inline uint64_t ticksPerSecond() {
+  static uint64_t f;
+  if (!f) __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+  return f;
+}
+
+inline void eventsMoved() {
+  __atomic_fetch_add(&gEventGen, 1ull, __ATOMIC_SEQ_CST);
+  thread_wakeup(static_cast<event_t>(&gEventChannel));
+}
+
+void irqGiveUp(uint32_t why) {
+  gpuWrite(kJobIntMask, 0);
+  armcpu_spi_disable(kJobIntid);
+  __atomic_store_n(&gIrqGaveUp, why, __ATOMIC_RELEASE);
+  __atomic_store_n(&gIrqLive, 0u, __ATOMIC_RELEASE);
+}
+
+// The primary interrupt context of the boot CPU, before the EOI: no locks, no memory, no printing. The line is level triggered: writing
+// the status back to JOB_INT_CLEAR drops it. A line that fires with nothing of ours pending 64 times in a row, or more than 100000 times
+// in a second, is taken out of service (a wrong INTID or a source that cannot be cleared must not hold the boot CPU): the waits then poll.
+void jobInterrupt(void *) {
+  const uint32_t status = gpu(kJobIntStat);
+  if (!status) {
+    ++gIrqEmpty;
+    if (++gIrqEmptyRun >= 64) { irqGiveUp(1); eventsMoved(); }
+    return;
+  }
+  gIrqEmptyRun = 0;
+  gpuWrite(kJobIntClear, status);
+  ++gIrqTaken;
+  const uint64_t now = ticksNow();
+  if (now - gIrqWindow > ticksPerSecond()) { gIrqWindow = now; gIrqInWindow = 0; }
+  if (++gIrqInWindow > 100000) irqGiveUp(2);
+  eventsMoved();
+  if (gEventCall) thread_call_enter(gEventCall);
+}
+
+// Panthor's group_process_tiler_oom(): the tiler of queue q has no chunk left. Give it one more unless the heap is at its limit or has more
+// render passes in flight than its target; with 0 the firmware waits for fragment jobs to hand chunks back or runs the client's own handler
+// (incremental rendering). Driver lock held.
+void heapOutOfMemory(Group &g, unsigned q, const CsView &c) {
+  const uint64_t heapVa = c.out->heapAddress;
+  const uint32_t vtStart = c.out->heapVtStart, vtEnd = c.out->heapVtEnd, fragEnd = c.out->heapFragEnd;
+  Heap *h = nullptr;
+  for (unsigned i = 0; i < kMaxHeaps && !h; ++i)
+    if (gHeap[i].used && gHeap[i].ctx == g.ctx && gHeap[i].ctxVa == heapVa) h = &gHeap[i];
+  uint64_t chunk = 0;
+  const char *why = "one more chunk";
+  if (!h) why = "no such heap";
+  else if (fragEnd > vtEnd || vtEnd >= vtStart) why = "counters that make no sense";
+  else if (!gHeapGrow) why = "left as it is (mali-heap-grow=0)";
+  else if (vtStart - fragEnd > h->targetInFlight) why = "more render passes in flight than its target";
+  else if (h->chunkCount >= h->maxChunks) why = "at its limit";
+  else if (!(chunk = heapAddChunk(*h))) why = "no memory for a chunk";
+  if (chunk) ++gHeapGrown; else ++gHeapRefused;
+  c.in->heapStart = chunk;
+  c.in->heapEnd = chunk;
+  __asm__ volatile("dsb sy" ::: "memory");
+  static unsigned shown;
+  if (shown < 24) {
+    ++shown;
+    printf("mali: tiler of group %u queue %u out of heap (%u render passes in flight, %u fragment jobs to go, heap %#llx with %u of %u chunks): %s\n", g.id, q, vtStart - fragEnd,
+           vtEnd - fragEnd, static_cast<unsigned long long>(heapVa), h ? h->chunkCount : 0u, h ? h->maxChunks : 0u, why);
+  }
+}
+
+// Answer what the firmware raised on the groups that sit in slots (Panthor's sched_process_csg_irq_locked). Driver lock held.
+void gpuEventsProcess(const char *when) {
+  if (!gEventsOn || !gGlbControl) return;
+  bool faults = false;
+  for (unsigned slot = 0; slot < kMaxGroups; ++slot) {
+    Group *g = gSlotGroup[slot];
+    SlotView s;
+    if (!g || !slotView(slot, s)) continue;
+    // The queues' interrupt requests are answered before the queues are looked at: one raised while we look is then seen the next time.
+    const uint32_t csIrqs = s.out->csIrqReq;
+    if (csIrqs != s.in->csIrqAck) s.in->csIrqAck = csIrqs;
+    uint32_t ring = 0;
+    for (unsigned q = 0; q < g->queues; ++q) {
+      CsView c;
+      if (!csView(s, q, c)) continue;
+      const uint32_t ack = c.out->ack, events = (c.in->req ^ ack) & kCsEvents;
+      if (!events) continue;
+      if (events & kCsTilerOom) heapOutOfMemory(*g, q, c);
+      if (events & (kCsFault | kCsFatal)) faults = true;
+      c.in->req = (c.in->req & ~events) | (ack & events);
+      if (events & (kCsTilerOom | kCsFault)) ring |= 1u << q;   // the queue goes on once it is told so
+      ++gEventsAnswered;
+    }
+    const uint32_t events = (s.out->ack ^ s.in->req) & kCsgEvents;
+    if (events) { s.in->req ^= events; ++gEventsAnswered; }
+    if (events & kCsgProgressTimer) {
+      static unsigned shown;
+      if (shown++ < 8) printf("mali: group %u (slot %u) made no progress within the firmware's timer [%s]\n", g->id, slot, when);
+    }
+    if (ring) {
+      s.in->doorbellReq = (s.in->doorbellReq & ~ring) | ((~s.out->doorbellAck) & ring);
+      __asm__ volatile("dsb sy" ::: "memory");
+      ringGlobalDoorbell(slot);
+    }
+  }
+  __asm__ volatile("dsb sy" ::: "memory");
+  if (faults) gpuFaultScan(when);
+}
+
+extern IOLock *gLock;
+
+void gpuEventWork(thread_call_param_t, thread_call_param_t) {
+  if (!gLock) return;
+  IOLockLock(gLock);
+  gpuEventsProcess("interrupt");
+  IOLockUnlock(gLock);
+  eventsMoved();   // after the answers: what happened between the firmware's event and its answer raised no interrupt of its own
+}
+
+// Without the interrupt: the events are looked at from the waits, if no call is in the driver right now.
+void eventsPoll() {
+  if (!gEventsOn || !gLock || !IOLockTryLock(gLock)) return;
+  gpuEventsProcess("poll");
+  IOLockUnlock(gLock);
+}
+
+// Sleep until the events move on from `gen` or `us` microseconds pass. No lock held.
+void eventSleep(uint64_t gen, uint64_t us) {
+  uint64_t deadline;
+  clock_interval_to_deadline(static_cast<uint32_t>(us ? us : 1), NSEC_PER_USEC, &deadline);
+  assert_wait_deadline(static_cast<event_t>(&gEventChannel), THREAD_UNINT, deadline);
+  if (__atomic_load_n(&gEventGen, __ATOMIC_ACQUIRE) != gen) {
+    clear_wait(current_thread(), THREAD_AWAKENED);
+    return;
+  }
+  ++gWaitSlept;
+  if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) ++gWaitTimedOut;
+}
+
+// Wait until done() or the time is up; true when done. `spins` looks of 10 microseconds come first (a short job is done within tens of
+// microseconds); then the thread sleeps: until the next event, at most 4 ms, with the interrupt; 1 ms at a time without it, as before.
+template <typename Condition> bool eventWaitFor(uint64_t timeoutUs, unsigned spins, Condition done) {
+  const uint64_t freq = ticksPerSecond(), begin = ticksNow();
+  for (unsigned turn = 0;; ++turn) {
+    const uint64_t gen = __atomic_load_n(&gEventGen, __ATOMIC_ACQUIRE);
+    if (done()) return true;
+    const uint64_t waited = (ticksNow() - begin) * 1000000 / freq;
+    if (waited >= timeoutUs) return false;
+    if (turn < spins) { IODelay(10); continue; }
+    if (!gEventsOn) { IOSleep(1); continue; }
+    const bool live = __atomic_load_n(&gIrqLive, __ATOMIC_ACQUIRE) != 0;
+    if (!live) eventsPoll();
+    const uint64_t left = timeoutUs - waited, slice = live ? 4000 : 1000;
+    const uint64_t taken = gIrqTaken;
+    eventSleep(gen, left < slice ? left : slice);
+    // An interrupt that never comes (the line is the secure world's, or not the GPU's) must not leave every wait at 4 ms: after a few
+    // waits that only the time limit ended while their condition had come true, go back to polling.
+    if (live && !taken && !gIrqTaken && __atomic_load_n(&gEventGen, __ATOMIC_ACQUIRE) == gen && done()) {
+      if (__atomic_add_fetch(&gIrqMissed, 1u, __ATOMIC_RELAXED) == 16) {
+        const boolean_t was = ml_set_interrupts_enabled(FALSE);
+        irqGiveUp(3);
+        (void)ml_set_interrupts_enabled(was);
+      }
+      return true;
+    }
+  }
+}
+
+// Attach the job interrupt and prove it with a ping: the firmware answers one through the global interface's interrupt (bit 31).
+// A line that stays silent is taken out of service at once. Thread context; the driver lock is taken for the ping.
+unsigned gIrqArg = 1;
+void irqAttach() {
+  if (!gEventsOn || !gLock || !gGlbInput || !gGlbOutput || gIrqLive || gIrqGaveUp || gEventCall) return;
+  gEventCall = thread_call_allocate(gpuEventWork, nullptr);
+  if (!gEventCall) { printf("mali: events: no thread call, polled\n"); return; }
+  gpuWrite(kJobIntMask, 0);
+  uint32_t readback = 0;
+  uint64_t router = 0;
+  __atomic_store_n(&gIrqLive, 1u, __ATOMIC_RELEASE);
+  const IOReturn r = armcpu_spi_attach(kJobIntid, false, jobInterrupt, nullptr, &readback, &router);
+  if (r != kIOReturnSuccess) {
+    __atomic_store_n(&gIrqLive, 0u, __ATOMIC_RELEASE);
+    printf("mali: events: job interrupt %u not attached (%#x), polled\n", kJobIntid, r);
+    return;
+  }
+  IOLockLock(gLock);
+  const uint64_t before = gIrqTaken;
+  gpuWrite(kJobIntMask, 0xffffffffu);   // what is pending already fires now: its events are answered by the work it queues
+  gGlbInput->req = (gGlbInput->req & ~kGlbPing) | ((gGlbOutput->ack ^ kGlbPing) & kGlbPing);
+  __asm__ volatile("dsb sy" ::: "memory");
+  gpuWrite(kDoorbell0, 1);
+  bool fired = false;
+  for (unsigned ms = 0; ms < 100 && !fired; ++ms) { IOSleep(1); fired = gIrqTaken != before; }
+  if (!fired) {
+    const boolean_t was = ml_set_interrupts_enabled(FALSE);
+    irqGiveUp(3);
+    (void)ml_set_interrupts_enabled(was);
+  }
+  gpuEventsProcess("the interrupt's start");
+  IOLockUnlock(gLock);
+  eventsMoved();
+  printf("mali: events: job interrupt %u attached (GIC group/enable/trigger/priority %#x, routed to %#llx): the ping's interrupt %s (job irq raw %#x), tiler heaps %s\n", kJobIntid,
+         readback, static_cast<unsigned long long>(router), fired ? "ARRIVED" : "did NOT arrive: taken out of service, polled", gpu(kJobIntRaw), gHeapGrow ? "grow" : "do not grow");
+}
+
+// Called once, when the service is about to be published. mali-irq=2 leaves the interrupt for later: sysctl kern.akita_mali=100
+// attaches it on a running system (a first try with the log already on the wire).
+void irqStart() {
+  unsigned events = 1;
+  PE_parse_boot_argn("mali-events", &events, sizeof events);
+  PE_parse_boot_argn("mali-irq", &gIrqArg, sizeof gIrqArg);
+  PE_parse_boot_argn("mali-heap-grow", &gHeapGrow, sizeof gHeapGrow);
+  gEventsOn = events != 0;
+  if (!gEventsOn) { printf("mali: events: off (mali-events=0): the firmware's events are not answered, the waits poll\n"); return; }
+  if (gIrqArg != 1) {
+    printf("mali: events: polled (mali-irq=%u%s), tiler heaps %s\n", gIrqArg, gIrqArg == 2 ? ": sysctl kern.akita_mali=100 attaches the interrupt" : "", gHeapGrow ? "grow" : "do not grow");
+    return;
+  }
+  irqAttach();
+}
+
+// A line with the totals when they moved, from the calls' ten second table.
+void eventsReport() {
+  static uint64_t lastTaken, lastAnswered, lastGrown, lastRefused;
+  static uint32_t toldGaveUp;
+  const uint32_t gaveUp = __atomic_load_n(&gIrqGaveUp, __ATOMIC_ACQUIRE);
+  if (gaveUp && !toldGaveUp) {
+    toldGaveUp = 1;
+    printf("mali: events: the job interrupt was taken out of service (%s; %llu taken, %llu with nothing pending): polled from here on\n",
+           gaveUp == 1 ? "it fired with nothing pending" : gaveUp == 2 ? "a storm" : "it never fired", static_cast<unsigned long long>(gIrqTaken),
+           static_cast<unsigned long long>(gIrqEmpty));
+  }
+  if (gIrqTaken == lastTaken && gEventsAnswered == lastAnswered && gHeapGrown == lastGrown && gHeapRefused == lastRefused) return;
+  lastTaken = gIrqTaken; lastAnswered = gEventsAnswered; lastGrown = gHeapGrown; lastRefused = gHeapRefused;
+  printf("mali: events: %llu interrupts (%llu empty), %llu events answered, waits slept %llu times (%llu ended by the time limit), tiler chunks added %llu refused %llu\n",
+         static_cast<unsigned long long>(gIrqTaken), static_cast<unsigned long long>(gIrqEmpty), static_cast<unsigned long long>(gEventsAnswered),
+         static_cast<unsigned long long>(gWaitSlept), static_cast<unsigned long long>(gWaitTimedOut), static_cast<unsigned long long>(gHeapGrown),
+         static_cast<unsigned long long>(gHeapRefused));
 }
 
 // ---- M3a self-test
@@ -1909,6 +2281,7 @@ out:
 
 IOLock *gLock;   // the driver's state is global and single threaded: every user client call takes it (waiting for a fence does not)
 
+
 bool m3b();               // the self-test through the user client's own entry point
 bool serviceCreate();
 void serviceRegister();
@@ -1924,6 +2297,7 @@ void m1() {
     if (gLevel >= 7) {
       gLock = IOLockAlloc();
       if (gLock && serviceCreate()) {
+        irqStart();   // akita
         if (gLevel == 7) m3b();
         serviceRegister();
       }
@@ -2084,6 +2458,11 @@ IOReturn MaliClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOM
   if (!closed) {
     if (type == MALI_MAP_SCANOUT) {
       if (native_gop_handoff_memory && gopAllowed()) { md = native_gop_handoff_memory(); retained = md != nullptr; }   // retained by the display driver for us
+    } else if (type == MALI_MAP_FLUSH_ID) {   // akita
+      static IOMemoryDescriptor *flushIdPage;
+      if (!flushIdPage) flushIdPage = IOMemoryDescriptor::withPhysicalAddress(kGpuPhys + 0x10000, 0x4000, kIODirectionIn);
+      md = flushIdPage;
+      mapOptions = kIOMapInhibitCache | kIOMapReadOnly;
     } else if (type & MALI_MAP_SYNCOBJ) {
       Group *g = groupFor(type & 0xff);
       if (g) { md = g->sync.md; mapOptions |= kIOMapReadOnly; }
@@ -2129,11 +2508,8 @@ IOReturn MaliClient::fenceWait(const mali_fence_wait_in &i, mali_fence_wait_out 
   if (g && i.queue < g->queues) done = reinterpret_cast<volatile uint64_t *>(g->sync.kva + i.queue * 16);
   IOLockUnlock(gLock);
   if (!done) return kIOReturnBadArgument;
-  uint64_t waited = 0;
-  while (*done < i.seqno && waited < i.timeout_us) {
-    if (waited < 200) { IODelay(10); waited += 10; }
-    else { IOSleep(1); waited += 1000; }
-  }
+  const uint64_t wanted = i.seqno;
+  (void)eventWaitFor(i.timeout_us, 20, [done, wanted] { return *done >= wanted; });   // akita: sleeps until the job interrupt
   o->done_seqno = *done;
   o->signaled = *done >= i.seqno;
   if (!o->signaled) {
@@ -2162,7 +2538,7 @@ inline uint64_t cntvct() {
 // A group in a slot with jobs that do not finish: the user side polls the syncobj without telling us, so the driver looks for itself, at most once a
 // second, on any call. Says where the group stands (slot, address space, per queue: jobs done / given, ring extract / insert, what the firmware reports).
 void gpuStallScan() {
-  static uint64_t last, since[kMaxGroupObjs], reported[kMaxGroupObjs];
+  static uint64_t last, since[kMaxGroupObjs], reported[kMaxGroupObjs], doneSeen[kMaxGroupObjs][kMaxQueues];
   static unsigned shown;
   if (shown >= 60) return;
   if (!gCallStatFreq) __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(gCallStatFreq));
@@ -2173,12 +2549,15 @@ void gpuStallScan() {
     Group *g = gSlotGroup[slot];
     if (!g || g->id == 0 || g->id > kMaxGroupObjs) continue;
     const unsigned idx = g->id - 1;
-    bool pending = false;
-    for (unsigned q = 0; q < g->queues; ++q) {
-      const volatile uint64_t *done = reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16);
-      if (*done < g->q[q].seqno) pending = true;
+    // Stalled = jobs outstanding and none finished since the last look (a busy queue always has one in flight).
+    bool pending = false, moved = false;
+    for (unsigned q = 0; q < g->queues && q < kMaxQueues; ++q) {
+      const uint64_t done = *reinterpret_cast<volatile uint64_t *>(g->sync.kva + q * 16);
+      if (done < g->q[q].seqno) pending = true;
+      if (done != doneSeen[idx][q]) moved = true;
+      doneSeen[idx][q] = done;
     }
-    if (!pending) { since[idx] = 0; reported[idx] = 0; continue; }
+    if (!pending || moved) { since[idx] = 0; reported[idx] = 0; continue; }
     if (!since[idx]) { since[idx] = now; continue; }
     if (now - since[idx] < 2 * gCallStatFreq || (reported[idx] && now - reported[idx] < 4 * gCallStatFreq)) continue;
     reported[idx] = now;
@@ -2232,6 +2611,15 @@ void callStatRecord(uint32_t selector, uint64_t began, uint64_t locked, uint64_t
         if (used >= sizeof line) break;
       }
       if (line[0]) printf("mali: calls (selector:count total/lock-wait/max):%s\n", line);
+      if (half == 1 && gSubPh[7]) {   // akita: a submit's parts, mean ns
+        const uint64_t n = gSubPh[7]; uint64_t f = 0; absolutetime_to_nanoseconds(1000000000ull, &f); f = f ? 1000000000ull * 1000000000ull / f : gCallStatFreq;   // ticks per second of mach_absolute_time
+        printf("mali: submit parts (mean ns of %llu): dispatch %llu (activate %llu, ring %llu, kick %llu), fault scan %llu, stall scan %llu, events %llu, backwards %llu\n",
+               (unsigned long long)n, (unsigned long long)(gSubPh[6] * 1000000ull / f * 1000 / n), (unsigned long long)(gSubPh[0] * 1000000ull / f * 1000 / n),
+               (unsigned long long)(gSubPh[1] * 1000000ull / f * 1000 / n), (unsigned long long)(gSubPh[2] * 1000000ull / f * 1000 / n),
+               (unsigned long long)(gSubPh[3] * 1000000ull / f * 1000 / n), (unsigned long long)(gSubPh[4] * 1000000ull / f * 1000 / n),
+               (unsigned long long)(gSubPh[5] * 1000000ull / f * 1000 / n), (unsigned long long)gSubNeg);
+      }
+      if (half == 0) eventsReport();
       static uint64_t lastBind[2];
       if (gBindPages[0] != lastBind[0] || gBindPages[1] != lastBind[1]) {
         lastBind[0] = gBindPages[0]; lastBind[1] = gBindPages[1];
@@ -2263,6 +2651,19 @@ IOReturn MaliClient::externalMethod(uint32_t selector, IOExternalMethodArguments
       if (!a->structureOutput || a->structureOutputSize < outSize) return kIOReturnBadArgument;
       memcpy(a->structureOutput, &out, outSize);
     }
+  } else if (selector == MALI_EVENT_WAIT) {
+    // akita: what the user side's fence waits sleep in (darwin-drm keeps the fences itself: it only needs to know that something finished).
+    mali_event_wait_in in;
+    mali_event_wait_out out = {};
+    if (a->structureInputSize < sizeof in || a->structureOutputSize < sizeof out || !a->structureInput || !a->structureOutput) return kIOReturnBadArgument;
+    memcpy(&in, a->structureInput, sizeof in);
+    const uint64_t from = in.gen;
+    if (gEventsOn) (void)eventWaitFor(in.timeout_us > 1000000 ? 1000000 : in.timeout_us, 0, [from] { return __atomic_load_n(&gEventGen, __ATOMIC_ACQUIRE) != from; });
+    out.gen = __atomic_load_n(&gEventGen, __ATOMIC_ACQUIRE);
+    out.interrupts = gEventsOn ? __atomic_load_n(&gIrqLive, __ATOMIC_ACQUIRE) : 0;
+    memcpy(a->structureOutput, &out, sizeof out);
+    outSize = sizeof out;
+    r = kIOReturnSuccess;
   } else if (selector == MALI_FENCE_WAIT) {
     mali_fence_wait_in in;
     mali_fence_wait_out out;
@@ -2274,10 +2675,21 @@ IOReturn MaliClient::externalMethod(uint32_t selector, IOExternalMethodArguments
     IOLockLock(gLock);
     locked = cntvct();
     for (unsigned tries = 0;; ++tries) {
+      const uint64_t d0 = cntvctNow();
       r = closed ? static_cast<IOReturn>(kIOReturnNotAttached)
                  : dispatch(selector, static_cast<const uint8_t *>(a->structureInput), a->structureInputSize, static_cast<uint8_t *>(a->structureOutput), a->structureOutputSize, &outSize);
-      if (selector == MALI_GROUP_SUBMIT || selector == MALI_GROUP_DESTROY) gpuFaultScan(selector == MALI_GROUP_SUBMIT ? "after a submit" : "after a group destroy");
+      const uint64_t d1 = cntvctNow();
+      static uint64_t faultScanAt;   // akita: after a submit at most every 5 ms (one MMIO read costs ~7.6 us)
+      if (selector == MALI_GROUP_DESTROY) gpuFaultScan("after a group destroy");
+      else if ((selector == MALI_GROUP_SUBMIT || selector == MALI_GROUP_SUBMIT_BATCH) && (gFaultScanGap || (nanoseconds_to_absolutetime(5000000ull, &gFaultScanGap), true)) && mach_absolute_time() - faultScanAt > gFaultScanGap) {
+        faultScanAt = mach_absolute_time();
+        gpuFaultScan("after a submit");
+      }
+      const uint64_t d2 = cntvctNow();
       gpuStallScan();
+      const uint64_t d3 = cntvctNow();
+      if (!gIrqLive) gpuEventsProcess("a call");   // akita: without the interrupt the events are answered here
+      if (selector == MALI_GROUP_SUBMIT) { subPh(6, d0, d1); subPh(3, d1, d2); subPh(4, d2, d3); subPh(5, d3, cntvctNow()); gSubPh[7]++; }
       if (r != kIOReturnNotReady || tries >= 10000) break;   // a submit that found no slot: the busy groups finish on their own, without the lock
       IOLockUnlock(gLock);
       IOSleep(1);
@@ -2286,7 +2698,7 @@ IOReturn MaliClient::externalMethod(uint32_t selector, IOExternalMethodArguments
     IOLockUnlock(gLock);
   }
   if (r == kIOReturnSuccess) a->structureOutputSize = outSize;
-  if (selector != MALI_LOG && selector != MALI_GOP) callStatRecord(selector, began, locked, cntvct());   // (a wait for a frame is mostly idle time)
+  if (selector != MALI_LOG && selector != MALI_GOP && selector != MALI_EVENT_WAIT) callStatRecord(selector, began, locked, cntvct());   // (a wait for a frame is mostly idle time)
   return r;
 }
 
@@ -2411,7 +2823,7 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       Ctx *c = vmFor(i.vm);
       if (!c) return kIOReturnBadArgument;
       mali_heap_create_out o = {};
-      const int slot = heapCreate(*c, i.initial_chunk_count, i.chunk_size, i.max_chunks, this, &o.ctx_va, &o.first_chunk_va);
+      const int slot = heapCreate(*c, i.initial_chunk_count, i.chunk_size, i.max_chunks, i.target_in_flight, this, &o.ctx_va, &o.first_chunk_va);
       if (slot < 0) return kIOReturnNoMemory;
       o.handle = static_cast<uint32_t>(slot) + 1;
       PUT_OUT(mali_heap_create_out, o);
@@ -2435,11 +2847,48 @@ IOReturn MaliClient::dispatch(uint32_t selector, const uint8_t *in, uint32_t inS
       Group *g = groupFor(i.group);
       if (!g || i.queue >= g->queues || !i.cs_size || (i.cs_size & 7) || (i.cs_va & 63) || i.cs_va >= g->ctx->userVaRange) return kIOReturnBadArgument;
       mali_group_submit_out o = {0};
+      const uint64_t act0 = cntvctNow();
       const int act = groupActivate(*g);
+      subPh(0, act0, cntvctNow());
       if (act > 0) return kIOReturnNotReady;   // every slot has a busy group in it: externalMethod waits and calls again
       if (act < 0) return kIOReturnNoResources;
-      if (!groupSubmit(*g, i.queue, i.cs_va, i.cs_size, i.latest_flush, &o.seqno)) return kIOReturnNoSpace;
+      mali_group_submit2_in i2 = {};   // akita: the longer form carries the waits on other queues
+      if (inSize >= sizeof i2) {
+        memcpy(&i2, in, sizeof i2);
+        if (i2.wait_count > MALI_SUBMIT_MAX_WAITS) return kIOReturnBadArgument;
+        for (unsigned w = 0; w < i2.wait_count; ++w) if (i2.waits[w].queue >= g->queues) return kIOReturnBadArgument;
+      }
+      const uint64_t sub0 = cntvctNow(), kick0 = gSubPh[2];
+      if (!ringHasRoom(*g, i.queue)) return kIOReturnNotReady;   // akita: the queue's ring is full: externalMethod waits and calls again
+      if (!groupSubmit(*g, i.queue, i.cs_va, i.cs_size, i.latest_flush, &o.seqno, i2.waits, i2.wait_count)) return kIOReturnNoSpace;
+      subPh(1, sub0 + (gSubPh[2] - kick0), cntvctNow());
       PUT_OUT(mali_group_submit_out, o);
+      return kIOReturnSuccess;
+    }
+    case MALI_GROUP_SUBMIT_BATCH: {   // akita: several streams of one group; out.done says how many went in (the rest: one by one)
+      NEED_IN(mali_group_submit_batch_in, b);
+      Group *g = groupFor(b.group);
+      if (!g || !b.count || b.count > MALI_SUBMIT_BATCH_MAX) return kIOReturnBadArgument;
+      for (unsigned e = 0; e < b.count; ++e) {
+        const mali_submit_entry &x = b.e[e];
+        if (x.queue >= g->queues || !x.cs_size || (x.cs_size & 7) || (x.cs_va & 63) || x.cs_va >= g->ctx->userVaRange || x.wait_count > MALI_SUBMIT_MAX_WAITS)
+          return kIOReturnBadArgument;
+        for (unsigned w = 0; w < x.wait_count; ++w) if (x.waits[w].queue >= g->queues) return kIOReturnBadArgument;
+      }
+      const int act = groupActivate(*g);
+      if (act > 0) return kIOReturnNotReady;
+      if (act < 0) return kIOReturnNoResources;
+      mali_group_submit_batch_out o = {};
+      uint32_t mask = 0;
+      for (; o.done < b.count; ++o.done) {
+        const mali_submit_entry &x = b.e[o.done];
+        if (!ringHasRoom(*g, x.queue)) break;   // akita: the rest goes one by one, which waits for room
+        if (!groupSubmit(*g, x.queue, x.cs_va, x.cs_size, x.latest_flush, &o.seqno[o.done], x.waits, x.wait_count, false)) break;
+        mask |= 1u << x.queue;
+      }
+      kickStreams(*g, mask);
+      gSubPh[7] += o.done;
+      PUT_OUT(mali_group_submit_batch_out, o);
       return kIOReturnSuccess;
     }
     default:
@@ -2771,6 +3220,9 @@ extern "C" int mali_test_file(unsigned index, const char **name, const uint8_t *
 // mali_fence_take: the groups' queues that still have jobs running, as triples { serial, seqno, group << 8 | queue }, at most cap of them;
 // returns the count, -1 when the driver is busy with a call (try again), -2 when there are more than cap (then the fence is "all idle", count ~0).
 // mali_fence_done: 1 when all of them have reached their seqno (a group that is gone counts as done), 0 when not, -1 when the driver is busy.
+// akita: the process whose frames reach the panel is backboardd on iOS and WindowServer on macOS.
+static bool renderServerName(const char *name) { return strcmp(name, "backboardd") == 0 || strcmp(name, "WindowServer") == 0; }
+
 extern "C" int mali_fence_take(uint64_t *entries, unsigned cap) {
   if (!gLock || !IOLockTryLock(gLock)) return -1;
   unsigned n = 0;
@@ -2780,7 +3232,7 @@ extern "C" int mali_fence_take(uint64_t *entries, unsigned cap) {
     if (!gr.used || !gr.sync.kva) continue;
     // Only the render server's work is what a frame waits for: a poster extension or an app whose job is stalled (a GPU that waits on a
     // sync nobody signals, a group that is not running) must not hold the panel's frames back.
-    if (!gr.owner || strcmp(static_cast<MaliClient *>(gr.owner)->name(), "backboardd") != 0) continue;
+    if (!gr.owner || !renderServerName(static_cast<MaliClient *>(gr.owner)->name())) continue;
     for (unsigned q = 0; q < gr.queues; ++q) {
       const uint64_t done = *reinterpret_cast<volatile uint64_t *>(gr.sync.kva + q * 16);
       if (done >= gr.q[q].seqno) continue;
@@ -2800,7 +3252,7 @@ extern "C" int mali_fence_done(const uint64_t *entries, unsigned count) {
     for (unsigned g = 0; g < kMaxGroupObjs && !pending; ++g) {
       Group &gr = gGroup[g];
       if (!gr.used || !gr.sync.kva) continue;
-      if (!gr.owner || strcmp(static_cast<MaliClient *>(gr.owner)->name(), "backboardd") != 0) continue;
+      if (!gr.owner || !renderServerName(static_cast<MaliClient *>(gr.owner)->name())) continue;
       for (unsigned q = 0; q < gr.queues; ++q)
         if (*reinterpret_cast<volatile uint64_t *>(gr.sync.kva + q * 16) < gr.q[q].seqno) { pending = 1; break; }
     }
@@ -2816,6 +3268,30 @@ extern "C" int mali_fence_done(const uint64_t *entries, unsigned count) {
   IOLockUnlock(gLock);
   return pending ? 0 : 1;
 }
+
+// akita (Generated-by: LLM): the display's wait for a fence taken with mali_fence_take: 1 as soon as it is done (the job interrupt ends the
+// sleep), 0 when `us` microseconds passed first. Sleeps: not for an interrupt context, and no lock of the caller's may be one the driver needs.
+extern "C" int mali_fence_wait(const uint64_t *entries, unsigned count, uint64_t us) {
+  const uint64_t freq = ticksPerSecond(), begin = ticksNow();
+  for (;;) {
+    const uint64_t gen = __atomic_load_n(&gEventGen, __ATOMIC_ACQUIRE);
+    const int state = mali_fence_done(entries, count);
+    if (state == 1) return 1;
+    const uint64_t waited = (ticksNow() - begin) * 1000000 / freq;
+    if (waited >= us) return 0;
+    const uint64_t left = us - waited;
+    // -1: a call holds the driver's lock: look again soon. Else until the next event (4 ms at most), or 1 ms without the interrupt.
+    const uint64_t slice = state < 0 ? 200 : (gEventsOn && __atomic_load_n(&gIrqLive, __ATOMIC_ACQUIRE)) ? 4000 : 1000;
+    if (!gEventsOn) { IOSleep(1); continue; }
+    eventSleep(gen, left < slice ? left : slice);
+  }
+}
+
+// What the display needs to know to pace itself: the count of job interrupts taken so far (0 forever: there is none).
+extern "C" uint64_t mali_event_interrupts(void) { return gIrqTaken; }
+
+// 1 once the driver serves clients (before that mali_fence_take's -1 would mean "busy" forever).
+extern "C" int mali_fence_available(void) { return gLock != nullptr; }
 
 // What a fence that gave up was waiting for (the first few times only): which group of whom, how far it got, how long ago it last ran.
 extern "C" void mali_fence_describe(const uint64_t *entries, unsigned count) {
@@ -2900,9 +3376,14 @@ void gpuActivityTick(thread_call_param_t, thread_call_param_t) {
 // running (pd_g3d CONFIG=1, CMU_G3D gates read-only, ACPM owns DVFS), so there is no power-domain or clock code here.
 extern "C" void mali_start_level(unsigned on) {
   static bool started;
+  if (on == 100 && started) {   // akita: see irqStart()
+    if (gIrqArg == 2) irqAttach(); else printf("mali: level 100 ignored (mali-irq=%u)\n", gIrqArg);
+    return;
+  }
   if (!on || started) { printf("mali: level %u ignored (%s)\n", on, started ? "already started" : "zero"); return; }
   started = true;
   gLevel = on;
+  PE_parse_boot_argn("mali-trace-alloc", &gTraceAlloc, sizeof gTraceAlloc);   // akita
   printf("mali: Mali-G715 (zuma) bring-up, level %u\n", on);
   gGpu = reinterpret_cast<volatile uint32_t *>(ml_io_map(kGpuPhys, kGpuMapSize));
   if (!gGpu) { printf("mali: cannot map the GPU registers\n"); return; }

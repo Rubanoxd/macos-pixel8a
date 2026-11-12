@@ -36,7 +36,7 @@ from native_devtree import configure_native_text_state  # noqa: E402
 
 # DRAM and the DarwinBoot-owned window of the iPadOS akita board (UniXNU-akita/board.toml).
 DRAM_SIZE = 0x180000000
-OWNED_MEMORY = int(os.environ.get("AKITA_OWNED_MEMORY", "0x100000000"), 0)   # akita: the full-OS session wants more than 4 GiB
+OWNED_MEMORY = int(os.environ.get("AKITA_OWNED_MEMORY", "0x200000000"), 0)   # akita: up to 8 GiB; DarwinBoot takes its largest run (5.26 GiB seen by macOS, fullos183)
 BOOT_ARGS = ('-v debug=0x14e keepsyms=1 cpus=1 -enable_kprintf_spam -sheng-early-console '
              'native-ufs-root=1 native-ufs-diagnostics=1 -sheng-development-no-ignition '
              'native-ufs-isc-overlay=1 native-gop-display=1 sheng-recovery-ui=1 '
@@ -50,8 +50,8 @@ def main():
     parser.add_argument('--root-hash', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--boot-args', default=BOOT_ARGS)
-    parser.add_argument('--cpus', type=int, choices=(1, 2, 4, 8), default=1,
-                        help='CPUs in the ADT: the four Cortex-A510 (0x000-0x300), then the four Cortex-A715 (0x400-0x700)')
+    parser.add_argument('--cpus', type=int, choices=(1, 2, 4, 8, 9), default=1,
+                        help='CPUs in the ADT: the four Cortex-A510 (0x000-0x300), then the four Cortex-A715 (0x400-0x700), then the Cortex-X3 (0x800)')
     parser.add_argument('--nvram', action='append', default=[], metavar='NAME=VALUE',
                         help='System NVRAM variables for the ADT bank, e.g. prev-lang:kbd=es:87 (skips the language chooser)')
     parser.add_argument('--mu', type=Path, default=WORKSPACE / 'Mu-Silicium/Mu-akita-0.img')
@@ -59,6 +59,9 @@ def main():
                         help='boot the full macOS system volume with this UUID instead of the paired BaseSystem: '
                              'osenvironment main, root-matching by UUID, no root hash (unsealed development root)')
     parser.add_argument('--stock', type=Path, default=WORKSPACE / 'factory/stock/boot.img')
+    parser.add_argument('--gpu-addon', type=Path, default=None,
+                        help='NGPUADD2 file (scratch/make-akita-gpu-addon.py) carried as kernel.macho.gpuaddon; the kernel unpacks it at boot '
+                             '(boot-arg akita-gpu-addon=1) and rc.server puts the Mali Metal plugin in place before WindowServer starts')
     args = parser.parse_args()
 
     kernel = args.kernel_build / 'kernel.development.sheng'
@@ -83,12 +86,15 @@ def main():
         subprocess.run([sys.executable, ROOT / 'platform/akita/sparse-kernel.py', kernel, files / 'kernel.macho'],
                        check=True)
         adt = files / 'kernel.macho.adt'
+        if args.gpu_addon:
+            shutil.copy2(args.gpu_addon, files / 'kernel.macho.gpuaddon')
         subprocess.run([sys.executable, ROOT / 'platform/akita/make-akita-adt.py', '--output', adt,
                         '--dram-size', hex(DRAM_SIZE), '--owned-memory-size', hex(OWNED_MEMORY), '--panic-log',
                         '--cpu-regs', ','.join(hex(n << 8) for n in range(args.cpus)),
                         *[item for n in range(args.cpus)
-                          for item in ('--cpu-compatible', 'arm,cortex-a510' if n < 4 else 'arm,cortex-a715')],
+                          for item in ('--cpu-compatible', 'arm,cortex-a510' if n < 4 else 'arm,cortex-a715' if n < 8 else 'arm,cortex-x3')],
                         '--random-seed-bytes', '256', '--buttons',
+                        *(('--gpu-addon',) if args.gpu_addon else ()),
                         *[item for value in args.nvram for item in ('--nvram', value)],
                         *(('--os-environment', 'recoveryos', '--root-match-volume-uuid', str(uuid.UUID(args.fullos_root_uuid)))
                           if args.fullos_root_uuid else
@@ -105,7 +111,7 @@ def main():
             f'title = "akita macOS 26.5 Recovery {identity[:8]}"\ntype = "xnu"\n'
             f'path = "Payloads/kernel.macho"\nargs = "{args.boot_args}"\n')
         content = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file())
-        mib = (content >> 20) + 6
+        mib = (content >> 20) + 3   # the akita ABL hangs on a kernel field much over ~76 MiB: keep the FAT slack small
         fat = work / 'payload.fat'
         subprocess.run(['mformat', '-C', '-F', '-T', str(mib * 2048), '-v', 'AKITAMAC',
                         '-N', '414b4d26', '-i', fat, '::'], check=True)

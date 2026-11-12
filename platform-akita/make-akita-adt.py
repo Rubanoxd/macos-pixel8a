@@ -29,7 +29,7 @@ ARMIO_SIZE = 0x10000000
 GIC_DIST = 0x10400000
 GIC_DIST_SIZE = 0x10000
 GIC_REDIST = 0x10440000
-GIC_REDIST_SIZE = 0x100000
+GIC_REDIST_SIZE = 0x120000   # nine cores x 0x20000 (zuma.dtsi)
 GIC_REDIST_STRIDE = 0x20000
 TIMEBASE = 24576000
 UFS_HC = 0x13200000
@@ -130,9 +130,9 @@ def main():
         cpu_regs = [int(value, 0) for value in args.cpu_regs.split(',')]
     except ValueError:
         parser.error('--cpu-regs must be integers')
-    if (not cpu_regs or cpu_regs[0] != 0 or len(set(cpu_regs)) != len(cpu_regs) or len(cpu_regs) > 8
+    if (not cpu_regs or cpu_regs[0] != 0 or len(set(cpu_regs)) != len(cpu_regs) or len(cpu_regs) > 9
             or any(reg < 0 or reg > 0xffff or reg & 0xff for reg in cpu_regs)):
-        parser.error('--cpu-regs: up to eight distinct Affinity1-numbered cores, boot CPU 0 first')
+        parser.error('--cpu-regs: up to nine distinct Affinity1-numbered cores, boot CPU 0 first')
     compatibles = args.cpu_compatible or ['arm,cortex-a715'] * len(cpu_regs)
     if len(compatibles) != len(cpu_regs):
         parser.error('--cpu-compatible must describe every listed CPU')

@@ -1,0 +1,149 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -23,6 +23,13 @@
+ 
+ extern "C" task_t kernel_task;
+ 
++// akita (Generated-by: LLM): the GPU driver's fence for the display (Mali.cpp): which of the render server's jobs are still running,
++// and whether they are done. Neither call blocks.
++extern "C" int mali_fence_available(void);
++extern "C" int mali_fence_take(uint64_t *entries, unsigned cap);
++extern "C" int mali_fence_done(const uint64_t *entries, unsigned count);
++extern "C" void mali_fence_describe(const uint64_t *entries, unsigned count);
++
+ // IOMobileFramebufferLegacy (instance 0x1af8)
+ static constexpr size_t kCurrentSwap = 6032;       // the swap being programmed (swap_begin_gated 0x...dba5c, clean_queue_gated)
+ static constexpr size_t kSwapQueueFirst = 6040;    // TAILQ head of the pending swaps
+@@ -121,6 +128,8 @@
+ 
+     bool clean_queue_gated();
+     void program_hardware_gated();
++    bool fenceBegin_gated();
++    bool fenceClear_gated();
+     void copySurface(IOSurface *);
+     bool createDisplayAttributes();
+     static void vblFired(OSObject *, IOTimerEventSource *);
+@@ -169,6 +178,15 @@
+     // copy it again every ~100 ms for 5 s after each swap; the per-surface shadow writes only the pixels that changed.
+     IOSurface *fLastSurface = nullptr;
+     uint64_t fRecopyUntil = 0;
++    // akita (Generated-by: LLM): the compositor swaps a surface as soon as its GPU work is queued, not finished. With the fence
++    // (native-gop-fence=0 turns it off) a swap is copied to the panel only once the render server's jobs that were running when
++    // it came up are done: the swap stays the current one and is looked at again every 500 us, for 250 ms at most.
++    static constexpr unsigned kFenceCap = 16;
++    bool fFenceOn = false, fFenceHeld = false, fFenceRetake = false, fFenceWaited = false;
++    uint64_t fFenceEntries[3 * kFenceCap]{};
++    unsigned fFenceCount = 0;
++    uint64_t fFenceStart = 0;
++    uint64_t fFenceWaits = 0, fFenceWaitUs = 0, fFenceMaxUs = 0, fFenceGaveUp = 0, fFenceUnfenced = 0, fFenceReported = 0;
+ };
+ 
+ OSDefineMetaClassAndStructors(NativeGOPDisplay, IOMobileFramebufferLegacy)
+@@ -220,7 +238,10 @@
+         OSSafeReleaseNULL(fScanoutMap);
+         return false;
+     }
+-    IOLog("NativeGOPDisplay: started, display %ux%u\n", display_width(), display_height());
++    unsigned fence = 1;
++    PE_parse_boot_argn("native-gop-fence", &fence, sizeof(fence));
++    fFenceOn = fence != 0;
++    IOLog("NativeGOPDisplay: started, display %ux%u, GPU fence %s\n", display_width(), display_height(), fFenceOn ? "on" : "off");
+     return true;
+ }
+ 
+@@ -307,6 +328,13 @@
+     if (!fVBL)
+         return kIOReturnNotReady;
+     fVBL->cancelTimeout();
++    if (fFenceHeld) {   // akita: the current swap is waiting for the GPU
++        if (!fenceClear_gated())
++            return fVBL->setTimeoutUS(500);
++        fFenceHeld = false;
++        if (at<IOMFBSwapIORequest *>(this, kCurrentSwap))   // (the family may have taken it back meanwhile)
++            program_hardware_gated();
++    }
+     while (clean_queue_gated()) {
+         IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kSwapQueueFirst);
+         at<IOMFBSwapIORequest *>(this, kCurrentSwap) = swap;
+@@ -319,6 +347,10 @@
+             at<IOMFBSwapIORequest **>(this, kSwapQueueLast) = prev;
+         *prev = next;
+         if ((at<uint32_t>(swap, kSwapDropReasons) & ~8u) == 0) {
++            if (fFenceOn && !fenceBegin_gated()) {   // akita: its GPU work is still running: come back for it
++                fFenceHeld = true;
++                return fVBL->setTimeoutUS(500);
++            }
+             program_hardware_gated();
+         } else {
+             dropSwap_gated(swap, false);
+@@ -334,9 +366,70 @@
+         IOLog("NativeGOPDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu lit centre %#llx\n",
+               fSubmitted, fFrames, fDropped, fStalled, at<IOMFBSwapIORequest *>(this, kCurrentSwap), fLastLit, fLastCenter);
+     }
++    if (fFenceWaits + fFenceGaveUp + fFenceUnfenced != fFenceReported && fTicks % 625 == 0) {   // akita: about every 10 s while it changes
++        fFenceReported = fFenceWaits + fFenceGaveUp + fFenceUnfenced;
++        IOLog("NativeGOPDisplay: GPU fence: %llu swaps waited (mean %llu us, longest %llu us), %llu gave up, %llu shown without one (driver busy)\n",
++              fFenceWaits, fFenceWaits ? fFenceWaitUs / fFenceWaits : 0, fFenceMaxUs, fFenceGaveUp, fFenceUnfenced);
++    }
+     return fVBL->setTimeoutMS(16);
+ }
+ 
++// akita (Generated-by: LLM): take the fence for the swap that just became the current one. True: nothing to wait for.
++bool NativeGOPDisplay::fenceBegin_gated()
++{
++    fFenceCount = 0;
++    fFenceRetake = fFenceWaited = false;
++    if (!mali_fence_available())
++        return true;
++    fFenceStart = mach_absolute_time();
++    int taken = mali_fence_take(fFenceEntries, kFenceCap);
++    if (taken == -1)
++        fFenceRetake = true;   // a call is in the driver: ask again in a moment
++    else
++        fFenceCount = taken < 0 ? ~0u : static_cast<unsigned>(taken);
++    return fenceClear_gated();
++}
++
++// True once the fence taken for the current swap is done, or it is given up on.
++bool NativeGOPDisplay::fenceClear_gated()
++{
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(mach_absolute_time() - fFenceStart, &ns);
++    if (fFenceRetake) {
++        int taken = mali_fence_take(fFenceEntries, kFenceCap);
++        if (taken == -1) {
++            if (ns < 8000000ULL) {
++                fFenceWaited = true;
++                return false;
++            }
++            fFenceRetake = false;   // the driver stayed busy for 8 ms: show the frame as it is (the late recopy picks up the rest)
++            fFenceUnfenced++;
++            return true;
++        }
++        fFenceRetake = false;
++        fFenceCount = taken < 0 ? ~0u : static_cast<unsigned>(taken);
++    }
++    if (fFenceCount) {
++        int done = mali_fence_done(fFenceEntries, fFenceCount);
++        if (done != 1 && ns < 250000000ULL) {
++            fFenceWaited = true;
++            return false;
++        }
++        if (done != 1) {
++            fFenceGaveUp++;
++            mali_fence_describe(fFenceEntries, fFenceCount);
++        }
++        fFenceCount = 0;
++    }
++    if (fFenceWaited) {
++        fFenceWaits++;
++        fFenceWaitUs += ns / 1000;
++        if (ns / 1000 > fFenceMaxUs)
++            fFenceMaxUs = ns / 1000;
++    }
++    return true;
++}
++
+ // Diagnostic: CoreAnimation asks swap_wait, without blocking, whether its last swaps are done before it composes the next frame
+ // (IOMFBDisplay::can_update_); after three swaps WindowServer found the display unready for good.
+ IOReturn NativeGOPDisplay::swap_wait(IOMobileFramebufferUserClient *client, unsigned int swapID, unsigned int options, unsigned int timeout)

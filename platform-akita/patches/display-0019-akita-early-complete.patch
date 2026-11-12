@@ -1,0 +1,119 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -197,6 +197,15 @@
+     // it came up are done: the swap stays the current one and is looked at again every 500 us, for 250 ms at most.
+     static constexpr unsigned kFenceCap = 16;
+     bool fFenceOn = false, fFenceHeld = false, fFenceRetake = false, fFenceWaited = false;
++    // akita (Generated-by: LLM): early completion (native-gop-early=0 turns it off). CoreAnimation composes the next frame only once
++    // the display completed its last swap, and the swap used to complete after its GPU work and the copy (5-20 ms): CPU, GPU and copy
++    // ran one after the other. Now a swap completes when it is taken; its surface (retained) waits in fPending for its GPU work and
++    // is copied then. CoreAnimation reuses that surface only after the next swap completes, which is taken after this copy.
++    // A newer swap taken while one still waits replaces it (the older frame is not shown).
++    bool fEarlyOn = false, fEarlyDefer = false;
++    IOSurface *fPending = nullptr;
++    uint64_t fEarlyDropped = 0;
++    void pendingCopy_gated();
+     uint64_t fFenceEntries[3 * kFenceCap]{};
+     unsigned fFenceCount = 0;
+     uint64_t fFenceStart = 0;
+@@ -302,13 +311,21 @@
+     unsigned fence = 1;
+     PE_parse_boot_argn("native-gop-fence", &fence, sizeof(fence));
+     fFenceOn = fence != 0;
+-    IOLog("NativeGOPDisplay: started, display %ux%u, GPU fence %s\n", display_width(), display_height(), fFenceOn ? "on" : "off");
++    unsigned early = 1;   // akita: early completion needs the fence (the copy waits for the GPU)
++    PE_parse_boot_argn("native-gop-early", &early, sizeof(early));
++    fEarlyOn = early != 0 && fFenceOn;
++    IOLog("NativeGOPDisplay: started, display %ux%u, GPU fence %s, early completion %s\n", display_width(), display_height(),
++          fFenceOn ? "on" : "off", fEarlyOn ? "on" : "off");
+     return true;
+ }
+ 
+ void NativeGOPDisplay::stop(IOService *provider)
+ {
+     IOMobileFramebufferLegacy::stop(provider);
++    if (fPending) {   // akita
++        reinterpret_cast<OSObject *>(fPending)->release();
++        fPending = nullptr;
++    }
+     if (fLastSurface) {
+         reinterpret_cast<OSObject *>(fLastSurface)->release();
+         fLastSurface = nullptr;
+@@ -399,6 +416,10 @@
+     if (!fVBL)
+         return kIOReturnNotReady;
+     fVBL->cancelTimeout();
++    if (fPending && fenceClear_gated()) {   // akita: early completion: the waiting copy's GPU work is done
++        timelineMark('G');
++        pendingCopy_gated();
++    }
+     if (fFenceHeld) {   // akita: the current swap is waiting for the GPU
+         if (!fenceClear_gated())
+             return fVBL->setTimeoutUS(500);
+@@ -419,7 +440,15 @@
+             at<IOMFBSwapIORequest **>(this, kSwapQueueLast) = prev;
+         *prev = next;
+         timelineMark('T');
+-        if ((at<uint32_t>(swap, kSwapDropReasons) & ~8u) == 0) {
++        if ((at<uint32_t>(swap, kSwapDropReasons) & ~8u) == 0 && fEarlyOn) {   // akita: complete it now, copy it later
++            fEarlyDefer = true;
++            program_hardware_gated();
++            fEarlyDefer = false;
++            if (fPending && fenceBegin_gated()) {
++                timelineMark('G');
++                pendingCopy_gated();
++            }
++        } else if ((at<uint32_t>(swap, kSwapDropReasons) & ~8u) == 0) {
+             if (fFenceOn && !fenceBegin_gated()) {   // akita: its GPU work is still running: come back for it
+                 fFenceHeld = true;
+                 return fVBL->setTimeoutUS(500);
+@@ -442,10 +471,30 @@
+     }
+     if (fFenceWaits + fFenceGaveUp + fFenceUnfenced != fFenceReported && fTicks % 625 == 0) {   // akita: about every 10 s while it changes
+         fFenceReported = fFenceWaits + fFenceGaveUp + fFenceUnfenced;
+-        IOLog("NativeGOPDisplay: GPU fence: %llu swaps waited (mean %llu us, longest %llu us), %llu gave up, %llu shown without one (driver busy)\n",
+-              fFenceWaits, fFenceWaits ? fFenceWaitUs / fFenceWaits : 0, fFenceMaxUs, fFenceGaveUp, fFenceUnfenced);
++        IOLog("NativeGOPDisplay: GPU fence: %llu swaps waited (mean %llu us, longest %llu us), %llu gave up, %llu shown without one (driver busy), %llu replaced before their copy\n",
++              fFenceWaits, fFenceWaits ? fFenceWaitUs / fFenceWaits : 0, fFenceMaxUs, fFenceGaveUp, fFenceUnfenced, fEarlyDropped);
+     }
+-    return fVBL->setTimeoutMS(16);
++    return fPending ? fVBL->setTimeoutUS(500) : fVBL->setTimeoutMS(16);   // akita: a copy waits for its GPU work
++}
++
++// akita (Generated-by: LLM): early completion: copy the surface whose GPU work is done, and keep it as the last one shown.
++void NativeGOPDisplay::pendingCopy_gated()
++{
++    IOSurface *surface = fPending;
++    fPending = nullptr;
++    if (!surface)
++        return;
++    fpsCopy(surface);
++    fFpsFrames++;
++    if (fLastSurface != surface) {
++        reinterpret_cast<OSObject *>(surface)->retain();
++        if (fLastSurface)
++            reinterpret_cast<OSObject *>(fLastSurface)->release();
++        fLastSurface = surface;
++    }
++    reinterpret_cast<OSObject *>(surface)->release();
++    fRecopyUntil = fTicks + 312;
++    timelineMark('P');
+ }
+ 
+ // akita (Generated-by: LLM): a copy to the panel, timed.
+@@ -647,7 +696,14 @@
+                       words[row * 8 + 4], words[row * 8 + 5], words[row * 8 + 6], words[row * 8 + 7]);
+         }
+     }
+-    if (selected >= 0) {
++    if (selected >= 0 && fEarlyDefer) {   // akita: early completion: the copy waits for the surface's GPU work
++        reinterpret_cast<OSObject *>(surfaces[selected])->retain();
++        if (fPending) {
++            reinterpret_cast<OSObject *>(fPending)->release();
++            fEarlyDropped++;
++        }
++        fPending = surfaces[selected];
++    } else if (selected >= 0) {
+         fpsCopy(surfaces[selected]);
+         fFpsFrames++;
+         if (fLastSurface != surfaces[selected]) {

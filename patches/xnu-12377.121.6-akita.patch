@@ -153,7 +153,7 @@ index 604f16a..b8b34e4 100644
  STARTUP(TUNABLES, STARTUP_RANK_FIRST, csr_bootstrap);
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24..1c672fe 100644
+index 2467b24..d441b61 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -2738,6 +2738,10 @@ cleanup_rosetta_fp:
@@ -167,7 +167,7 @@ index 2467b24..1c672fe 100644
  
  #if CONFIG_SECLUDED_MEMORY
  	if (secluded_for_apps &&
-@@ -8065,6 +8069,821 @@ static const char * init_programs[] = {
+@@ -8065,6 +8069,823 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
@@ -393,6 +393,8 @@ index 2467b24..1c672fe 100644
 +    /* MiniLauncher treats this RAM-made account as new at every boot and runs MiniBuddy unless ~/.skipbuddy exists */
 +    "/usr/bin/touch $H/.skipbuddy && /usr/sbin/chown 501:20 $H/.skipbuddy\n"
 +    "/usr/bin/touch /private/var/db/.AppleSetupDone\n"
++    /* akita: the Wi-Fi interface (AkitaPcie.inc, akita-wifi=1) appears a minute or two after boot: ask for an address by DHCP then */
++    "( i=0; while [ $i -lt 300 ]; do /sbin/ifconfig en1 > /dev/null 2>&1 && { /usr/sbin/ipconfig set en1 DHCP; echo 'AKITA rc.server: en1 set to DHCP' > /dev/console; break; }; i=$((i+1)); sleep 2; done ) &\n"
 +    "echo \"AKITA rc.server: done (etc=$(ls /private/etc | wc -l) var=$(ls /private/var | wc -l) ld=$(ls /System/Library/LaunchDaemons | wc -l) user=$(id -u akita 2>&1))\" > /dev/console\n"
 +    "exit 0\n";
 +
@@ -989,7 +991,7 @@ index 2467b24..1c672fe 100644
  void
  load_init_program(proc_t p)
  {
-@@ -8074,6 +8893,24 @@ load_init_program(proc_t p)
+@@ -8074,6 +8895,24 @@ load_init_program(proc_t p)
  	mach_vm_offset_t scratch_addr = 0;
  	mach_vm_size_t map_page_size = vm_map_page_size(map);
  
@@ -1014,7 +1016,7 @@ index 2467b24..1c672fe 100644
  #if DEVELOPMENT || DEBUG
  	/* Use the opportunity to initialize exec's debug log stream */
  	exec_log_handle = os_log_create("com.apple.xnu.bsd", "exec");
-@@ -8081,6 +8918,9 @@ load_init_program(proc_t p)
+@@ -8081,6 +8920,9 @@ load_init_program(proc_t p)
  
  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
  	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
@@ -1024,7 +1026,7 @@ index 2467b24..1c672fe 100644
  #if CONFIG_MEMORYSTATUS
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
-@@ -8127,7 +8967,14 @@ load_init_program(proc_t p)
+@@ -8127,7 +8969,14 @@ load_init_program(proc_t p)
  		}
  	}
  

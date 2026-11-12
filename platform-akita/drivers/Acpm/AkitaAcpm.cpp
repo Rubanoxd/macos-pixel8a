@@ -15,7 +15,8 @@
 // table at SRAM + 0xa000; the DVFS client is channel 0 (exynos_cal_if: acpm-ipc-channel = <0>), the thermal one channel 9 (acpm_tmu).
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
-#include <IOKit/IOBufferMemoryDescriptor.h>   // akita: AkitaPcie.inc host rings
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/IOPlatformExpert.h>   // akita: kIOPlatformUUIDKey   // akita: AkitaPcie.inc host rings
 #include <kern/thread_call.h>
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
@@ -345,6 +346,7 @@ namespace touch { void startLive(); }   // akita: AkitaTouch.inc, included below
 extern "C" int akita_acpm_rtc_seconds(uint64_t *seconds);   // akita: the PMIC RTC, at the end of this file
 extern "C" int akita_acpm_rtc_write(uint64_t seconds);
 extern "C" void akita_acpm_boot_profile(void);
+extern "C" void akita_wifi_boot(void);   // akita: AkitaPcie.inc
 extern "C" void akita_acpm_boot_profile(void) {
   unsigned allowed = 0, profile = 0;
   PE_parse_boot_argn("akita-acpm", &allowed, sizeof allowed);
@@ -362,6 +364,7 @@ extern "C" void akita_acpm_boot_profile(void) {
       printf("touch: live driver in 20 s (akita-touch=1)\n");
     }
   }
+  if (allowed) akita_wifi_boot();   // akita: the Wi-Fi (AkitaPcie.inc), boot-arg akita-wifi=1
   if (!allowed || profile != 1 || gProfileCall) return;
   if (!gAcpmLock) gAcpmLock = IOLockAlloc();
   if (!gAcpmLock) return;

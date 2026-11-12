@@ -635,6 +635,8 @@ int console() {
 
 // ---- Stage 21 (after 8): CLM blob, events, up, escan; the networks found go to the log ----
 uint16_t gTrans = 2;
+bool gNoScan;
+extern IOLock *gTxLock;
 bool gLinkUp, gKeyed;
 void onLink();
 unsigned gScanSeen;
@@ -704,10 +706,15 @@ int ioctl(uint32_t cmd, uint8_t *data, uint32_t len, uint32_t outMax) {
   memcpy(m + 8, &cmd, 4); const uint16_t tid = gTrans++, inlen = static_cast<uint16_t>(len), olen = static_cast<uint16_t>(outMax > len ? outMax : len);
   memcpy(m + 12, &tid, 2); memcpy(m + 14, &inlen, 2); memcpy(m + 16, &olen, 2);
   putAddr(m + 24, gDma.pa + kIoctlReq);
-  if (!h2dPush(0, m, 40)) return -100;
+  if (gTxLock) IOLockLock(gTxLock);   // the polling thread (stage 23) also drains the control ring
+  const bool pushed = h2dPush(0, m, 40);
+  if (gTxLock) IOLockUnlock(gTxLock);
+  if (!pushed) return -100;
   for (unsigned ms = 0; ms < 3000; ms += 2) {
     IOSleep(2);
+    if (gTxLock) IOLockLock(gTxLock);
     const int r = drain(data, outMax);
+    if (gTxLock) IOLockUnlock(gTxLock);
     if (r >= 0) return 0;
     if (r < -1) return r;
   }
@@ -739,8 +746,19 @@ int wifiScan() {
   printf("pcie: stage 21: CLM blob %d bytes loaded: %d (rx data offset %u)\n", clmLen, r, gRxOff);
   uint8_t mask[16]; memset(mask, 0xff, sizeof mask);
   printf("pcie: stage 21: event_msgs %d\n", iovarSet("event_msgs", mask, sizeof mask));
+  // a stable MAC address: the firmware makes a random one each boot; derive one from the platform UUID (locally administered)
+  IOService *pe = IOService::getPlatform();
+  OSObject *uo = pe ? pe->getProperty("IOPlatformUUID") : nullptr;
+  if (!uo && pe && pe->getProvider()) uo = pe->getProvider()->getProperty("IOPlatformUUID");   // IOPlatformExpertDevice
+  if (OSString *uuid = OSDynamicCast(OSString, uo)) {
+    uint32_t h = 2166136261u;
+    for (const char *c = uuid->getCStringNoCopy(); *c; ++c) h = (h ^ static_cast<uint8_t>(*c)) * 16777619u;
+    uint8_t mac[6] = {0x02, 0x8a, static_cast<uint8_t>(h >> 24), static_cast<uint8_t>(h >> 16), static_cast<uint8_t>(h >> 8), static_cast<uint8_t>(h)};
+    printf("pcie: stage 21: MAC from the platform UUID: %d\n", iovarSet("cur_etheraddr", mac, 6));
+  }
   uint8_t up[4] = {};
   printf("pcie: stage 21: up %d\n", ioctl(2, up, 4, 0));
+  if (gNoScan) return 0;
   // escan: the firmware refused version 1 (BCME_VERSION); try the params versions 4, 3, 2 (wlioctl.h wl_scan_params_v2..v4)
   gScanSeen = 0;
   int er = -1;
@@ -764,6 +782,8 @@ int wifiScan() {
 
 // ---- Stage 22: join a WPA2-PSK network with the firmware's own supplicant (sup_wpa). The network comes from
 // /Users/akita/.akita/wifi/network.conf, written by the user: "ssid=<name>" and "psk=<passphrase>" lines. ----
+extern bool gPolling;
+void onLink();
 int wifiJoin() {
   if (!gDma.va) { printf("pcie: stage 22: run stages 8 and 21 first\n"); return 1; }
   char conf[512] = {};
@@ -798,7 +818,12 @@ int wifiJoin() {
   const uint32_t sl = static_cast<uint32_t>(slen); memcpy(ss, &sl, 4); memcpy(ss + 4, ssid, slen);
   int r7 = ioctl(26, ss, sizeof ss, 0);      // WLC_SET_SSID: start the join
   printf("pcie: stage 22: infra %d auth %d wsec %d wpa_auth %d sup_wpa %d pmk %d join %d\n", r1, r2, r3, r4, r5, r6, r7);
-  for (unsigned ms = 0; ms < 20000 && !(gLinkUp && gKeyed); ms += 10) { IOSleep(10); drain(nullptr, 0); }
+  for (unsigned ms = 0; ms < 20000 && !(gLinkUp && gKeyed); ms += 10) {
+    IOSleep(10);
+    if (gPolling) continue;   // the polling thread sees the events
+    drain(nullptr, 0);
+  }
+  onLink();
   printf("pcie: stage 22: link %s, keys %s\n", gLinkUp ? "up" : "down", gKeyed ? "installed" : "not installed");
   return gLinkUp && gKeyed ? 0 : 1;
 }
@@ -809,10 +834,10 @@ Ring gFlow;
 uint16_t gFlowId = 2;
 uint8_t gMac[6];
 ifnet_t gIf;
-IOLock *gTxLock;
+IOLock *gTxLock = nullptr;
 uint32_t gTxNext;
 uint64_t gRxPkts, gTxPkts, gTxDrops;
-bool gFlowUp, gPolling;
+bool gFlowUp; bool gPolling;
 void postRx(uint32_t i) {
   uint8_t m[32] = {};
   m[0] = 0x11; const uint32_t id = 0x3000 + i; memcpy(m + 4, &id, 4);
@@ -963,6 +988,30 @@ int dataPath() {
          gMac[0], gMac[1], gMac[2], gMac[3], gMac[4], gMac[5], gFlowUp ? "up" : "refused", gLinkUp ? "up" : "down", gPolling);
   return gIf ? 0 : 1;
 }
+
+// ---- Boot: boot-arg akita-wifi=1 runs every stage by itself once the home volume (the firmware files) is mounted. ----
+void wifiBootThread(void *, wait_result_t) {
+  IOSleep(60000);
+  uint8_t probe[16];
+  for (unsigned i = 0; i < 150 && readFile("/Users/akita/.akita/wifi/nvram.txt", probe, sizeof probe) <= 0; ++i) IOSleep(2000);
+  int r = bringUp();
+  if (r == 0) r = backplane();
+  if (r == 0) r = enumerate();
+  if (r == 0) r = download();
+  if (r == 0) r = msgbuf();
+  if (r == 0) { gNoScan = true; r = wifiScan(); }
+  if (r == 0) { const int j = wifiJoin(); printf("pcie: boot: join %d\n", j); r = dataPath(); }
+  printf("pcie: boot: Wi-Fi %s\n", r == 0 ? "up" : "failed");
+}
+}  // namespace pcie
+extern "C" void akita_wifi_boot(void) {
+  unsigned on = 0;
+  PE_parse_boot_argn("akita-wifi", &on, sizeof on);
+  if (on != 1) return;
+  thread_t t = nullptr;
+  if (kernel_thread_start(pcie::wifiBootThread, nullptr, &t) == KERN_SUCCESS) { thread_deallocate(t); printf("pcie: Wi-Fi starts in 60 s (akita-wifi=1)\n"); }
+}
+namespace pcie {
 
 int command(unsigned stage) {
   if (stage == 1) {

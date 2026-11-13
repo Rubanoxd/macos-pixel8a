@@ -23,5 +23,7 @@ Also from this round:
 - **WindowServer's shader cache now persists.** `/private/var/folders` is on a third APFS volume, "Folders", in the
   persistent container. Before, it lived on the RAM Data side and was emptied every boot, together with WindowServer's m2v
   pipeline cache: 33 s of pipeline compiles each boot, including single 13 s stalls ("cache hit 0").
+  Measured on the next boot (fullos250): WindowServer compiled its 98 pipelines in **154 ms** in total, against 33 s
+  before; the longest took 7 ms, against 13 s. The cache answered 94 times.
 - **Three daemons that respawned in a loop are disabled:** coresymbolicationd (64 restarts in 15 minutes), routined (50)
   and intelligenceplatformd (35, exit 9).

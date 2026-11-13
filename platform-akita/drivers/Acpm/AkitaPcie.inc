@@ -990,7 +990,7 @@ errno_t wifiOutput(ifnet_t ifp, mbuf_t mb) {
   mbuf_freem(mb);
   return 0;
 }
-errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *) {
+errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
   if (cmd == SIOCSIFADDR) { ifnet_set_flags(ifp, IFF_UP, IFF_UP); return 0; }
   if (cmd == SIOCSIFFLAGS && !(ifnet_flags(ifp) & IFF_UP)) {   // akita (Generated-by: LLM): who takes en1 down (fullos227/228)
     char who[32] = {}; proc_selfname(who, sizeof who);
@@ -998,11 +998,30 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *) {
   }
   if (cmd == SIOCSIFFLAGS) { ifnet_set_flags(ifp, (ifnet_flags(ifp) & IFF_UP) ? IFF_RUNNING : 0, IFF_RUNNING); return 0; }
   if (cmd == SIOCADDMULTI || cmd == SIOCDELMULTI) return 0;
+  // akita (Generated-by: LLM): the media state SystemConfiguration's KernelEventMonitor asks for (SIOCGIFMEDIA and
+  // SIOCGIFXMEDIA, in their 32/64-bit forms: same leading fields, only the trailing list pointer differs). Without it
+  // System Settings showed en1 "Not connected" (fullos268).
+  const unsigned long num = cmd & 0xffff;
+  if ((num == (('i' << 8) | 56) || num == (('i' << 8) | 72)) && data) {
+    struct MediaHead { char name[IFNAMSIZ]; int current, mask, status, active, count; };
+    MediaHead *m = static_cast<MediaHead *>(data);
+    m->current = m->active = IFM_ETHER | IFM_AUTO;
+    m->mask = 0;
+    m->status = IFM_AVALID | (gLinkUp ? IFM_ACTIVE : 0);
+    m->count = 0;
+    return 0;
+  }
   return EOPNOTSUPP;
 }
 void wifiDetach(ifnet_t) {}
 void onLink() {
   if (gIf) ifnet_set_flags(gIf, gLinkUp ? (IFF_UP | IFF_RUNNING) : IFF_UP, IFF_UP | IFF_RUNNING);
+  // akita (Generated-by: LLM): tell SystemConfiguration when the link comes and goes (KEV_DL_LINK_ON/OFF)
+  static int reported = -1;
+  if (gIf && reported != (gLinkUp ? 1 : 0)) {
+    reported = gLinkUp ? 1 : 0;
+    dlil_post_msg(reinterpret_cast<struct ifnet *>(gIf), KEV_DL_SUBCLASS, gLinkUp ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, nullptr, 0, FALSE);
+  }
 }
 // ---- akita (Generated-by: LLM): control channel over Wi-Fi, the same idea as AkitaUsbGadget.h's (5140/5141) for when the
 // USB-C port holds a dongle. Built and parsed here, beside the BSD stack, so it works while userland is wedged.
@@ -1405,7 +1424,7 @@ int dataPath() {
       ifnet_set_addrlen(gIf, 6); ifnet_set_baudrate(gIf, 600000000); ifnet_set_mtu(gIf, ETHERMTU);
       ifnet_set_flags(gIf, IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
       ifnet_set_hdrlen(gIf, 14); ifnet_set_offload(gIf, 0);
-      if (ifnet_attach(gIf, nullptr) == 0) { ifnet_set_lladdr(gIf, gMac, 6); bpfattach(gIf, DLT_EN10MB, 14); } else { ifnet_release(gIf); gIf = nullptr; }
+      if (ifnet_attach(gIf, nullptr) == 0) { ifnet_set_lladdr(gIf, gMac, 6); bpfattach(gIf, DLT_EN10MB, 14); netif::publish(gMac, 1); } else { ifnet_release(gIf); gIf = nullptr; }
     }
   }
   onLink();

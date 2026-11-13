@@ -45,7 +45,7 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **USB host**: keyboard and mouse through a USB-C hub (our xHCI driver, HID boot protocol) | ✅ plug the hub in and they work in ~20 s (the PD engine starts by itself once the Mac link is gone); mouse cursor drawn; scrolling works; low-speed devices pending; going back to the Mac's USB needs a reboot |
 | Stability: hour-long soaks with Wi-Fi/USB checks, 10-minute drag test, critical memory pressure (13.8 GB swap) | ✅ (the "hangs" after 1 h were the watchdog boot-arg `akita-wdt-pet-seconds=3600`: now pets for good) |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
-| Wi-Fi (BCM4383 on PCIe): **joins WPA2 at boot, DHCP, internet (DNS, HTTPS)**; kernel log, shell and fastboot reset over Wi-Fi; no Wi-Fi menu yet (`en1` is not an IOKit interface) | ✅ works, `docs/wifi-bringup.md` |
+| Wi-Fi (BCM4383 on PCIe): **joins WPA2 at boot, DHCP, internet (DNS, HTTPS)**; kernel log, shell and fastboot reset over Wi-Fi; `en1` now listed in System Settings > Network (published in IOKit as an Ethernet-type interface); no Wi-Fi menu yet | ✅ works, `docs/wifi-bringup.md` |
 | USB-C: Power Delivery and DisplayPort alternate mode (MAX77759 TCPC) | ✅ PD contract, host role, DP mode configured with a USB-C HDMI hub; video output next, see `docs/research-hdmi-usbc.md` |
 
 More photos in [`photos/`](photos/).

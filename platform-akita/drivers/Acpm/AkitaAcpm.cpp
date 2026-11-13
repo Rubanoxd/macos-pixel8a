@@ -416,6 +416,10 @@ extern "C" {   // akita: bpf.h has no extern "C" of its own
 #include <sys/vnode.h>   // akita: AkitaPcie.inc reads the Wi-Fi firmware
 #include <sys/fcntl.h>
 #include <sys/random.h>
+#include <net/if_media.h>
+#include <sys/kern_event.h>
+extern "C" int dlil_post_msg(struct ifnet *, u_int32_t, u_int32_t, struct net_event_data *, u_int32_t, boolean_t);   // akita: link events (AkitaPcie.inc)
+#include "AkitaNetIf.inc"   // akita: en1 described in IOKit for SystemConfiguration (before AkitaPcie.inc, which publishes it)
 #include "AkitaPcie.inc"    // akita: the Wi-Fi PCIe link, staged look (kern.akita_acpm = 4000000 + stage)
 #include "AkitaI2c.inc"     // akita: HSI2C 11, the MAX77759 bus (kern.akita_acpm = 5000000 + stage), read-only towards the chips
 #include "AkitaTypec.inc"   // akita: USB Power Delivery on the MAX77759 TCPC (kern.akita_acpm = 5000010.., see the file)

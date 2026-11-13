@@ -153,7 +153,7 @@ index 604f16a..b8b34e4 100644
  STARTUP(TUNABLES, STARTUP_RANK_FIRST, csr_bootstrap);
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24..57afb03 100644
+index 2467b24..382e161 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -2738,6 +2738,10 @@ cleanup_rosetta_fp:
@@ -167,7 +167,7 @@ index 2467b24..57afb03 100644
  
  #if CONFIG_SECLUDED_MEMORY
  	if (secluded_for_apps &&
-@@ -8065,6 +8069,846 @@ static const char * init_programs[] = {
+@@ -8065,6 +8069,848 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
@@ -208,24 +208,26 @@ index 2467b24..57afb03 100644
 +	return 0;
 +}
 +
++/* akita (Generated-by: LLM): ms of the ARM counter (not reset by the firmware chain), to time the boot */
++#define AKITA_MS() ((unsigned long)(__builtin_arm_rsr64("CNTPCT_EL0") / (__builtin_arm_rsr64("CNTFRQ_EL0") / 1000)))
 +static void
 +akita_fullos_ensure_tmpfs(void)
 +{
 +	if (akita_fullos_has_vfs("tmpfs")) {
-+		printf("AKITA FULLOS: tmpfs VFS already registered\n");
++		printf("AKITA FULLOS [+%lu ms]: tmpfs VFS already registered\n", AKITA_MS());
 +		return;
 +	}
-+	printf("AKITA FULLOS: tmpfs VFS not registered, loading kext...\n");
++	printf("AKITA FULLOS [+%lu ms]: tmpfs VFS not registered, loading kext...\n", AKITA_MS());
 +	kern_return_t kr = OSKextLoadKextWithIdentifier("com.apple.filesystems.tmpfs");
-+	printf("AKITA FULLOS: OSKextLoadKextWithIdentifier(tmpfs) = %d\n", kr);
++	printf("AKITA FULLOS [+%lu ms]: OSKextLoadKextWithIdentifier(tmpfs) = %d\n", AKITA_MS(), kr);
 +	if (akita_fullos_has_vfs("tmpfs")) {
-+		printf("AKITA FULLOS: tmpfs VFS now registered\n");
++		printf("AKITA FULLOS [+%lu ms]: tmpfs VFS now registered\n", AKITA_MS());
 +	} else {
-+		printf("AKITA FULLOS: tmpfs still NOT registered, listing VFS types:\n");
++		printf("AKITA FULLOS [+%lu ms]: tmpfs still NOT registered, listing VFS types:\n", AKITA_MS());
 +		struct vfstable *vfc;
 +		mount_list_lock();
 +		for (vfc = vfsconf; vfc; vfc = vfc->vfc_next) {
-+			printf("AKITA FULLOS:   vfs: %s (typenum %d)\n", vfc->vfc_name, vfc->vfc_typenum);
++			printf("AKITA FULLOS [+%lu ms]:   vfs: %s (typenum %d)\n", AKITA_MS(), vfc->vfc_name, vfc->vfc_typenum);
 +		}
 +		mount_list_unlock();
 +	}
@@ -297,7 +299,7 @@ index 2467b24..57afb03 100644
 +	const char *dir = "/System/Library/dyld";
 +	if (err) {
 +		/* no dyld directory on the system volume: union a tmpfs over /System/Library and make it */
-+		printf("AKITA FULLOS: tmpfs on /System/Library/dyld => %d, trying /System/Library\n", err);
++		printf("AKITA FULLOS [+%lu ms]: tmpfs on /System/Library/dyld => %d, trying /System/Library\n", AKITA_MS(), err);
 +		err = akita_fullos_mount(p, scratch, "tmpfs", "/System/Library", args, sizeof(args), MNT_UNION);
 +		if (err == 0) {
 +			err = akita_fullos_mkdir(p, scratch, dir);
@@ -315,7 +317,7 @@ index 2467b24..57afb03 100644
 +			last = e;
 +		}
 +	}
-+	printf("AKITA FULLOS: dyld links %d (last err %d, mount err %d)\n", linked, last, err);
++	printf("AKITA FULLOS [+%lu ms]: dyld links %d (last err %d, mount err %d)\n", AKITA_MS(), linked, last, err);
 +	return err ? err : (linked ? 0 : last);
 +}
 +
@@ -426,7 +428,7 @@ index 2467b24..57afb03 100644
 +/* the boot-time loginwindow skips autologin (it starts before the session can be built); restarting it once does the login */
 +/* The autologin daemon also disables services that crash-loop here (no grafted cryptexes, no push, no hardware watchdog
 + * daemon) and burn CPU and corpses; rc.server is too early for launchctl. */
-+static const char akita_fullos_autologin_plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>com.akita.autologin</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>( n=0; while :; do /sbin/ifconfig en1 &gt; /dev/null 2&gt;&amp;1 &amp;&amp; ! /sbin/ifconfig en1 | /usr/bin/head -1 | /usr/bin/grep -q \"&lt;UP\" &amp;&amp; { /sbin/ifconfig en1 up; echo AKITA net: en1 was down, up again &gt; /dev/console; }; r=$(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '$1 == \"169.254\" {print $4; exit}'); [ -n \"$r\" ] &amp;&amp; [ \"$r\" != en0 ] &amp;&amp; { /sbin/route -n change -net 169.254.0.0/16 -interface en0 &gt; /dev/null 2&gt;&amp;1; echo AKITA net: link-local route back to en0 from $r &gt; /dev/console; }; if /sbin/ifconfig en1 2&gt; /dev/null | /usr/bin/grep -q RUNNING &amp;&amp; [ -z \"$(/usr/sbin/ipconfig getifaddr en1)\" ]; then /usr/sbin/ipconfig set en1 DHCP; echo AKITA net: en1 up, DHCP asked &gt; /dev/console; sleep 20; fi; n=$((n+1)); if [ $((n % 6)) = 1 ]; then echo \"AKITA net: en1 $(/sbin/ifconfig en1 2&gt; /dev/null | /usr/bin/awk '/inet /{print $2}' | /usr/bin/tr '\\n' ' ')| routes $(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '$1 == \"default\" || $1 == \"169.254\" {print $1 \"/\" $2 \"/\" $4}' | /usr/bin/tr '\\n' ' ')| en0 $(/sbin/ifconfig en0 | /usr/bin/awk '/inet /{print $2}')\" &gt; /dev/console; fi; sleep 10; done ) &amp; for j in com.apple.security.xprotectd com.apple.watchdogd com.apple.apsd com.apple.endpointsecurity.endpointsecurityd com.apple.AppSSODaemon com.apple.PerfPowerServices com.apple.security.cryptexd com.apple.mobileactivationd com.apple.logd_helper com.apple.coresymbolicationd; do /bin/launchctl disable system/$j; /bin/launchctl bootout system/$j &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl disable gui/501/com.apple.duetexpertd; for j in com.apple.routined com.apple.intelligenceplatformd; do /bin/launchctl disable gui/501/$j; /bin/launchctl bootout gui/501/$j &gt; /dev/null 2&gt;&amp;1; done; echo AKITA autologin: crash-looping services disabled &gt; /dev/console; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 10; id akita &gt; /dev/null 2&gt;&amp;1 || continue; P=$(pgrep -x -u root loginwindow) || exit 0; /usr/bin/defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser akita; /usr/bin/touch /private/var/akita/.skipbuddy; /usr/sbin/chown 501:20 /private/var/akita/.skipbuddy; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $P; echo AKITA autologin: kicked loginwindow $P &gt; /dev/console; for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 20; /bin/launchctl print gui/501 &gt; /dev/null 2&gt;&amp;1 || continue; for g in com.apple.duetexpertd com.apple.imagent; do /bin/launchctl disable gui/501/$g; /bin/launchctl bootout gui/501/$g &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl print-disabled gui/501 | /usr/bin/grep -q duetexpertd &amp;&amp; { echo AKITA autologin: duetexpertd imagent disabled &gt; /dev/console; break; }; done; /usr/bin/pmset -a displaysleep 0 disksleep 0 sleep 0 &gt; /dev/null 2&gt;&amp;1; while :; do sleep 20; /usr/sbin/ioreg -n Root -d1 | /usr/bin/grep -q 'ScreenIsLocked\"=Yes' || continue; Q=$(pgrep -x -u root loginwindow) || continue; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $Q; echo AKITA autologin: the session was locked, kicked loginwindow $Q &gt; /dev/console; done; exit 0; done</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/></dict></plist>\n";
++static const char akita_fullos_autologin_plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>com.akita.autologin</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>( n=0; while :; do /sbin/ifconfig en1 &gt; /dev/null 2&gt;&amp;1 &amp;&amp; ! /sbin/ifconfig en1 | /usr/bin/head -1 | /usr/bin/grep -q \"&lt;UP\" &amp;&amp; { /sbin/ifconfig en1 up; echo AKITA net: en1 was down, up again &gt; /dev/console; }; r=$(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '$1 == \"169.254\" {print $4; exit}'); [ -n \"$r\" ] &amp;&amp; [ \"$r\" != en0 ] &amp;&amp; { /sbin/route -n change -net 169.254.0.0/16 -interface en0 &gt; /dev/null 2&gt;&amp;1; echo AKITA net: link-local route back to en0 from $r &gt; /dev/console; }; if /sbin/ifconfig en1 2&gt; /dev/null | /usr/bin/grep -q RUNNING &amp;&amp; [ -z \"$(/usr/sbin/ipconfig getifaddr en1)\" ]; then /usr/sbin/ipconfig set en1 DHCP; echo AKITA net: en1 up, DHCP asked &gt; /dev/console; sleep 20; fi; n=$((n+1)); if [ $((n % 6)) = 1 ]; then echo \"AKITA net: en1 $(/sbin/ifconfig en1 2&gt; /dev/null | /usr/bin/awk '/inet /{print $2}' | /usr/bin/tr '\\n' ' ')| routes $(/usr/sbin/netstat -rn -f inet | /usr/bin/awk '$1 == \"default\" || $1 == \"169.254\" {print $1 \"/\" $2 \"/\" $4}' | /usr/bin/tr '\\n' ' ')| en0 $(/sbin/ifconfig en0 | /usr/bin/awk '/inet /{print $2}')\" &gt; /dev/console; fi; sleep 10; done ) &amp; for j in com.apple.security.xprotectd com.apple.watchdogd com.apple.apsd com.apple.endpointsecurity.endpointsecurityd com.apple.AppSSODaemon com.apple.PerfPowerServices com.apple.security.cryptexd com.apple.mobileactivationd com.apple.logd_helper com.apple.coresymbolicationd com.apple.backupd-helper com.apple.backupd; do /bin/launchctl disable system/$j; /bin/launchctl bootout system/$j &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl disable gui/501/com.apple.duetexpertd; for j in com.apple.routined com.apple.intelligenceplatformd; do /bin/launchctl disable gui/501/$j; /bin/launchctl bootout gui/501/$j &gt; /dev/null 2&gt;&amp;1; done; echo AKITA autologin: crash-looping services disabled &gt; /dev/console; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 10; id akita &gt; /dev/null 2&gt;&amp;1 || continue; P=$(pgrep -x -u root loginwindow) || exit 0; /usr/bin/defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser akita; /usr/bin/touch /private/var/akita/.skipbuddy; /usr/sbin/chown 501:20 /private/var/akita/.skipbuddy; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $P; echo AKITA autologin: kicked loginwindow $P &gt; /dev/console; for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 20; /bin/launchctl print gui/501 &gt; /dev/null 2&gt;&amp;1 || continue; for g in com.apple.duetexpertd com.apple.imagent; do /bin/launchctl disable gui/501/$g; /bin/launchctl bootout gui/501/$g &gt; /dev/null 2&gt;&amp;1; done; /bin/launchctl print-disabled gui/501 | /usr/bin/grep -q duetexpertd &amp;&amp; { echo AKITA autologin: duetexpertd imagent disabled &gt; /dev/console; break; }; done; /usr/bin/pmset -a displaysleep 0 disksleep 0 sleep 0 &gt; /dev/null 2&gt;&amp;1; while :; do sleep 20; /usr/sbin/ioreg -n Root -d1 | /usr/bin/grep -q 'ScreenIsLocked\"=Yes' || continue; Q=$(pgrep -x -u root loginwindow) || continue; rm -f /var/run/com.apple.loginwindow.didRunThisBoot; kill $Q; echo AKITA autologin: the session was locked, kicked loginwindow $Q &gt; /dev/console; done; exit 0; done</string></array><key>RunAtLoad</key><true/><key>AbandonProcessGroup</key><true/></dict></plist>\n";
 +static const char akita_fullos_ssh_host[] = "-----BEGIN OPENSSH PRIVATE KEY-----\nREPLACE-WITH-YOUR-OWN-HOST-KEY (ssh-keygen -t ed25519)\n-----END OPENSSH PRIVATE KEY-----\n";
 +static const char akita_fullos_ssh_auth[] = "ssh-ed25519 REPLACE-WITH-YOUR-CLIENT-PUBLIC-KEY akita-client\n";
 +static const char akita_fullos_ipkeep_plist[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Label</key><string>com.akita.ipkeep</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>while :; do /sbin/ifconfig en0 | /usr/bin/grep -q 169.254.7.2 || { /sbin/ifconfig en0 inet 169.254.7.2 netmask 255.255.0.0 alias; echo AKITA ipkeep: en0 address set &gt; /dev/console; }; /bin/sleep 5; done</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><true/></dict></plist>\n";
@@ -671,18 +673,18 @@ index 2467b24..57afb03 100644
 +		/* an RTC behind the image's build time is wrong (fullos193: 6.5 h behind): the packager's clock then */
 +		if (acpm_ok && akita_acpm_rtc_seconds(&rtc) == 0 && rtc >= 1704067200ULL && rtc >= epoch) {
 +			clock_set_calendar_microtime((clock_sec_t)rtc, 0);
-+			printf("AKITA FULLOS: calendar set from the RTC to %llu (was %lu)\n", rtc, (unsigned long)now_s);
++			printf("AKITA FULLOS [+%lu ms]: calendar set from the RTC to %llu (was %lu)\n", AKITA_MS(), rtc, (unsigned long)now_s);
 +		} else if (epoch > (uint64_t)now_s) {
 +			clock_set_calendar_microtime((clock_sec_t)epoch, 0);
-+			printf("AKITA FULLOS: calendar set to %llu (was %lu)\n", epoch, (unsigned long)now_s);
++			printf("AKITA FULLOS [+%lu ms]: calendar set to %llu (was %lu)\n", AKITA_MS(), epoch, (unsigned long)now_s);
 +		}
 +	}
-+	printf("AKITA FULLOS: waiting for UUID hook...\n");
++	printf("AKITA FULLOS [+%lu ms]: waiting for UUID hook...\n", AKITA_MS());
 +	for (unsigned waited = 0; waited < 60000 && !akita_bsdname_for_uuid; waited += 100) {
 +		delay(100 * 1000);
 +	}
 +	st[3] = akita_bsdname_for_uuid && akita_bsdname_for_uuid(uuid, device, sizeof(device), 60000) ? 0 : ENODEV;
-+	printf("AKITA FULLOS: device=%s err=%d\n", device[0] ? device : "(none)", st[3]);
++	printf("AKITA FULLOS [+%lu ms]: device=%s err=%d\n", AKITA_MS(), device[0] ? device : "(none)", st[3]);
 +	if (st[3] == 0) {
 +		uint8_t apfs[0x150] = {0};
 +		user_addr_t spec = scratch + 0xe00;
@@ -701,7 +703,7 @@ index 2467b24..57afb03 100644
 +			int perr = akita_fullos_mount(p, scratch, "tmpfs", "/System/Volumes/Preboot", pargs, sizeof(pargs), 0);
 +			int m1 = akita_fullos_mkdir(p, scratch, "/System/Volumes/Preboot/Cryptexes");
 +			int m2 = akita_fullos_mkdir(p, scratch, "/System/Volumes/Preboot/Cryptexes/OS");
-+			printf("AKITA FULLOS: preboot tmpfs %d mkdir %d %d\n", perr, m1, m2);
++			printf("AKITA FULLOS [+%lu ms]: preboot tmpfs %d mkdir %d %d\n", AKITA_MS(), perr, m1, m2);
 +			if (perr || m1 || m2) {
 +				preboot = 0;   /* fall back to the union over "/" */
 +			}
@@ -715,13 +717,13 @@ index 2467b24..57afb03 100644
 +					st[4] = akita_fullos_mount(p, scratch, "apfs", "/", apfs, sizeof(apfs), MNT_RDONLY | MNT_UNION);
 +				}
 +				if (st[4] == 0) {
-+					printf("AKITA FULLOS: cryptex mount (%s) OK on attempt %d\n", preboot ? "preboot" : "union /", attempt);
++					printf("AKITA FULLOS [+%lu ms]: cryptex mount (%s) OK on attempt %d\n", AKITA_MS(), preboot ? "preboot" : "union /", attempt);
 +					if (preboot == 1) {   /* akita-cryptex-preboot=2: no links, dyld finds the cache in the cryptex */
 +						(void)akita_fullos_dyld_links(p, scratch);
 +					}
 +					break;
 +				}
-+				printf("AKITA FULLOS: union mount attempt %d => %d\n", attempt, st[4]);
++				printf("AKITA FULLOS [+%lu ms]: union mount attempt %d => %d\n", AKITA_MS(), attempt, st[4]);
 +				delay(500 * 1000);
 +			}
 +		} else {
@@ -750,7 +752,7 @@ index 2467b24..57afb03 100644
 +			akita_fullos_mkdir(p, scratch, "/System/Volumes/Data/cores");
 +		}
 +	}
-+	printf("AKITA FULLOS RESULT: dev=%s(%d) cx=%d dat=%d\n",
++	printf("AKITA FULLOS [+%lu ms] RESULT: dev=%s(%d) cx=%d dat=%d\n", AKITA_MS(),
 +	    device[0] ? device : "-", st[3], st[4], st[5]);
 +	{
 +		char stage[96];
@@ -773,16 +775,16 @@ index 2467b24..57afb03 100644
 +				if (ust[i] == 0) {
 +					break;
 +				}
-+				printf("AKITA FULLOS: tmpfs %s attempt %d => %d\n", unions[i], attempt, ust[i]);
++				printf("AKITA FULLOS [+%lu ms]: tmpfs %s attempt %d => %d\n", AKITA_MS(), unions[i], attempt, ust[i]);
 +				delay(500 * 1000);
 +			}
 +		}
-+		printf("AKITA FULLOS: unions private=%d Library=%d Users=%d\n", ust[0], ust[1], ust[2]);
++		printf("AKITA FULLOS [+%lu ms]: unions private=%d Library=%d Users=%d\n", AKITA_MS(), ust[0], ust[1], ust[2]);
 +		if (ust[0] == 0) {
 +			int merr = akita_fullos_mkdir(p, scratch, "/private/etc");
 +			int werr = merr ? merr : akita_fullos_write_file("/private/etc/rc.server", akita_fullos_rc_server,
 +			    sizeof(akita_fullos_rc_server) - 1, 0755);
-+			printf("AKITA FULLOS: /private/etc/rc.server mkdir=%d write=%d\n", merr, werr);
++			printf("AKITA FULLOS [+%lu ms]: /private/etc/rc.server mkdir=%d write=%d\n", AKITA_MS(), merr, werr);
 +		}
 +		{
 +			int lerr = akita_fullos_mkdir(p, scratch, "/private/etc/akita");
@@ -801,7 +803,7 @@ index 2467b24..57afb03 100644
 +			    akita_fullos_autologin_plist, sizeof(akita_fullos_autologin_plist) - 1, 0644);
 +			int w7 = lerr ? lerr : akita_fullos_write_file("/private/etc/akita/com.akita.sweep.plist",
 +			    akita_fullos_sweep_plist, sizeof(akita_fullos_sweep_plist) - 1, 0644);
-+			printf("AKITA FULLOS: daemons dir=%d shell=%d ipkeep=%d sshd=%d keys=%d/%d/%d autologin=%d sweep=%d\n", lerr, w1, w2, w3, kerr, w4, w5, w6, w7);
++			printf("AKITA FULLOS [+%lu ms]: daemons dir=%d shell=%d ipkeep=%d sshd=%d keys=%d/%d/%d autologin=%d sweep=%d\n", AKITA_MS(), lerr, w1, w2, w3, kerr, w4, w5, w6, w7);
 +			akita_gpu_addon_install(p, scratch);
 +		}
 +		{
@@ -1014,7 +1016,7 @@ index 2467b24..57afb03 100644
  void
  load_init_program(proc_t p)
  {
-@@ -8074,6 +8918,24 @@ load_init_program(proc_t p)
+@@ -8074,6 +8920,24 @@ load_init_program(proc_t p)
  	mach_vm_offset_t scratch_addr = 0;
  	mach_vm_size_t map_page_size = vm_map_page_size(map);
  
@@ -1039,7 +1041,7 @@ index 2467b24..57afb03 100644
  #if DEVELOPMENT || DEBUG
  	/* Use the opportunity to initialize exec's debug log stream */
  	exec_log_handle = os_log_create("com.apple.xnu.bsd", "exec");
-@@ -8081,6 +8943,9 @@ load_init_program(proc_t p)
+@@ -8081,6 +8945,9 @@ load_init_program(proc_t p)
  
  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
  	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
@@ -1049,7 +1051,7 @@ index 2467b24..57afb03 100644
  #if CONFIG_MEMORYSTATUS
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
-@@ -8127,7 +8992,14 @@ load_init_program(proc_t p)
+@@ -8127,7 +8994,14 @@ load_init_program(proc_t p)
  		}
  	}
  
@@ -1394,6 +1396,27 @@ index edac75b..3a9ef9e 100644
  	error = writev_internal(p, fd, uio, flags, puguard, retval);
  
  out:
+diff --git a/bsd/kern/sys_work_interval.c b/bsd/kern/sys_work_interval.c
+index b544bf3..8ea9a97 100644
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -68,9 +68,13 @@ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+ 			return error;
+ 		}
+ 
+-		if ((error = priv_check_cred(kauth_cred_get(), PRIV_WORK_INTERVAL, 0)) != 0) {
+-			return error;
+-		}
++		/*
++		 * akita (Generated-by: LLM, local only): no policy grants PRIV_WORK_INTERVAL on this port (AMFI gives it from the
++		 * com.apple.private.kernel.work-interval entitlement on a Mac), and AppKit aborts an app whose scroll animation
++		 * cannot create its performance regulator work interval ("Failed to create performance regulator work interval
++		 * (error 1)"). Allow it for everybody: it only expresses frame deadlines to the scheduler.
++		 */
++		(void)priv_check_cred;
+ 
+ 		create_args = (struct kern_work_interval_create_args) {
+ 			.wica_id            = create_params.wicp_id,
 diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
 index 79bf0cb..32b45fb 100644
 --- a/bsd/kern/ubc_subr.c

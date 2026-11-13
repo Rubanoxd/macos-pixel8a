@@ -383,6 +383,8 @@ int command(uint32_t stage) {
 
 // akita (Generated-by: LLM): for the USB host in the input driver (AkitaUsbHost.h): the phone is the host with a PD contract
 extern "C" int akita_typec_host(void) { return typec::gS.run && typec::gS.contract && typec::gS.dfp; }
+// akita (Generated-by: LLM): the USB host thread starts the PD engine when the gadget has lost its USB host (AkitaUsbHost.h)
+extern "C" void akita_typec_autostart(void) { if (!typec::gS.run) typec::start(); }
 
 // akita (Generated-by: LLM): run-time experiments in the USB host (input driver), kern.akita_acpm = 6000000 + n
 static int (*volatile gUsbHostHook)(unsigned);

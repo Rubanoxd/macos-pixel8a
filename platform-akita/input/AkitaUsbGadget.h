@@ -307,10 +307,14 @@ void Gadget::stall()
 
 // akita (Generated-by: LLM): the USB host (AkitaUsbHost.h) takes the controller when the PD engine makes the phone the host
 volatile bool gStopRequest = false, gStopped = false;
+// akita (Generated-by: LLM): the gadget runs (gUp) and a USB host has it configured with the link up (gLinked): AkitaUsbHost.h starts the PD
+// engine when the cable has had no USB host for a while (the phone moved from the Mac to a hub)
+volatile bool gUp = false, gLinked = false;
 
 void Gadget::run()
 {
   uint64_t lastSummary = 0, now = 0;
+  gUp = true;
   for (;;) {
     if (gStopRequest) {
       dwc3Write(DEVTEN, 0);
@@ -340,6 +344,9 @@ void Gadget::run()
     pumpTx();
     pumpRaw();
     IOSleep(1);
+    // linked: configured, and the link in U0/L0. On this board VBUS is forced valid, so pulling the cable gives no
+    // disconnect event (fullos256): the link only drops to suspend (USBLNKST 3) for lack of SOFs.
+    gLinked = fConfig && ((dwc3Read(DSTS) >> 18) & 0xfU) == 0;
     clock_get_uptime(&now);
     uint64_t ns = 0;
     absolutetime_to_nanoseconds(now - lastSummary, &ns);

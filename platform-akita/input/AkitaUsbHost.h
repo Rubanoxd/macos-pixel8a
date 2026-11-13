@@ -11,6 +11,7 @@
 namespace usbhost {
 
 extern "C" int akita_typec_host(void);   // kernel: the PD engine made the phone the host (AkitaTypec.inc)
+extern "C" void akita_typec_autostart(void);   // kernel: start the PD engine if it is not running (AkitaTypec.inc)
 extern "C" void akita_usbhost_set_hook(int (*hook)(unsigned));   // kernel: kern.akita_acpm 6000000 + n reaches command()
 
 void (*gKeys)(void *ctx, const uint8_t report[8]) = nullptr;
@@ -424,6 +425,18 @@ bool start() {
   w32(GSBUSCFG0, r32(GSBUSCFG0) & ~1u);
   w32(GCTL, (r32(GCTL) & ~(3u << 12)) | (1u << 12));
   w32(GUCTL, r32(GUCTL) | (1u << 14));   // USBHSTINAUTORETRYEN, as Google's dwc3_exynos_core_init in host mode
+  // Google's zuma host timing (commands 10, 11 and 14 below), by default: without it a hub with a full-speed
+  // receiver behind it drops the root port every few seconds and no HID report arrives
+  {
+    uint32_t v = r32(GFLADJ);
+    v = (v & ~0x3fu) | (1u << 7) | 0x20;
+    v = (v & ~(0x3fffu << 8)) | (200u << 8);
+    v = (v & ~(0x7fu << 24) & ~(1u << 31)) | (12u << 24) | (1u << 31);
+    v |= 1u << 23;
+    w32(GFLADJ, v);
+    w32(GUCTL, (r32(GUCTL) & ~(0x3ffu << 22)) | (0x34u << 22) | (1u << 17) | (1u << 21));
+    w32(GUCTL, (r32(GUCTL) & ~0x1ffu) | 200u);
+  }
   IOSleep(20);
   const uint32_t capLen = r32(CAPLENGTH) & 0xff, hcs1 = r32(HCSPARAMS1), hcs2 = r32(HCSPARAMS2), hcc1 = r32(HCCPARAMS1);
   gH.op = capLen; gH.db = r32(DBOFF) & ~3u; gH.rt = r32(RTSOFF) & ~0x1fu;
@@ -561,7 +574,21 @@ int command(unsigned n) {
 void hostThread(void *, wait_result_t) {
   akita_usbhost_set_hook(command);
   IOLog("usbhost: waiting for the USB PD engine to make the phone the host\n");
-  while (!akita_typec_host()) IOSleep(500);
+  // the PD engine starts by itself once the gadget has had no USB host for 20 s (the cable went from the Mac to a hub):
+  // it only takes the host role when the partner asks for it (a hub's DR_Swap), so a Mac keeps the phone a device
+  unsigned down = 0;
+  bool asked = false;
+  while (!akita_typec_host()) {
+    if (!asked && gadget::gUp) {
+      down = gadget::gLinked ? 0 : down + 1;
+      if (down >= 40) {
+        IOLog("usbhost: no USB host on the cable for 20 s: starting the USB PD engine\n");
+        akita_typec_autostart();
+        asked = true;
+      }
+    }
+    IOSleep(500);
+  }
   IOLog("usbhost: the phone is the host (DFP): stopping the gadget\n");
   gadget::gStopRequest = true;
   for (unsigned t = 0; t < 300 && !gadget::gStopped; ++t) IOSleep(10);

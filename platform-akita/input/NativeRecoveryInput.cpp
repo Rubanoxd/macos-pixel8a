@@ -53,6 +53,12 @@ static_assert(sizeof(IOHIDDevice) == 208, "paired 25F71 IOHIDDevice size");
 namespace {
 
 constexpr unsigned pollMs = 20;
+// akita (Generated-by: LLM): in the full OS (boot-arg akita-touch=1) a single volume key steps the panel brightness
+// (AkitaBacklight.inc in the kernel) instead of sending an arrow: on the press, then every 200 ms after 500 ms held.
+extern "C" int akita_backlight_set(unsigned level);
+extern "C" unsigned akita_backlight_level(void);
+constexpr unsigned brightnessSteps[] = {210, 260, 330, 420, 530, 670, 850, 1080, 1370, 1740, 2047};
+constexpr unsigned brightnessStepCount = sizeof(brightnessSteps) / sizeof(brightnessSteps[0]);
 constexpr uint32_t gpa4Data = 0x84, gpa6Data = 0xa4;
 enum : uint8_t { usageReturn = 0x28, usageTab = 0x2b, usageSpace = 0x2c, usageDown = 0x51, usageUp = 0x52 };
 
@@ -435,6 +441,9 @@ class NativeRecoveryInput : public IOService {
   // Pointer mode state.
   bool fPointer = false, fToggled = false, fLastButton = false;
   unsigned fComboTicks = 0, fUpTicks = 0, fDownTicks = 0, fDirection = 0;
+  bool fBrightnessKeys = false;   // akita: volume keys step the brightness (full OS)
+  unsigned fBrightnessHeld = 0;
+  void brightnessKey(bool up);
 
   static void pollThread(void *self, wait_result_t);
   static NativeRecoveryHID *newDevice(IOService *owner, uint8_t kind);
@@ -501,6 +510,8 @@ bool NativeRecoveryInput::start(IOService *provider)
   fTabletX = fScreenWidth / 2;
   fTabletY = fScreenHeight / 2;
   PE_parse_boot_argn("akita-input-keepawake", &fKeepAwakeSeconds, sizeof(fKeepAwakeSeconds));
+  unsigned touch = 0;
+  fBrightnessKeys = PE_parse_boot_argn("akita-touch", &touch, sizeof(touch)) && touch == 1;
   OSData *compatible = OSDynamicCast(OSData, provider->getProperty("compatible"));
   static const char expected[] = "google,akita-buttons";
   if (!compatible || compatible->getLength() != sizeof(expected) ||
@@ -1032,6 +1043,24 @@ void NativeRecoveryInput::pollThread(void *self, wait_result_t)
   }
 }
 
+void NativeRecoveryInput::brightnessKey(bool up)
+{
+  const unsigned now = akita_backlight_level();
+  unsigned i = brightnessStepCount / 2;   // the bootloader's level is unknown: start from the middle
+  if (now) {
+    i = 0;
+    while (i + 1 < brightnessStepCount && brightnessSteps[i] < now)
+      ++i;
+  }
+  if (up && i + 1 < brightnessStepCount)
+    ++i;
+  else if (!up && i > 0 && now)
+    --i;
+  const int rc = akita_backlight_set(brightnessSteps[i]);
+  IOLog("NativeRecoveryInput: brightness %s -> %u (step %u of %u)%s\n", up ? "up" : "down", brightnessSteps[i], i + 1,
+        brightnessStepCount, rc ? " not sent" : "");
+}
+
 void NativeRecoveryInput::poll()
 {
   const volatile uint32_t *pins = reinterpret_cast<const volatile uint32_t *>(fPins->getVirtualAddress());
@@ -1067,6 +1096,15 @@ void NativeRecoveryInput::poll()
     bytes[n++] = usageTab;
   } else if (power && up) {
     bytes[n++] = usageSpace;
+  }
+  if (fBrightnessKeys && !fComboTicks && !fPointer && !power && up != down) {
+    // the press, then every 200 ms once held for 500 ms
+    if (fBrightnessHeld == 0 || (fBrightnessHeld >= 500 / pollMs && (fBrightnessHeld - 500 / pollMs) % (200 / pollMs) == 0))
+      brightnessKey(up);
+    ++fBrightnessHeld;
+    up = down = false;
+  } else if (!up && !down) {
+    fBrightnessHeld = 0;
   }
   if (!fComboTicks && !fPointer && !(power && (up || down))) {
     if (up) bytes[n++] = usageUp;

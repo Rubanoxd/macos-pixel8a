@@ -418,6 +418,9 @@ extern "C" {   // akita: bpf.h has no extern "C" of its own
 #include "AkitaI2c.inc"     // akita: HSI2C 11, the MAX77759 bus (kern.akita_acpm = 5000000 + stage), read-only towards the chips
 #include "AkitaTypec.inc"   // akita: USB Power Delivery on the MAX77759 TCPC (kern.akita_acpm = 5000010.., see the file)
 #include "AkitaBattery.inc"   // akita: the fuel gauge as an IOPMPowerSource (kern.akita_acpm = 8000000 prints it)
+#include "AkitaBacklight.inc"   // akita: panel brightness over DSIM0 (kern.akita_acpm = 9000000 state, 9100000 + level)
+extern "C" int akita_backlight_set(unsigned level) { return backlight::set(level); }
+extern "C" unsigned akita_backlight_level(void) { return backlight::level(); }
 extern "C" void akita_battery_boot(void) { battery::boot(); }
 
 extern "C" int akita_acpm_command(unsigned what) {
@@ -455,6 +458,8 @@ extern "C" int akita_acpm_command(unsigned what) {
   if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);
   if (what >= 5000010 && what < 5000100) return typec::command(what - 5000000);
   if (what > 6000000 && what < 6000100) return akita_usbhost_command(what - 6000000);   // akita: USB host experiments (input driver)
+  if (what == 9000000) { backlight::dump(); return 0; }   // akita: AkitaBacklight.inc
+  if (what > 9100000 && what <= 9104095) { const int rc = backlight::set(what - 9100000); backlight::dump(); return rc; }
   if (what == 8000000) { battery::print(battery::read()); return 0; }   // akita: AkitaBattery.inc
   if (what >= 7000000 && what < 7256256) {   // akita: read one I2C register on HSI2C 11: 7000000 + device * 1000 + register (AkitaI2c.inc)
     const unsigned dev = (what - 7000000) / 1000, reg = (what - 7000000) % 1000;

@@ -153,7 +153,7 @@ index 604f16a..b8b34e4 100644
  STARTUP(TUNABLES, STARTUP_RANK_FIRST, csr_bootstrap);
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24..06a3727 100644
+index 2467b24..c6f593f 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -2738,6 +2738,10 @@ cleanup_rosetta_fp:
@@ -331,7 +331,7 @@ index 2467b24..06a3727 100644
 +     * diskarbitrationd could not make mount points: every .dmg failed with "no mountable file systems" (fullos260) */
 +    "/usr/bin/touch /Volumes/.akita-rw 2> /dev/null && /bin/rm -f /Volumes/.akita-rw || /sbin/mount_tmpfs -s 8m /Volumes\n"
 +    /* ...and with mount points possible, diskarbitrationd mounted the boot image's Recovery volume on the desktop: noauto */
-+    "/usr/bin/grep -q -F 'macOS\\040Base' /etc/fstab 2> /dev/null || echo 'LABEL=macOS\\040Base\\040System none apfs ro,noauto' >> /etc/fstab\n"
++    "/usr/bin/grep -q -F 'macOS\\040Base' /etc/fstab 2> /dev/null || printf '%s\\n' 'LABEL=macOS\\040Base\\040System none apfs ro,noauto' >> /etc/fstab\n"
 +    "T=/System/Library/Templates/Data\n"
 +    /* Preboot cryptex layout: dyld does not search the cryptex for dylibs here (no graft), so link the few /usr/lib
 +     * dylibs only the cryptex has (libLaunchServicesSupport for loginwindow...) into a small union tmpfs on /usr/lib */

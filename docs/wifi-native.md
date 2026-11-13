@@ -7,8 +7,10 @@ To make macOS treat it as Wi-Fi:
   `IOInterfaceType`, `IOInterfaceUnit`) sits under a controller with `IOMACAddress`. It is "Wi-Fi" when that controller conforms to
   `IO80211Controller`. `AkitaNetIf.inc` publishes those classes; IONetworkingFamily and IO80211Family are not in this kernel.
   The service shows **Connected** once `en1` answers `SIOCGIFMEDIA` and posts `KEV_DL_LINK_ON` (fullos270).
-- **Wi-Fi type (boot-arg `akita-netif-wifi=1`).** System Settings shows a Wi-Fi port. But airportd, ControlCenter and System
-  Settings (CoreWLAN) then find no IO80211 driver behind it, and the menu bar went missing (fullos271). So Ethernet is the default.
+- **Wi-Fi type (boot-arg `akita-netif-wifi=1`).** System Settings shows a Wi-Fi port, but airportd finds no IO80211 driver
+  behind it. Ethernet stays the default.
+  - Correction (fullos277): the missing menu bar in fullos271/276 was not the Wi-Fi. It was System Settings, restored at
+    login and stuck as the active app; with Finder in front the menu bar is there.
 - **How airportd talks to a Wi-Fi driver (IO80211.framework, 26.5).**
   - `Apple80211RawGet` uses `ioctl(SIOCGA80211 = 0xC02869C9)` on the BSD interface, and `Apple80211RawSet` uses
     `SIOCSA80211 = 0x802869C8`, with the classic 40-byte `apple80211req`. These would reach `en1`'s ioctl handler.
@@ -37,7 +39,6 @@ Next options, from cheapest:
 - What happens then:
   - `networksetup -getairportpower en1` answers "Off (forced)";
   - configd's only Apple80211 ioctl is GET type 12 (card capabilities, 21 bytes);
-  - airportd sends none;
-  - the menu bar is still missing.
+  - airportd sends none.
 - airportd's power and state come through `IO80211APIUserClient`, which our IOKit classes do not provide. That user client is the
   next thing to reverse (IO80211.framework `Apple80211BindToInterface*`) before the ioctls are worth answering.

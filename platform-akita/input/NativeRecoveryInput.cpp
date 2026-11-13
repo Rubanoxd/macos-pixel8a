@@ -60,7 +60,7 @@ extern "C" unsigned akita_backlight_level(void);
 constexpr unsigned brightnessSteps[] = {210, 260, 330, 420, 530, 670, 850, 1080, 1370, 1740, 2047};
 constexpr unsigned brightnessStepCount = sizeof(brightnessSteps) / sizeof(brightnessSteps[0]);
 constexpr uint32_t gpa4Data = 0x84, gpa6Data = 0xa4;
-enum : uint8_t { usageReturn = 0x28, usageTab = 0x2b, usageSpace = 0x2c, usageDown = 0x51, usageUp = 0x52 };
+enum : uint8_t { usageReturn = 0x28, usageTab = 0x2b, usageSpace = 0x2c, usageDown = 0x51, usageUp = 0x52, usageF14 = 0x69, usageF15 = 0x6A };
 
 // QEMU hw/input/hid.c boot keyboard: modifiers, reserved, six key usages; five LED outputs.
 const uint8_t keyboardDescriptor[] = {
@@ -74,6 +74,14 @@ const uint8_t keyboardDescriptor[] = {
 };
 
 // Boot mouse: three buttons, relative X and Y, and (akita, for USB mice) a relative wheel.
+// akita (Generated-by: LLM): consumer control, one 16-bit usage (0 = none): the volume keys send Display Brightness
+// Increment (0x6F) / Decrement (0x70) in the full OS, which macOS takes as its brightness keys (HUD, slider, CoreBrightness)
+const uint8_t consumerDescriptor[] = {
+  0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x03, 0x19, 0x00, 0x2a, 0xff, 0x03,
+  0x75, 0x10, 0x95, 0x01, 0x81, 0x00, 0xc0,
+};
+constexpr uint16_t usageBrightnessUp = 0x6f, usageBrightnessDown = 0x70;
+
 const uint8_t mouseDescriptor[] = {
   0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00,
   0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
@@ -93,7 +101,7 @@ const uint8_t tabletDescriptor[] = {
   0xc0, 0xc0,
 };
 constexpr unsigned panelWidth = 1080, panelHeight = 2400;
-enum : uint8_t { kindKeyboard, kindMouse, kindTablet };
+enum : uint8_t { kindKeyboard, kindMouse, kindTablet, kindConsumer };
 
 constexpr unsigned modeHoldTicks = 50;     // 1 s of both volume buttons toggles pointer mode
 constexpr unsigned tapTicks = 20;          // volume down released within 400 ms turns the direction
@@ -398,16 +406,16 @@ public:
   OSString *newManufacturerString() const override { return OSString::withCString("Google"); }
   OSString *newProductString() const override
   {
-    static const char *const names[] = {"Pixel 8a Buttons", "Pixel 8a Buttons Pointer", "Pixel 8a Script Tablet"};
+    static const char *const names[] = {"Pixel 8a Buttons", "Pixel 8a Buttons Pointer", "Pixel 8a Script Tablet", "Pixel 8a Consumer Keys"};
     return OSString::withCString(names[fKind]);
   }
   OSNumber *newVendorIDNumber() const override { return OSNumber::withNumber(0x1af4, 32); }
   OSNumber *newProductIDNumber() const override { return OSNumber::withNumber(0x1052, 32); }
   OSNumber *newLocationIDNumber() const override { return OSNumber::withNumber(0x41420000 + fKind, 32); }
-  OSNumber *newPrimaryUsagePageNumber() const override { return OSNumber::withNumber(kHIDPage_GenericDesktop, 32); }
+  OSNumber *newPrimaryUsagePageNumber() const override { return OSNumber::withNumber(fKind == kindConsumer ? static_cast<unsigned>(kHIDPage_Consumer) : static_cast<unsigned>(kHIDPage_GenericDesktop), 32); }
   OSNumber *newPrimaryUsageNumber() const override
   {
-    return OSNumber::withNumber(fKind == kindKeyboard ? kHIDUsage_GD_Keyboard : kHIDUsage_GD_Mouse, 32);
+    return OSNumber::withNumber(fKind == kindConsumer ? static_cast<unsigned>(kHIDUsage_Csmr_ConsumerControl) : static_cast<unsigned>(fKind == kindKeyboard ? kHIDUsage_GD_Keyboard : kHIDUsage_GD_Mouse), 32);
   }
 };
 
@@ -415,7 +423,9 @@ OSDefineMetaClassAndStructors(NativeRecoveryHID, IOHIDDevice)
 
 IOReturn NativeRecoveryHID::newReportDescriptor(IOMemoryDescriptor **descriptor) const
 {
-  if (fKind == kindTablet)
+  if (fKind == kindConsumer)
+    *descriptor = IOBufferMemoryDescriptor::withBytes(consumerDescriptor, sizeof(consumerDescriptor), kIODirectionNone);
+  else if (fKind == kindTablet)
     *descriptor = IOBufferMemoryDescriptor::withBytes(tabletDescriptor, sizeof(tabletDescriptor), kIODirectionNone);
   else if (fKind == kindMouse)
     *descriptor = IOBufferMemoryDescriptor::withBytes(mouseDescriptor, sizeof(mouseDescriptor), kIODirectionNone);
@@ -431,6 +441,10 @@ class NativeRecoveryInput : public IOService {
   NativeRecoveryHID *fHid = nullptr;
   NativeRecoveryHID *fMouse = nullptr;
   NativeRecoveryHID *fTablet = nullptr;
+  NativeRecoveryHID *fConsumer = nullptr;   // akita: brightness keys (full OS)
+  uint16_t fConsumerLast = 0;
+  void sendConsumer(uint16_t usage);
+  static void consumerTest(unsigned n);
   char fScript[600] = {};
   IOLock *fSendLock = nullptr;   // the poll and script threads both report
   unsigned fScreenWidth = panelWidth, fScreenHeight = panelHeight;   // the display mode NativeGOPDisplay publishes
@@ -480,6 +494,7 @@ public:
 };
 
 OSDefineMetaClassAndStructors(NativeRecoveryInput, IOService)
+NativeRecoveryInput *gConsumerInput = nullptr;   // akita: for the brightness key test hook
 
 static NativeRecoveryInput *gRemoteInputOwner;
 static void remoteInputHook(const char *steps, unsigned length)
@@ -534,6 +549,12 @@ bool NativeRecoveryInput::start(IOService *provider)
   fMouse = newDevice(this, kindMouse);
   if (!fMouse)
     IOLog("NativeRecoveryInput: no pointer device; keyboard only\n");
+  if (fBrightnessKeys) {
+    fConsumer = newDevice(this, kindConsumer);
+    gConsumerInput = this;
+    usbhost::gConsumerTest = consumerTest;
+    IOLog("NativeRecoveryInput: consumer keys %s (volume keys = brightness)\n", fConsumer ? "on" : "failed");
+  }
   // The companion cannot unload. Retain it for the lifetime of its polling thread.
   thread_t thread;
   retain();
@@ -1061,6 +1082,30 @@ void NativeRecoveryInput::brightnessKey(bool up)
         brightnessStepCount, rc ? " not sent" : "");
 }
 
+void NativeRecoveryInput::sendConsumer(uint16_t usage)
+{
+  fConsumerLast = usage;
+  if (!fConsumer)
+    return;
+  uint8_t bytes[2] = {static_cast<uint8_t>(usage & 0xff), static_cast<uint8_t>(usage >> 8)};
+  IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, sizeof(bytes), kIODirectionNone);
+  if (report) {
+    fConsumer->handleReport(report);
+    report->release();
+  }
+}
+
+// kern.akita_acpm 6000030 / 6000031 (usbhost command 30/31): one brightness up / down press, for tests without a hand
+void NativeRecoveryInput::consumerTest(unsigned n)
+{
+  if (!gConsumerInput)
+    return;
+  gConsumerInput->sendConsumer(n == 30 ? usageBrightnessUp : usageBrightnessDown);
+  IOSleep(80);
+  gConsumerInput->sendConsumer(0);
+  IOLog("NativeRecoveryInput: test brightness %s press\n", n == 30 ? "up" : "down");
+}
+
 void NativeRecoveryInput::poll()
 {
   const volatile uint32_t *pins = reinterpret_cast<const volatile uint32_t *>(fPins->getVirtualAddress());
@@ -1097,14 +1142,14 @@ void NativeRecoveryInput::poll()
   } else if (power && up) {
     bytes[n++] = usageSpace;
   }
-  if (fBrightnessKeys && !fComboTicks && !fPointer && !power && up != down) {
-    // the press, then every 200 ms once held for 500 ms
-    if (fBrightnessHeld == 0 || (fBrightnessHeld >= 500 / pollMs && (fBrightnessHeld - 500 / pollMs) % (200 / pollMs) == 0))
-      brightnessKey(up);
-    ++fBrightnessHeld;
-    up = down = false;
-  } else if (!up && !down) {
-    fBrightnessHeld = 0;
+  if (fConsumer) {
+    // macOS's own brightness keys as consumer usages: its HUD shows, CoreBrightness moves the slider and akita-brightnessd
+    // takes it to the panel; held, macOS repeats them
+    const uint16_t want = (!fComboTicks && !fPointer && !power && up != down) ? (up ? usageBrightnessUp : usageBrightnessDown) : 0;
+    if (want != fConsumerLast)
+      sendConsumer(want);
+    if (want)
+      up = down = false;
   }
   if (!fComboTicks && !fPointer && !(power && (up || down))) {
     if (up) bytes[n++] = usageUp;

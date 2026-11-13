@@ -16,6 +16,7 @@ extern "C" void akita_usbhost_set_hook(int (*hook)(unsigned));   // kernel: kern
 
 void (*gKeys)(void *ctx, const uint8_t report[8]) = nullptr;
 void (*gMouse)(void *ctx, uint8_t buttons, int dx, int dy, int wheel) = nullptr;
+void (*gConsumerTest)(unsigned n) = nullptr;   // akita: set by NativeRecoveryInput (consumer brightness keys)
 void *gCtx = nullptr;
 
 // DWC3 globals
@@ -563,6 +564,7 @@ int command(unsigned n) {
     case 14: w32(GUCTL, (r32(GUCTL) & ~0x1ffu) | 200u); break;   // device timeout (usb_host_device_timeout = 200)
     case 15: gHubPollPaused = !gHubPollPaused; IOLog("usbhost: hub polling %s\n", gHubPollPaused ? "paused" : "on"); break;
     case 16: gRestartRequest = true; break;
+    case 30: case 31: if (gConsumerTest) gConsumerTest(n); return 0;   // akita: brightness key test (NativeRecoveryInput)
     case 17: { const uint32_t a = gH.op + PORTSC0; IOLog("usbhost: root port 1 portsc %08x portpmsc %08x portli %08x\n", r32(a), r32(a + 4), r32(a + 8)); return 0; }
     default: IOLog("usbhost: command %u unknown\n", n); return -1;
   }

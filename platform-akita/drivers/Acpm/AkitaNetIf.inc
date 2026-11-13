@@ -25,6 +25,19 @@ class IOEthernetInterface : public IONetworkInterface {
 };
 OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface)
 
+// SystemConfiguration calls an interface Wi-Fi when its controller conforms to IO80211Controller (boot-arg akita-netif-wifi=1,
+// experimental: System Settings then shows a Wi-Fi port, but the CoreWLAN clients find no IO80211 driver behind it and the
+// menu bar went missing in fullos271). IO80211Family is not in this kernel either.
+class IO80211Controller : public IOEthernetController {
+  OSDeclareDefaultStructors(IO80211Controller);
+};
+OSDefineMetaClassAndStructors(IO80211Controller, IOEthernetController)
+
+class IO80211Interface : public IOEthernetInterface {
+  OSDeclareDefaultStructors(IO80211Interface);
+};
+OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface)
+
 namespace netif {
 
 IOEthernetController *gController = nullptr;
@@ -40,7 +53,9 @@ void publish(const uint8_t mac[6], unsigned unit) {
   if (gInterface) return;
   IOService *platform = IOService::getPlatform();
   if (!platform) return;
-  gController = new IOEthernetController;
+  unsigned wifi = 0;   // fullos271: as Wi-Fi without IO80211Family behind it, the menu bar disappeared (CoreWLAN clients)
+  PE_parse_boot_argn("akita-netif-wifi", &wifi, sizeof wifi);
+  gController = wifi ? new IO80211Controller : new IOEthernetController;
   if (!gController || !gController->init() || !gController->attach(platform)) {
     printf("netif: could not make the controller\n");
     if (gController) { gController->release(); gController = nullptr; }
@@ -57,7 +72,7 @@ void publish(const uint8_t mac[6], unsigned unit) {
   setNumber(gController, "IOMaxPacketSize", 1518, 32);
   gController->registerService();
 
-  gInterface = new IOEthernetInterface;
+  gInterface = wifi ? new IO80211Interface : new IOEthernetInterface;
   if (!gInterface || !gInterface->init() || !gInterface->attach(gController)) {
     printf("netif: could not make the interface\n");
     if (gInterface) { gInterface->release(); gInterface = nullptr; }
@@ -78,7 +93,7 @@ void publish(const uint8_t mac[6], unsigned unit) {
   gInterface->setProperty("IOPrimaryInterface", false);
   gInterface->setProperty("IOLocation", "");
   gInterface->registerService();
-  printf("netif: en%u published in IOKit (IOEthernetInterface under IOEthernetController)\n", unit);
+  printf("netif: en%u published in IOKit (%s)\n", unit, wifi ? "IO80211Interface under IO80211Controller" : "IOEthernetInterface under IOEthernetController");
 }
 
 }  // namespace netif

@@ -153,7 +153,7 @@ index 604f16a..b8b34e4 100644
  STARTUP(TUNABLES, STARTUP_RANK_FIRST, csr_bootstrap);
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24..5c42c43 100644
+index 2467b24..06a3727 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -2738,6 +2738,10 @@ cleanup_rosetta_fp:
@@ -167,7 +167,7 @@ index 2467b24..5c42c43 100644
  
  #if CONFIG_SECLUDED_MEMORY
  	if (secluded_for_apps &&
-@@ -8065,6 +8069,851 @@ static const char * init_programs[] = {
+@@ -8065,6 +8069,853 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
@@ -330,6 +330,8 @@ index 2467b24..5c42c43 100644
 +    /* akita (Generated-by: LLM): /Volumes is on the sealed read-only root here (a Mac's is the Data volume's), so
 +     * diskarbitrationd could not make mount points: every .dmg failed with "no mountable file systems" (fullos260) */
 +    "/usr/bin/touch /Volumes/.akita-rw 2> /dev/null && /bin/rm -f /Volumes/.akita-rw || /sbin/mount_tmpfs -s 8m /Volumes\n"
++    /* ...and with mount points possible, diskarbitrationd mounted the boot image's Recovery volume on the desktop: noauto */
++    "/usr/bin/grep -q -F 'macOS\\040Base' /etc/fstab 2> /dev/null || echo 'LABEL=macOS\\040Base\\040System none apfs ro,noauto' >> /etc/fstab\n"
 +    "T=/System/Library/Templates/Data\n"
 +    /* Preboot cryptex layout: dyld does not search the cryptex for dylibs here (no graft), so link the few /usr/lib
 +     * dylibs only the cryptex has (libLaunchServicesSupport for loginwindow...) into a small union tmpfs on /usr/lib */
@@ -1019,7 +1021,7 @@ index 2467b24..5c42c43 100644
  void
  load_init_program(proc_t p)
  {
-@@ -8074,6 +8923,24 @@ load_init_program(proc_t p)
+@@ -8074,6 +8925,24 @@ load_init_program(proc_t p)
  	mach_vm_offset_t scratch_addr = 0;
  	mach_vm_size_t map_page_size = vm_map_page_size(map);
  
@@ -1044,7 +1046,7 @@ index 2467b24..5c42c43 100644
  #if DEVELOPMENT || DEBUG
  	/* Use the opportunity to initialize exec's debug log stream */
  	exec_log_handle = os_log_create("com.apple.xnu.bsd", "exec");
-@@ -8081,6 +8948,9 @@ load_init_program(proc_t p)
+@@ -8081,6 +8950,9 @@ load_init_program(proc_t p)
  
  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
  	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
@@ -1054,7 +1056,7 @@ index 2467b24..5c42c43 100644
  #if CONFIG_MEMORYSTATUS
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
-@@ -8127,7 +8997,14 @@ load_init_program(proc_t p)
+@@ -8127,7 +8999,14 @@ load_init_program(proc_t p)
  		}
  	}
  

@@ -348,6 +348,7 @@ extern "C" int akita_acpm_rtc_seconds(uint64_t *seconds);   // akita: the PMIC R
 extern "C" int akita_acpm_rtc_write(uint64_t seconds);
 extern "C" void akita_acpm_boot_profile(void);
 extern "C" void akita_wifi_boot(void);   // akita: AkitaPcie.inc
+extern "C" void akita_battery_boot(void);   // akita: AkitaBattery.inc
 extern "C" void akita_acpm_boot_profile(void) {
   printf("macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano\n");   // akita: the author's mark in every boot log
   unsigned allowed = 0, profile = 0;
@@ -367,6 +368,7 @@ extern "C" void akita_acpm_boot_profile(void) {
     }
   }
   if (allowed) akita_wifi_boot();   // akita: the Wi-Fi (AkitaPcie.inc), boot-arg akita-wifi=1
+  if (allowed) akita_battery_boot();   // akita: the battery in the menu bar (AkitaBattery.inc), boot-arg akita-battery=0 off
   if (!allowed || profile != 1 || gProfileCall) return;
   if (!gAcpmLock) gAcpmLock = IOLockAlloc();
   if (!gAcpmLock) return;
@@ -415,6 +417,8 @@ extern "C" {   // akita: bpf.h has no extern "C" of its own
 #include "AkitaPcie.inc"    // akita: the Wi-Fi PCIe link, staged look (kern.akita_acpm = 4000000 + stage)
 #include "AkitaI2c.inc"     // akita: HSI2C 11, the MAX77759 bus (kern.akita_acpm = 5000000 + stage), read-only towards the chips
 #include "AkitaTypec.inc"   // akita: USB Power Delivery on the MAX77759 TCPC (kern.akita_acpm = 5000010.., see the file)
+#include "AkitaBattery.inc"   // akita: the fuel gauge as an IOPMPowerSource (kern.akita_acpm = 8000000 prints it)
+extern "C" void akita_battery_boot(void) { battery::boot(); }
 
 extern "C" int akita_acpm_command(unsigned what) {
   static IOLock *made;
@@ -451,6 +455,7 @@ extern "C" int akita_acpm_command(unsigned what) {
   if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);
   if (what >= 5000010 && what < 5000100) return typec::command(what - 5000000);
   if (what > 6000000 && what < 6000100) return akita_usbhost_command(what - 6000000);   // akita: USB host experiments (input driver)
+  if (what == 8000000) { battery::print(battery::read()); return 0; }   // akita: AkitaBattery.inc
   if (what >= 7000000 && what < 7256256) {   // akita: read one I2C register on HSI2C 11: 7000000 + device * 1000 + register (AkitaI2c.inc)
     const unsigned dev = (what - 7000000) / 1000, reg = (what - 7000000) % 1000;
     if (dev > 0x7f || reg > 0xff) return -1;

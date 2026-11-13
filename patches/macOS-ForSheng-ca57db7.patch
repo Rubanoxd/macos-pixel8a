@@ -368,6 +368,42 @@ index 2cf0c96..40241f2 100644
                  raise ValueError('input companion requires the paired default-off QEMU HID contract')
              expected = dict(CFBundleIdentifier=evidence['bundle'], IOClass='NativeRecoveryInput',
                  IOProviderClass='IOPlatformDevice', IONameMatch='native-recovery-input',
+diff --git a/scripts/plan_macos26_security.py b/scripts/plan_macos26_security.py
+index 9ba3b7f..eb55862 100644
+--- a/scripts/plan_macos26_security.py
++++ b/scripts/plan_macos26_security.py
+@@ -37,6 +37,14 @@ LIBM_LITERALS = (
+ )
+ 
+ 
++# akita (Generated-by: LLM): inline byte tables in the 25F71 UDIFDiskImage text (va, bytes), checked before exclusion
++UDIF_LITERALS = {
++    'BC539C9C-C7A7-3277-99CB-59C88AE2C238': (
++        (0xfffffe000a79a540, bytes.fromhex('202020' '1e' '101e1e1c' '101b1e16' '181a1c1e')),
++        (0xfffffe000a79f4e0, bytes.fromhex('201f1e1d' '1c1b1a19' '18171615' '14131211' '100f0e0d' '0c0b0a09' '08070605' '04030201')),
++    ),
++}
++
+ def libm_literal_regions(identity: str, blob: bytes):
+     if identity != LIBM_UUID:
+         raise ValueError('unreviewed Libm inline table UUID')
+@@ -139,6 +147,16 @@ def plan(data: bytes, native: dict, identity: dict, slide: int, roots=ROOTS) ->
+                     excluded.update(range(offset, offset + size, 4))
+                     literals.append(dict(module=name, va=seg['va'] + offset,
+                                          bytes=size, sha256=digest, purpose=purpose))
++            # akita (Generated-by: LLM): byte tables inside UDIFDiskImage's code (its decompressors) whose words decode as
++            # branches to nowhere; excluded only for this exact build and bytes.
++            if name == 'com.apple.driver.DiskImages.UDIFDiskImage' and seg['name'] == '__TEXT_EXEC':
++                for va, literal in UDIF_LITERALS.get(modules[name]['uuid'], ()):
++                    offset = va - seg['va']
++                    if blob[offset:offset + len(literal)] != literal:
++                        raise ValueError('paired UDIF inline table changed')
++                    excluded.update(range(offset, offset + len(literal), 4))
++                    literals.append(dict(module=name, va=va, bytes=len(literal),
++                                         sha256=hashlib.sha256(literal).hexdigest(), purpose='UDIF inline table'))
+             position = 0
+             while (position := blob.find(bytes.fromhex('982f8a42'), position)) >= 0:
+                 literal = blob[position:position + 256]
 diff --git a/scripts/prepare_macos26_gop.py b/scripts/prepare_macos26_gop.py
 index c379d92..e60175f 100644
 --- a/scripts/prepare_macos26_gop.py

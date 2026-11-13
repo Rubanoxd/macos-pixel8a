@@ -153,7 +153,7 @@ index 604f16a..b8b34e4 100644
  STARTUP(TUNABLES, STARTUP_RANK_FIRST, csr_bootstrap);
  
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2467b24..58169e2 100644
+index 2467b24..57afb03 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -2738,6 +2738,10 @@ cleanup_rosetta_fp:
@@ -167,7 +167,7 @@ index 2467b24..58169e2 100644
  
  #if CONFIG_SECLUDED_MEMORY
  	if (secluded_for_apps &&
-@@ -8065,6 +8069,832 @@ static const char * init_programs[] = {
+@@ -8065,6 +8069,846 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
@@ -322,6 +322,9 @@ index 2467b24..58169e2 100644
 +/* launchd runs /etc/rc.server (optional boot task) before tzinit; /etc is /private/etc on the writable union. */
 +static const char akita_fullos_rc_server[] =
 +    "#!/bin/sh\n"
++    /* akita (Generated-by: LLM): boot timing; the live log starts later (the gadget waits 60 s), so steps go to a file */
++    "bt () { /bin/mkdir -p /private/var/tmp; echo \"$(/bin/date +%T) $*\" >> /private/var/tmp/akita-boot.txt; }\n"
++    "bt rc.server start\n"
 +    "T=/System/Library/Templates/Data\n"
 +    /* Preboot cryptex layout: dyld does not search the cryptex for dylibs here (no graft), so link the few /usr/lib
 +     * dylibs only the cryptex has (libLaunchServicesSupport for loginwindow...) into a small union tmpfs on /usr/lib */
@@ -336,6 +339,7 @@ index 2467b24..58169e2 100644
 +     * zero: anything else is never formatted. Without the disk the session stays in RAM as before. */
 +    "vol () { /usr/sbin/ioreg -r -c AppleAPFSVolume -l | /usr/bin/awk -F'\"' -v n=\"$1\" '/\"FullName\" =/{f=$4} /\"BSD Name\" =/{if(f==n){print $4; exit}}'; }\n"
 +    "W=; i=0; while [ $i -lt 90 ]; do W=$(/usr/sbin/ioreg -r -c AkitaDataDisk -l | /usr/bin/awk -F'\"' '/\"BSD Name\" =/{print $4; exit}'); [ -n \"$W\" ] && break; i=$((i+1)); sleep 1; done\n"
++    "bt data disk ${W:-not found}\n"
 +    "P=; D=; H=/private/var/akita\n"
 +    "if [ -n \"$W\" ]; then\n"
 +    "  i=0; while [ $i -lt 20 ] && [ -z \"$(vol AkitaData)\" ]; do i=$((i+1)); sleep 1; done\n"
@@ -356,22 +360,28 @@ index 2467b24..58169e2 100644
 +    "  F=$(vol Folders); if [ -z \"$F\" ] && [ -n \"$D\" ]; then /sbin/newfs_apfs -A -v Folders /dev/${D%s*} && sleep 2; F=$(vol Folders); fi\n"
 +    "  /bin/mkdir -p /private/var/folders; if [ -n \"$F\" ] && /sbin/mount_apfs -o nobrowse /dev/$F /private/var/folders; then /usr/sbin/chown root:wheel /private/var/folders; /bin/chmod 755 /private/var/folders; echo \"AKITA rc.server: /private/var/folders persistent ($F)\" > /dev/console; fi\n"
 +    "  echo \"AKITA rc.server: persistent data=${D:-none} vm=${V:-none} home=$H\" > /dev/console\n"
++    "  bt persistent volumes mounted\n"
 +    "fi\n"
 +    /* first the steps the session depends on: the slow template copies below have been cut short (no kcpassword, no GPU) */
 +    /* kcpassword: XOR('akita', 7d 89 52 23 d2) = 1c e2 3b 57 b3, pad to 12 bytes */
 +    "/bin/ln -sf /var/db/timezone/zoneinfo/Europe/Madrid /private/etc/localtime\n"
 +    "printf '\\x1c\\xe2\\x3b\\x57\\xb3\\x00\\x00\\x00\\x00\\x00\\x00\\x00' > /private/etc/kcpassword\n"
 +    "/bin/chmod 600 /private/etc/kcpassword\n"
++    "bt seeding Data from template\n"
 +    "echo 'AKITA rc.server: seeding Data from template' > /dev/console\n"
 +    "/bin/cp -Rpn $T/private/. /private/ 2> /dev/null\n"
++    "bt private copied\n"
 +    "/bin/cp -Rpn $T/Users/. /Users/ 2> /dev/null\n"
 +    /* akita: the persistent home, at the path a Mac uses. Not nobrowse: Carbon's FSFindFolder(kUserDomain) answers nsvErr (-35)
 +     * for a home on a nobrowse volume, and Firefox finds no profile folder (2026-11-12) */
 +    "if [ -n \"$D\" ]; then /bin/mkdir /Users/akita 2> /dev/null; E=$(/sbin/mount_apfs /dev/$D /Users/akita 2>&1) && H=/Users/akita || echo \"AKITA rc.server: mount $D: $E\" > /dev/console; echo \"AKITA rc.server: home=$H\" > /dev/console; fi\n"
-+    "/bin/cp -Rpn $T/Library/. /Library/ 2> /dev/null\n"
++    /* akita (Generated-by: LLM): the template's /Library without the read-only trees that are linked back below (157 of its 172 MB
++     * were copied into RAM and deleted again on every boot); cp as before when rsync is missing */
++    "/usr/bin/rsync -a --ignore-existing --exclude '/Application Support/Apple/Photos' --exclude '/Apple' --exclude '/WebServer' --exclude '/Documentation' --exclude '/Application Support/iLifeMediaBrowser' $T/Library/ /Library/ 2> /dev/null || /bin/cp -Rpn $T/Library/. /Library/ 2> /dev/null\n"
++    "bt Library copied\n"
 +    /* RAM: the tmpfs copies of read-only template data cost ~475 MB. Point the big read-only trees back at the template
 +     * (Photos resources 180 MB, /Library/Apple 105 MB). logd's uuidtext (190 MB of format strings) is capped below. */
-+    "for d in '/Library/Application Support/Apple/Photos' /Library/Apple /Library/WebServer /Library/Documentation '/Library/Application Support/iLifeMediaBrowser'; do [ -d \"$T$d\" ] && /bin/rm -rf \"$d\" && /bin/ln -s \"$T$d\" \"$d\"; done\n"
++    "for d in '/Library/Application Support/Apple/Photos' /Library/Apple /Library/WebServer /Library/Documentation '/Library/Application Support/iLifeMediaBrowser'; do [ -d \"$T$d\" ] && [ ! -L \"$d\" ] && /bin/rm -rf \"$d\" && /bin/ln -s \"$T$d\" \"$d\"; done\n"
 +    /* /Library/Preferences exists only once the template is in */
 +    /* the virtual HID keyboard (VendorID 6900, ProductID 4178) as ISO (41): no Keyboard Setup Assistant */
 +    "echo '<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>autoLoginUser</key><string>akita</string></dict></plist>' > /Library/Preferences/com.apple.loginwindow.plist\n"
@@ -379,6 +389,7 @@ index 2467b24..58169e2 100644
 +    "L=/System/Library/LaunchDaemons; S=/private/tmp/ld0; /bin/mkdir $S 2> /dev/null\n"
 +    "/bin/cp -a $L/. $S/ 2> /dev/null\n"
 +    "/sbin/mount_tmpfs -s 16m $L && /bin/cp -a $S/. $L/ 2> /dev/null\n"
++    "bt LaunchDaemons staged\n"
 +    "/bin/cp /private/etc/akita/*.plist $L/ && /usr/sbin/chown root:wheel $L/com.akita.* && /bin/chmod 644 $L/com.akita.*\n"
 +    /* user akita straight into dslocal (opendirectoryd not needed); no authentication_authority: autologin then needs no password check */
 +    "U=/var/db/dslocal/nodes/Default/users/akita\n"
@@ -398,12 +409,15 @@ index 2467b24..58169e2 100644
 +    /* akita (2026-11-12): the glass on (no reduceTransparency: it cost little once the heap textures stopped being shadows) and the
 +     * dark appearance, as the user films it */
 +    "[ -e $H/Library/Preferences/.GlobalPreferences.plist ] || echo '<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>AppleInterfaceStyle</key><string>Dark</string></dict></plist>' > $H/Library/Preferences/.GlobalPreferences.plist\n"
-+    "/usr/sbin/chown -R 501:20 $H\n"
++    /* akita: only what is not akita's already (chown -R of the persistent home took 6.4 s for 21k files, and grows; find 1.2 s) */
++    "/usr/bin/find $H -xdev \\( ! -user 501 -o ! -group 20 \\) -exec /usr/sbin/chown -h 501:20 {} + 2> /dev/null\n"
++    "bt home owner checked\n"
 +    /* MiniLauncher treats this RAM-made account as new at every boot and runs MiniBuddy unless ~/.skipbuddy exists */
 +    "/usr/bin/touch $H/.skipbuddy && /usr/sbin/chown 501:20 $H/.skipbuddy\n"
 +    "/usr/bin/touch /private/var/db/.AppleSetupDone\n"
 +    /* akita: no display sleep: set by the autologin job (it locks the session, and without a Secure Enclave the lock delay cannot change) */
 +    /* akita: DHCP on the Wi-Fi interface (en1) is asked by the autologin job (rc.server's background jobs die with it) */
++    "bt rc.server done\n"
 +    "echo \"AKITA rc.server: done (etc=$(ls /private/etc | wc -l) var=$(ls /private/var | wc -l) ld=$(ls /System/Library/LaunchDaemons | wc -l) user=$(id -u akita 2>&1))\" > /dev/console\n"
 +    "exit 0\n";
 +
@@ -1000,7 +1014,7 @@ index 2467b24..58169e2 100644
  void
  load_init_program(proc_t p)
  {
-@@ -8074,6 +8904,24 @@ load_init_program(proc_t p)
+@@ -8074,6 +8918,24 @@ load_init_program(proc_t p)
  	mach_vm_offset_t scratch_addr = 0;
  	mach_vm_size_t map_page_size = vm_map_page_size(map);
  
@@ -1025,7 +1039,7 @@ index 2467b24..58169e2 100644
  #if DEVELOPMENT || DEBUG
  	/* Use the opportunity to initialize exec's debug log stream */
  	exec_log_handle = os_log_create("com.apple.xnu.bsd", "exec");
-@@ -8081,6 +8929,9 @@ load_init_program(proc_t p)
+@@ -8081,6 +8943,9 @@ load_init_program(proc_t p)
  
  	(void) mach_vm_allocate_kernel(map, &scratch_addr, map_page_size,
  	    VM_MAP_KERNEL_FLAGS_ANYWHERE());
@@ -1035,7 +1049,7 @@ index 2467b24..58169e2 100644
  #if CONFIG_MEMORYSTATUS
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
-@@ -8127,7 +8978,14 @@ load_init_program(proc_t p)
+@@ -8127,7 +8992,14 @@ load_init_program(proc_t p)
  		}
  	}
  
@@ -6923,10 +6937,10 @@ index 0000000..cd021d9
 +#endif
 diff --git a/pexpert/arm/pe_sheng_log.h b/pexpert/arm/pe_sheng_log.h
 new file mode 100644
-index 0000000..5e77810
+index 0000000..51ee990
 --- /dev/null
 +++ b/pexpert/arm/pe_sheng_log.h
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,358 @@
 +/* SPDX-License-Identifier: MIT */
 +/* Diagnostic output never waits for locks or scheduling; count reentrant drops separately. */
 +#ifndef SHENG_RETAINED_LOG_H
@@ -7175,6 +7189,24 @@ index 0000000..5e77810
 +    sheng_log_status(message);
 +    const char *prefix = "\nSHENG: ";
 +    while (*prefix) sheng_log_putc(*prefix++);
++    {
++        /* akita (Generated-by: LLM): the ARM counter in ms (not reset by the firmware chain), to time the boot stages */
++        uint64_t counter, frequency;
++        __asm__ volatile("mrs %0, CNTPCT_EL0" : "=r"(counter));
++        __asm__ volatile("mrs %0, CNTFRQ_EL0" : "=r"(frequency));
++        uint64_t ms = frequency >= 1000 ? counter / (frequency / 1000) : 0;
++        char digits[20];
++        unsigned count = 0;
++        do { digits[count++] = (char)('0' + ms % 10); ms /= 10; } while (ms && count < sizeof(digits));
++        sheng_log_putc('[');
++        sheng_log_putc('+');
++        while (count) sheng_log_putc(digits[--count]);
++        sheng_log_putc(' ');
++        sheng_log_putc('m');
++        sheng_log_putc('s');
++        sheng_log_putc(']');
++        sheng_log_putc(' ');
++    }
 +    for (unsigned n = 0; message && message[n] && n < 160; n++) sheng_log_putc(message[n]);
 +    sheng_log_putc('\n');
 +}

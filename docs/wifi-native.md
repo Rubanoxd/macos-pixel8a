@@ -26,3 +26,18 @@ Next options, from cheapest:
 2. Link IO80211Family from the BootKC and subclass its controller and interface (the AirportItlwm approach). This needs the
    26.5 class ABIs.
 3. Bring up AppleBCMWLANCore on the BCM4383: it needs an IOPCIDevice shim for the Exynos PCIe link and firmware compatibility.
+
+## Experiment, fullos275-276 (boot-arg `akita-netif-wifi=1`)
+
+- How airportd finds a Wi-Fi interface (IO80211.framework `_getIfListCopy`, `_Apple80211FindService`, `_isInfraInterface`):
+  - the BSD interface's `SIOCGIFMEDIA` must say IEEE 802.11;
+  - an IOKit service must match `IOPropertyMatch {IOInterfaceName: "en1"}`, the full BSD name;
+  - that service needs `IO80211InterfaceRole = "Infrastructure"`.
+  `en1` does all three in Wi-Fi mode.
+- What happens then:
+  - `networksetup -getairportpower en1` answers "Off (forced)";
+  - configd's only Apple80211 ioctl is GET type 12 (card capabilities, 21 bytes);
+  - airportd sends none;
+  - the menu bar is still missing.
+- airportd's power and state come through `IO80211APIUserClient`, which our IOKit classes do not provide. That user client is the
+  next thing to reverse (IO80211.framework `Apple80211BindToInterface*`) before the ioctls are worth answering.

@@ -1002,6 +1002,22 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
   // SIOCGIFXMEDIA, in their 32/64-bit forms: same leading fields, only the trailing list pointer differs). Without it
   // System Settings showed en1 "Not connected" (fullos268).
   const unsigned long num = cmd & 0xffff;
+  // akita (Generated-by: LLM): Apple80211 requests (SIOCSA80211 'i' 200, SIOCGA80211 'i' 201, struct apple80211req:
+  // if name[16], type, val, len, user data pointer at 32) from airportd/CoreWLAN when en1 is published as Wi-Fi
+  // (akita-netif-wifi=1). First step: log which ones come, so they can be answered one by one.
+  if ((num == (('i' << 8) | 200) || num == (('i' << 8) | 201)) && data) {
+    const uint32_t type = *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 16);
+    static uint8_t seen[2][256];
+    const int set = (num & 0xff) == 200 ? 1 : 0;
+    if (type < 256 && !seen[set][type]) {
+      seen[set][type] = 1;
+      char who[32] = {}; proc_selfname(who, sizeof who);
+      printf("pcie: apple80211 %s type %u val %u len %u from %s\n", set ? "SET" : "GET", type,
+             *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 20),
+             *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 24), who);
+    }
+    return EOPNOTSUPP;
+  }
   if ((num == (('i' << 8) | 56) || num == (('i' << 8) | 72)) && data) {
     struct MediaHead { char name[IFNAMSIZ]; int current, mask, status, active, count; };
     MediaHead *m = static_cast<MediaHead *>(data);
@@ -1009,7 +1025,7 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
     // 32-bit form, 8 (aligned at 40) in the 64-bit one; the ioctl's size field tells them apart (ifconfig: "no media types?")
     const int asked = m->count;
     const unsigned len = static_cast<unsigned>((cmd >> 16) & 0x1fff);
-    const int media = IFM_ETHER | IFM_AUTO;
+    const int media = (netif::gWifi ? IFM_IEEE80211 : IFM_ETHER) | IFM_AUTO;   // airportd lists only 802.11 media
     if (asked > 0) {
       user_addr_t list = 0;
       if (len >= 48) list = *reinterpret_cast<const uint64_t *>(static_cast<uint8_t *>(data) + 40);

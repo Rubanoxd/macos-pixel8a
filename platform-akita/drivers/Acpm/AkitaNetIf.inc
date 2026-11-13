@@ -40,6 +40,8 @@ OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface)
 
 namespace netif {
 
+bool gWifi = false;   // en1 published as Wi-Fi (its media then reads IEEE 802.11)
+
 IOEthernetController *gController = nullptr;
 IOEthernetInterface *gInterface = nullptr;
 
@@ -55,6 +57,7 @@ void publish(const uint8_t mac[6], unsigned unit) {
   if (!platform) return;
   unsigned wifi = 0;   // fullos271: as Wi-Fi without IO80211Family behind it, the menu bar disappeared (CoreWLAN clients)
   PE_parse_boot_argn("akita-netif-wifi", &wifi, sizeof wifi);
+  gWifi = wifi;
   gController = wifi ? new IO80211Controller : new IOEthernetController;
   if (!gController || !gController->init() || !gController->attach(platform)) {
     printf("netif: could not make the controller\n");
@@ -82,7 +85,10 @@ void publish(const uint8_t mac[6], unsigned unit) {
   snprintf(bsd, sizeof bsd, "en%u", unit);
   gInterface->setName(bsd);
   gInterface->setProperty("BSD Name", bsd);
-  gInterface->setProperty("IOInterfaceName", "en");
+  // airportd (IO80211.framework _Apple80211FindService) matches IOInterfaceName against the full BSD name and wants the
+  // infrastructure role; SystemConfiguration goes by BSD Name and the prefix
+  gInterface->setProperty("IOInterfaceName", wifi ? bsd : "en");
+  if (wifi) gInterface->setProperty("IO80211InterfaceRole", "Infrastructure");
   gInterface->setProperty("IOInterfaceNamePrefix", "en");
   setNumber(gInterface, "IOInterfaceUnit", unit, 32);
   setNumber(gInterface, "IOInterfaceType", 6, 8);   // IFT_ETHER

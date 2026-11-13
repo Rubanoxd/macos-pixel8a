@@ -40,7 +40,7 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **Boot: `fastboot boot` → desktop in ~2 min** (was ~6.5): no 30 s log pages in DarwinBoot, RELEASE UEFI, rc.server 55 → 19 s (`docs/boot-time.md`) | ✅ |
 | **Persistent shader cache** (`/private/var/folders` on the persistent container): WindowServer's pipelines 33 s → 154 ms per boot | ✅ |
 | **Battery in the menu bar** (MAX77759 fuel gauge as an IOPMPowerSource: percent, charging, voltage, temperature) | ✅ `pmset -g batt` shows InternalBattery-0; read-only |
-| **Display brightness** (MIPI DCS 0x51 to the OLED panel through DSIM0; volume keys step it in the full OS) | ✅ |
+| **Display brightness** (MIPI DCS 0x51 to the OLED panel through DSIM0) | ✅ macOS's own slider in Control Center (AkitaBacklightService + `tools/akita-brightnessd`), volume keys step it too |
 | **Disk images** (.dmg: DiskImageMounter, hdiutil) | ✅ AppleDiskImages2, the DiskImages family and HFS+ linked into the kernel; `/Volumes` writable |
 | **USB host**: keyboard and mouse through a USB-C hub (our xHCI driver, HID boot protocol) | ✅ plug the hub in and they work in ~20 s (the PD engine starts by itself once the Mac link is gone); mouse cursor drawn; scrolling works; low-speed devices pending; going back to the Mac's USB needs a reboot |
 | Stability: hour-long soaks with Wi-Fi/USB checks, 10-minute drag test, critical memory pressure (13.8 GB swap) | ✅ (the "hangs" after 1 h were the watchdog boot-arg `akita-wdt-pet-seconds=3600`: now pets for good) |

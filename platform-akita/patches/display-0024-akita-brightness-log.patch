@@ -1,0 +1,78 @@
+--- a/NativeGOPDisplay.cpp	2026-11-13 18:27:10
++++ b/NativeGOPDisplay.cpp	2026-11-13 18:27:10
+@@ -121,6 +121,12 @@
+     IOReturn notify_crc_ready_gated(unsigned int) override;
+     bool are_timings_enabled() const override;
+     IOReturn do_power_state_change_gated() override;
++    // akita (Generated-by: LLM): the brightness requests corebrightnessd makes, logged and passed on (display-0024)
++    IOReturn set_parameter(IOMFBParameterName, unsigned long long const *, unsigned int) override;
++    IOReturn set_brightness_gated(int) override;
++    IOReturn setBrightnessCorrection(unsigned int) override;
++    IOReturn splc_set_brightness(unsigned int) override;
++    IOReturn setProperties(OSObject *) override;
+ 
+ private:
+     static constexpr uint32_t kRefreshHz = 60;
+@@ -1424,3 +1430,62 @@
+ }
+ IOReturn NativeGOPDisplay::notify_crc_ready_gated(unsigned int) {return kIOReturnSuccess;}
+ bool NativeGOPDisplay::are_timings_enabled() const {return false;}
++
++// akita (Generated-by: LLM): what corebrightnessd asks the framebuffer for, so the panel brightness (AkitaBacklight.inc in the
++// kernel, DCS 0x51 over DSIM0) can follow macOS's own brightness. This first step only logs the calls and passes them on.
++static unsigned gBrightnessLog;
++static bool brightnessLogOK() { return gBrightnessLog++ < 300; }
++
++IOReturn NativeGOPDisplay::set_parameter(IOMFBParameterName name, unsigned long long const *values, unsigned int count)
++{
++    if (brightnessLogOK())
++        IOLog("NativeGOPDisplay: set_parameter %u count %u values %llu %llu %llu\n", static_cast<unsigned>(name), count,
++              values && count > 0 ? values[0] : 0ULL, values && count > 1 ? values[1] : 0ULL, values && count > 2 ? values[2] : 0ULL);
++    return IOMobileFramebufferLegacy::set_parameter(name, values, count);
++}
++
++IOReturn NativeGOPDisplay::set_brightness_gated(int value)
++{
++    if (brightnessLogOK())
++        IOLog("NativeGOPDisplay: set_brightness_gated %d (%#x)\n", value, static_cast<unsigned>(value));
++    return IOMobileFramebufferLegacy::set_brightness_gated(value);
++}
++
++IOReturn NativeGOPDisplay::setBrightnessCorrection(unsigned int value)
++{
++    if (brightnessLogOK())
++        IOLog("NativeGOPDisplay: setBrightnessCorrection %u (%#x)\n", value, value);
++    return IOMobileFramebufferLegacy::setBrightnessCorrection(value);
++}
++
++IOReturn NativeGOPDisplay::splc_set_brightness(unsigned int value)
++{
++    if (brightnessLogOK())
++        IOLog("NativeGOPDisplay: splc_set_brightness %u (%#x)\n", value, value);
++    return IOMobileFramebufferLegacy::splc_set_brightness(value);
++}
++
++IOReturn NativeGOPDisplay::setProperties(OSObject *properties)
++{
++    OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++    if (dict && brightnessLogOK()) {
++        OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++        char line[256] = "";
++        size_t used = 0;
++        while (it) {
++            const OSSymbol *key = OSDynamicCast(OSSymbol, it->getNextObject());
++            if (!key)
++                break;
++            OSNumber *num = OSDynamicCast(OSNumber, dict->getObject(key));
++            const int w = num ? snprintf(line + used, sizeof(line) - used, " %s=%llu", key->getCStringNoCopy(), num->unsigned64BitValue())
++                              : snprintf(line + used, sizeof(line) - used, " %s", key->getCStringNoCopy());
++            if (w <= 0 || used + static_cast<size_t>(w) >= sizeof(line))
++                break;
++            used += static_cast<size_t>(w);
++        }
++        if (it)
++            it->release();
++        IOLog("NativeGOPDisplay: setProperties%s\n", line);
++    }
++    return IOMobileFramebufferLegacy::setProperties(properties);
++}

@@ -349,6 +349,7 @@ extern "C" int akita_acpm_rtc_write(uint64_t seconds);
 extern "C" void akita_acpm_boot_profile(void);
 extern "C" void akita_wifi_boot(void);   // akita: AkitaPcie.inc
 extern "C" void akita_battery_boot(void);   // akita: AkitaBattery.inc
+extern "C" void akita_backlight_boot(void);   // akita: AkitaBacklight.inc
 extern "C" void akita_acpm_boot_profile(void) {
   printf("macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano\n");   // akita: the author's mark in every boot log
   unsigned allowed = 0, profile = 0;
@@ -368,6 +369,7 @@ extern "C" void akita_acpm_boot_profile(void) {
     }
   }
   if (allowed) akita_wifi_boot();   // akita: the Wi-Fi (AkitaPcie.inc), boot-arg akita-wifi=1
+  if (allowed) akita_backlight_boot();   // akita: the brightness service macOS drives (AkitaBacklight.inc), akita-backlight=0 off
   if (allowed) akita_battery_boot();   // akita: the battery in the menu bar (AkitaBattery.inc), boot-arg akita-battery=0 off
   if (!allowed || profile != 1 || gProfileCall) return;
   if (!gAcpmLock) gAcpmLock = IOLockAlloc();
@@ -421,6 +423,7 @@ extern "C" {   // akita: bpf.h has no extern "C" of its own
 #include "AkitaBacklight.inc"   // akita: panel brightness over DSIM0 (kern.akita_acpm = 9000000 state, 9100000 + level)
 extern "C" int akita_backlight_set(unsigned level) { return backlight::set(level); }
 extern "C" unsigned akita_backlight_level(void) { return backlight::level(); }
+extern "C" void akita_backlight_boot(void) { backlight::boot(); }
 extern "C" void akita_battery_boot(void) { battery::boot(); }
 
 extern "C" int akita_acpm_command(unsigned what) {

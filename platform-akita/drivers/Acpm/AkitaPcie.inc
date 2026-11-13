@@ -1005,10 +1005,27 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
   if ((num == (('i' << 8) | 56) || num == (('i' << 8) | 72)) && data) {
     struct MediaHead { char name[IFNAMSIZ]; int current, mask, status, active, count; };
     MediaHead *m = static_cast<MediaHead *>(data);
-    m->current = m->active = IFM_ETHER | IFM_AUTO;
+    // the media list (one entry) goes to the caller's ifm_ulist, a user pointer after the five ints: 4 bytes in the
+    // 32-bit form, 8 (aligned at 40) in the 64-bit one; the ioctl's size field tells them apart (ifconfig: "no media types?")
+    const int asked = m->count;
+    const unsigned len = static_cast<unsigned>((cmd >> 16) & 0x1fff);
+    const int media = IFM_ETHER | IFM_AUTO;
+    if (asked > 0) {
+      user_addr_t list = 0;
+      if (len >= 48) list = *reinterpret_cast<const uint64_t *>(static_cast<uint8_t *>(data) + 40);
+      else if (len >= 40) list = *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 36);
+      if (list && copyout(&media, list, sizeof media)) return EFAULT;
+    }
+    m->current = m->active = media;
     m->mask = 0;
     m->status = IFM_AVALID | (gLinkUp ? IFM_ACTIVE : 0);
-    m->count = 0;
+    m->count = 1;
+    // the boot-time link event went out before configd listened: say it again to the first one who asks
+    static bool announced;
+    if (!announced && gLinkUp) {
+      announced = true;
+      dlil_post_msg(reinterpret_cast<struct ifnet *>(ifp), KEV_DL_SUBCLASS, KEV_DL_LINK_ON, nullptr, 0, FALSE);
+    }
     return 0;
   }
   return EOPNOTSUPP;

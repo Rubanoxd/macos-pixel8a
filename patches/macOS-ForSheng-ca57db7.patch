@@ -140,7 +140,7 @@ index 46d4cb6..cef7c7e 100644
          /* Commit a valid cursor before any try-only scanline can skip the scroll. */
          sheng_panel.y = sheng_panel.rows - 1;
 diff --git a/platform/sheng/macos26/log/retained_log.h b/platform/sheng/macos26/log/retained_log.h
-index e39895c..5e77810 100644
+index e39895c..51ee990 100644
 --- a/platform/sheng/macos26/log/retained_log.h
 +++ b/platform/sheng/macos26/log/retained_log.h
 @@ -183,6 +183,7 @@ void sheng_log_bind_panel(uintptr_t address, unsigned stride, unsigned columns,
@@ -151,6 +151,31 @@ index e39895c..5e77810 100644
      sheng_panel_ready = 1;
      sheng_panel_reset();
      /* Replay only a bounded tail; pin the first panic line separately so long backtraces cannot overwrite it. */
+@@ -245,6 +246,24 @@ void sheng_log_stage(const char *message)
+     sheng_log_status(message);
+     const char *prefix = "\nSHENG: ";
+     while (*prefix) sheng_log_putc(*prefix++);
++    {
++        /* akita (Generated-by: LLM): the ARM counter in ms (not reset by the firmware chain), to time the boot stages */
++        uint64_t counter, frequency;
++        __asm__ volatile("mrs %0, CNTPCT_EL0" : "=r"(counter));
++        __asm__ volatile("mrs %0, CNTFRQ_EL0" : "=r"(frequency));
++        uint64_t ms = frequency >= 1000 ? counter / (frequency / 1000) : 0;
++        char digits[20];
++        unsigned count = 0;
++        do { digits[count++] = (char)('0' + ms % 10); ms /= 10; } while (ms && count < sizeof(digits));
++        sheng_log_putc('[');
++        sheng_log_putc('+');
++        while (count) sheng_log_putc(digits[--count]);
++        sheng_log_putc(' ');
++        sheng_log_putc('m');
++        sheng_log_putc('s');
++        sheng_log_putc(']');
++        sheng_log_putc(' ');
++    }
+     for (unsigned n = 0; message && message[n] && n < 160; n++) sheng_log_putc(message[n]);
+     sheng_log_putc('\n');
+ }
 diff --git a/platform/sheng/macos26/log/smp_log.h b/platform/sheng/macos26/log/smp_log.h
 index 55e34bb..9208520 100644
 --- a/platform/sheng/macos26/log/smp_log.h

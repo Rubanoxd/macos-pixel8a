@@ -29,7 +29,7 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **WindowServer composites on the GPU** (SkyLight's Metal compositor) | ✅ |
 | Dark mode, Liquid Glass (transparency) and wallpaper at boot | ✅ |
 | **Touchscreen** (Goodix on SPI, our own driver) with gestures: tap, drag, long press = right click, two-finger scroll | ✅ |
-| Window dragging: 15.7 → **~22 fps** (batched GPU submits, early swap completion, PanVK fast paths) | ✅ (goal: 60) |
+| Window dragging: 15.7 → ~22 → **~50–55 fps** (batched GPU submits, early swap completion, PanVK fast paths; 10-minute drag test: median 55.6 fps) | ✅ (goal: 60) |
 | GPU stable under stress (ring-full fault fixed; two jobs of slack counted from the job the GPU is in) | ✅ |
 | **Real clock**: boots with the time from the PMIC's RTC (S2MPG14), kept in sync | ✅ |
 | Autologin straight to the desktop with the persistent session | ✅ |
@@ -37,6 +37,10 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **Persistent home and settings**: the user's files survive a reboot (APFS volume in a window of `userdata`) | ✅ |
 | **Swap on flash** (real swapfiles, 2–6 GB under pressure) | ✅ |
 | **RAM: macOS sees 5.98 GiB** (was 4 GiB; UEFI heap moved, all 8 GiB declared, integrity-tested) | ✅ |
+| **Boot: `fastboot boot` → desktop in ~2 min** (was ~6.5): no 30 s log pages in DarwinBoot, RELEASE UEFI, rc.server 55 → 19 s (`docs/boot-time.md`) | ✅ |
+| **Persistent shader cache** (`/private/var/folders` on the persistent container): WindowServer's pipelines 33 s → 154 ms per boot | ✅ |
+| **USB host**: keyboard and mouse through a USB-C hub (our xHCI driver, HID boot protocol) | ✅ full/high speed; low-speed devices pending |
+| Stability: hour-long soaks with Wi-Fi/USB checks, 10-minute drag test, critical memory pressure (13.8 GB swap) | ✅ one hard hang seen (cause open) |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
 | Wi-Fi (BCM4383 on PCIe): **joins WPA2 at boot, DHCP, internet (DNS, HTTPS)**; kernel log, shell and fastboot reset over Wi-Fi; no Wi-Fi menu yet (`en1` is not an IOKit interface) | ✅ works, `docs/wifi-bringup.md` |
 | USB-C: Power Delivery and DisplayPort alternate mode (MAX77759 TCPC) | ✅ PD contract, host role, DP mode configured with a USB-C HDMI hub; video output next, see `docs/research-hdmi-usbc.md` |

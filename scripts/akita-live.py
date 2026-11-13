@@ -16,6 +16,7 @@ Por Wi-Fi (canal de AkitaPcie.inc, para cuando el USB-C tiene un dongle; el Mac 
   wlog [fichero]           saluda por broadcast (UDP 5141) y recibe el log del kernel por unicast; guarda la IP del teléfono
                            en scratch/live/phone-wifi-ip (para `AKHOST=$(cat ...) scratch/akx ...`)
   wfastboot                como `fastboot`, a la IP guardada (solo lo acepta del Mac que saludó)
+  wshot [salida.png] [n]   captura de pantalla por Wi-Fi (reducida n veces)
   wcmd <n>                 ejecuta en el kernel la orden kern.akita_acpm=<n> (p. ej. 5000010 arranca el Power Delivery)
 """
 import os
@@ -113,6 +114,46 @@ def wlog(path):
             sys.stdout.flush()
             f.write(text)
             f.flush()
+
+
+def wshot(path, scale):
+    try:
+        phone = open(WIFI_IP_FILE).read().strip()
+    except OSError:
+        sys.exit('no sé la IP Wi-Fi del teléfono: deja corriendo `akita-live.py wlog` primero')
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(('0.0.0.0', 0))
+    s.settimeout(3)
+    s.sendto(('S%d' % scale).encode(), (phone, 5141))
+    image, got, total, size, frame = None, 0, None, None, None
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        try:
+            data = s.recv(2048)
+        except socket.timeout:
+            break
+        if data[:4] != b'AKFB':
+            continue
+        fid, offset, tot = struct.unpack_from('<III', data, 4)
+        w, h = struct.unpack_from('<HH', data, 16)
+        if frame is None:
+            frame, total, size = fid, tot, (w, h)
+            image = bytearray(tot)
+        if fid != frame:
+            continue
+        payload = data[20:]
+        image[offset:offset + len(payload)] = payload
+        got += len(payload)
+        if got >= total:
+            break
+    if image is None:
+        sys.exit('sin respuesta del teléfono por Wi-Fi')
+    w, h = size
+    if os.environ.get('AKITA_RAW_SHOT') != '1':
+        image, w, h = rotate_ccw(image, w, h)
+        image = watermark(image, w, h)
+    png(path, w, h, bytes(image))
+    print('%s: %dx%d, %d/%d bytes%s' % (path, w, h, got, total, '' if got >= total else ' (INCOMPLETA)'))
 
 
 def encode_text(text):
@@ -257,6 +298,9 @@ def main():
         wlog(args[1] if len(args) > 1 else os.path.join(OUT, 'wifi-%s.log' % time.strftime('%H%M%S')))
     elif what == 'wfastboot':
         wsend('FASTBOOT')
+    elif what == 'wshot':   # screenshot over Wi-Fi
+        path = args[1] if len(args) > 1 else os.path.join(OUT, 'wshot-%s.png' % time.strftime('%H%M%S'))
+        wshot(path, int(args[2]) if len(args) > 2 else 2)
     elif what == 'wcmd':   # an akita_acpm command (kern.akita_acpm) run by the kernel itself, no userland needed
         wsend('K%d' % int(args[1]))
     elif what == 'replay':

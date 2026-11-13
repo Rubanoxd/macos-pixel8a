@@ -280,6 +280,13 @@ bool Gadget::start()
   dwc3Write(DEVTEN, (1U << 0) | (1U << 1) | (1U << 2));   // disconnect, USB reset, connect done
   dwc3Write(DCTL, dwc3Read(DCTL) | 0x80000000U);
   IOLog("usbgadget: started (dma %llx, setup %s), dsts=%08x\n", fPhys, ok ? "ok" : "FAILED", dwc3Read(DSTS));
+  {   // akita (Generated-by: LLM): the ARM counter against the calendar, to put arm_init's counter (boot clock line) on the wall clock
+    clock_sec_t sec = 0;
+    clock_usec_t usec = 0;
+    clock_get_calendar_microtime(&sec, &usec);
+    const uint64_t c = __builtin_arm_rsr64("CNTPCT_EL0"), f = __builtin_arm_rsr64("CNTFRQ_EL0");
+    IOLog("AKITA boot clock: gadget at counter %llu (%llu ms), calendar %lu.%06u UTC\n", c, f ? c / (f / 1000) : 0, (unsigned long)sec, (unsigned)usec);
+  }
   return true;
 }
 
@@ -298,10 +305,23 @@ void Gadget::stall()
   startSetup();
 }
 
+// akita (Generated-by: LLM): the USB host (AkitaUsbHost.h) takes the controller when the PD engine makes the phone the host
+volatile bool gStopRequest = false, gStopped = false;
+
 void Gadget::run()
 {
   uint64_t lastSummary = 0, now = 0;
   for (;;) {
+    if (gStopRequest) {
+      dwc3Write(DEVTEN, 0);
+      dwc3Write(DCTL, dwc3Read(DCTL) & ~0x80000000U);   // run/stop: the pull-up goes away
+      for (unsigned i = 0; i < 100 && !(dwc3Read(DSTS) & (1U << 22)); ++i)
+        IOSleep(1);
+      IOLog("usbgadget: stopped for the USB host (dsts %08x)\n", dwc3Read(DSTS));
+      gStopped = true;
+      for (;;)
+        IOSleep(60000);
+    }
     uint32_t pending = dwc3Read(GEVNTCOUNT) & 0xffff;
     if (pending) {
       barrier();

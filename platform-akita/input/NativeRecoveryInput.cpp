@@ -67,12 +67,12 @@ const uint8_t keyboardDescriptor[] = {
   0xc0,
 };
 
-// Boot mouse: three buttons, relative X and Y.
+// Boot mouse: three buttons, relative X and Y, and (akita, for USB mice) a relative wheel.
 const uint8_t mouseDescriptor[] = {
   0x05, 0x01, 0x09, 0x02, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00,
   0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
   0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
-  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
+  0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
   0xc0, 0xc0,
 };
 
@@ -376,6 +376,7 @@ void usbProbeThread(void *, wait_result_t)
 }
 
 #include "AkitaUsbGadget.h"
+#include "AkitaUsbHost.h"   // akita: USB host (xHCI) for a keyboard and mouse once USB PD makes the phone the host
 
 }  // namespace
 
@@ -448,6 +449,9 @@ class NativeRecoveryInput : public IOService {
 
 public:
   void queueRemote(const char *steps, unsigned length);
+  // akita (Generated-by: LLM): a USB keyboard and mouse behind a hub (AkitaUsbHost.h), as these HID devices
+  static void usbKeys(void *self, const uint8_t report[8]);
+  static void usbMouse(void *self, uint8_t buttons, int dx, int dy, int wheel);
   // akita (Generated-by: LLM): the touchscreen's first finger (AkitaTouch.inc in the kernel), panel coordinates 1080 x 2400 portrait
   static void touchSink(void *self, int panelX, int panelY, int down);
 
@@ -558,6 +562,15 @@ bool NativeRecoveryInput::start(IOService *provider)
       gadget::gRemoteInput = remoteInputHook;
       IOLog("NativeRecoveryInput: remote input on UDP 5141\n");
       akita_touch_set_sink(touchSink, this);   // akita: the touchscreen moves and presses the same tablet
+      // akita: USB host for a keyboard and mouse behind a USB-C hub (AkitaUsbHost.h), started when the PD engine says so
+      if (!fMouse)
+        fMouse = newDevice(this, kindMouse);
+      usbhost::gCtx = this;
+      usbhost::gKeys = usbKeys;
+      usbhost::gMouse = usbMouse;
+      thread_t host;
+      if (kernel_thread_start(usbhost::hostThread, nullptr, &host) == KERN_SUCCESS)
+        thread_deallocate(host);
     } else {
       release();
     }
@@ -612,10 +625,30 @@ void NativeRecoveryInput::sendMouse(bool button, int dx, int dy)
 {
   if (!fMouse)
     return;
-  uint8_t bytes[3] = {(uint8_t)(button ? 1 : 0), (uint8_t)(int8_t)dx, (uint8_t)(int8_t)dy};
+  uint8_t bytes[4] = {(uint8_t)(button ? 1 : 0), (uint8_t)(int8_t)dx, (uint8_t)(int8_t)dy, 0};
   IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, sizeof(bytes), kIODirectionNone);
   if (report) {
     fMouse->handleReport(report);
+    report->release();
+  }
+}
+
+void NativeRecoveryInput::usbKeys(void *self, const uint8_t report[8])
+{
+  if (self)
+    static_cast<NativeRecoveryInput *>(self)->sendKeys(report);
+}
+
+void NativeRecoveryInput::usbMouse(void *self, uint8_t buttons, int dx, int dy, int wheel)
+{
+  NativeRecoveryInput *input = static_cast<NativeRecoveryInput *>(self);
+  if (!input || !input->fMouse)
+    return;
+  auto clamp = [](int v) { return static_cast<uint8_t>(static_cast<int8_t>(v < -127 ? -127 : v > 127 ? 127 : v)); };
+  uint8_t bytes[4] = {static_cast<uint8_t>(buttons & 7), clamp(dx), clamp(dy), clamp(wheel)};
+  IOBufferMemoryDescriptor *report = IOBufferMemoryDescriptor::withBytes(bytes, sizeof(bytes), kIODirectionNone);
+  if (report) {
+    input->fMouse->handleReport(report);
     report->release();
   }
 }

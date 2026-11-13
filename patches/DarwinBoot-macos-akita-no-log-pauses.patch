@@ -1,0 +1,65 @@
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -608,7 +608,18 @@
+     LineLength[Count] = (UINT32)(Next - Cursor);
+     Count++;
+   }
+-  // Five pages of the last 145 lines, oldest first, 30 s each.
++  // akita (Generated-by: LLM): the previous boot's log only matters after a panic; every boot spent 2.5-3 minutes here
++  // (fullos247: arm_init 3 min 25 s after fastboot boot). Shown only when a line of it mentions a panic, 3 s a page.
++  {
++    BOOLEAN Panicked = FALSE;
++    for (Index = 0; (Index < Count) && !Panicked; Index++) {
++      Panicked = AkitaLineHas (Text + LineAt[Index], LineLength[Index], "panic(") ||
++                 AkitaLineHas (Text + LineAt[Index], LineLength[Index], "Kernel stack") ||
++                 AkitaLineHas (Text + LineAt[Index], LineLength[Index], "SError");
++    }
++    if (!Panicked) { return; }
++  }
++  // Five pages of the last 145 lines, oldest first, 3 s each.
+   for (Page = 0; Page < 5; Page++) {
+     First = (Count > (5 - Page) * 29) ? Count - (5 - Page) * 29 : 0;
+     if ((Page < 4) && (Count <= (4 - Page) * 29)) { continue; }
+@@ -623,7 +634,7 @@
+     for (Index = First; (Index < First + 29) && (Index < Count); Index++) {
+       Y = AkitaDiagLine (Text + LineAt[Index], LineLength[Index], Y, 3);
+     }
+-    for (Second = 0; Second < 30; Second++) {
++    for (Second = 0; Second < 3; Second++) {
+       if ((MmioRead32 (0x10060000) & BIT5) != 0) { MmioWrite32 (0x10060008, 0xFFFF); }
+       gBS->Stall (1000000);
+     }
+@@ -694,7 +705,7 @@
+   UINTN                 MapSize = 0, Key, Stride, Offset;
+   UINT32                Version;
+   EFI_STATUS            Status;
+-  UINT64                Address, End, Found = 0, Second;
++  UINT64                Address, End, Found = 0;
+   CONST UINT8           *Log;
+   CHAR8                 Header[160];
+   UINTN                 Y;
+@@ -770,11 +781,7 @@
+         Y = AkitaDiagLine (Header, AsciiStrLen (Header), Y, 3);
+       }
+     }
+-    for (Second = 0; Second < 20; Second++) {
+-      if ((MmioRead32 (0x10060000) & BIT5) != 0) { MmioWrite32 (0x10060008, 0xFFFF); }
+-      gBS->Stall (1000000);
+-    }
+-    goto Done;
++    goto Done;   // akita: no 20 s wait when no previous log is found (an ordinary cold boot)
+   }
+   Log = (CONST UINT8 *)(UINTN)Found;
+   AkitaDrawLog (Log, "RAM", Found);
+@@ -1072,10 +1079,7 @@
+     UINTN Second;
+     AsciiSPrint (Line, sizeof (Line), "WINDOW %lx + %lx  NEXT LOG AT %lx", Address, (UINT64)WindowSize, mAkitaNextLog);
+     AkitaDiagLine (Line, AsciiStrLen (Line), 0, 3);
+-    for (Second = 0; Second < 6; Second++) {
+-      if ((MmioRead32 (0x10060000) & BIT5) != 0) { MmioWrite32 (0x10060008, 0xFFFF); }
+-      gBS->Stall (1000000);
+-    }
++    (void)Second;   // akita: no 6 s wait on the window line
+   }
+   LogArmStatus = Status;
+   if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND) && (Status != EFI_UNSUPPORTED)) {

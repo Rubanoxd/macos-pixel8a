@@ -94,7 +94,17 @@ Phases 1–4 do not depend on macOS: they can be tested from the kernel with log
   - **Reading the RX buffer through READABLE_BYTE_COUNT (0x30), in one transaction.** On the MAX77759 the buffer can only
     be read that way, as Linux `tcpci_maxim_core.c` does.
 - The Wi-Fi control channel (`akita-live.py wcmd 5000010`) starts PD with the hub plugged, so no USB link is needed.
-- Next: USB host mode (DWC3 as xHCI) for a keyboard and mouse behind the hub. After that, phase 3 for video: the PHY, AUX
+- **USB host works.** `platform-akita/input/AkitaUsbHost.h` is a small polled xHCI driver in the input kext. When PD makes
+  the phone the host, it stops the gadget, sets DWC3 GCTL.PRTCAPDIR to host, enumerates the hub and drives HID boot keyboards
+  and mice into NativeRecoveryInput's HID devices. Two keys:
+  - **MAX77759 vendor register USBSW_CTRL (0x93) must be 0x09.** That connects D+/D- to the AP; it is 0x00 after the attach.
+    The PD engine sets it on DR_Swap.
+  - **Low-speed devices behind the hub are left alone for now.** Resetting one took the root port down.
+  A Logitech receiver delivered 981 keyboard and mouse reports into macOS with no link drops.
+- **The cursor arrives as layer 1** of each IOMFB swap: a 128x128 BGRA surface, at +96/+100 of the swap record (x and y,
+  ×256). NativeGOPDisplay only showed layer 0. `display-0023` blends it into the rows as they are copied (not yet tested on
+  the phone).
+- Next: phase 3 for video: the PHY, AUX and the EDID, with a capture card as the monitor. After that, phase 3 for video: the PHY, AUX
   and the EDID, with a capture card as the monitor.
 
 ## Risks and open questions

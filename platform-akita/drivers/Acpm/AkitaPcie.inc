@@ -1063,11 +1063,58 @@ bool ctlSendLocked(const uint8_t src[4], uint16_t sport, uint16_t dport, const v
   memcpy(eh, gPeer.mac, 6); memcpy(eh + 6, gMac, 6); eh[12] = 0x08; eh[13] = 0x00;
   return txPost(slot, eh, ipLen);
 }
+// akita (Generated-by: LLM): a screenshot over Wi-Fi ("S<n>", the gadget's format: "AKFB" + id, offset, total, width, height +
+// RGB), the framebuffer the panel scans out, downscaled n times, to the port the request came from.
+struct WifiShot { bool active; uint8_t *img; uint32_t bytes, w, h, total, off, id; uint16_t port; IOMemoryMap *fb; PE_Video video; };
+WifiShot gShot;
+void shotStart(uint16_t port, unsigned scale) {
+  if (gShot.active) return;
+  if (!gShot.fb) {
+    if (IOService::getPlatform()->getConsoleInfo(&gShot.video) != kIOReturnSuccess || gShot.video.v_depth != 32 || !gShot.video.v_width) {
+      printf("pcie: control channel: no framebuffer for a screenshot\n"); return;
+    }
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(gShot.video.v_baseAddr & ~3UL, gShot.video.v_rowBytes * gShot.video.v_height, kIODirectionIn);
+    if (md) { gShot.fb = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache); md->release(); }
+    if (!gShot.fb) return;
+  }
+  if (scale < 1) scale = 1;
+  if (scale > 4) scale = 4;
+  const uint32_t w = static_cast<uint32_t>(gShot.video.v_width / scale), h = static_cast<uint32_t>(gShot.video.v_height / scale);
+  const uint32_t need = w * h * 3;
+  if (gShot.bytes < need) { if (gShot.img) IOFree(gShot.img, gShot.bytes); gShot.img = static_cast<uint8_t *>(IOMalloc(need)); gShot.bytes = gShot.img ? need : 0; }
+  if (!gShot.img) return;
+  const uint8_t *fb = reinterpret_cast<const uint8_t *>(gShot.fb->getVirtualAddress());
+  uint8_t *out = gShot.img;
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint32_t *row = reinterpret_cast<const uint32_t *>(fb + static_cast<uint64_t>(y) * scale * gShot.video.v_rowBytes);
+    for (uint32_t x = 0; x < w; ++x) { const uint32_t px = row[x * scale]; *out++ = static_cast<uint8_t>(px >> 16); *out++ = static_cast<uint8_t>(px >> 8); *out++ = static_cast<uint8_t>(px); }
+  }
+  gShot.w = w; gShot.h = h; gShot.total = need; gShot.off = 0; gShot.port = port; ++gShot.id;
+  __atomic_store_n(&gShot.active, true, __ATOMIC_RELEASE);
+}
+
 // The retained kernel log to the peer, a few datagrams per poll tick, never more than half the TX slots in flight.
 void ctlPump() {
   if (!gPeer.on) return;
   uint8_t src[4] = {};
   ownIp(src);
+  if (__atomic_load_n(&gShot.active, __ATOMIC_ACQUIRE)) {   // a screenshot goes first
+    IOLockLock(gTxLock);
+    for (unsigned n = 0; n < 8 && gShot.off < gShot.total && gTxPosted - gTxDone < kNumTx / 2; ++n) {
+      uint32_t len = gShot.total - gShot.off;
+      if (len > 1400) len = 1400;
+      uint8_t h[20] = {'A', 'K', 'F', 'B'};
+      const uint32_t f[3] = {gShot.id, gShot.off, gShot.total};
+      memcpy(h + 4, f, 12);
+      const uint16_t wh[2] = {static_cast<uint16_t>(gShot.w), static_cast<uint16_t>(gShot.h)};
+      memcpy(h + 16, wh, 4);
+      if (!ctlSendLocked(src, 5142, gShot.port, h, 20, gShot.img + gShot.off, len)) break;
+      gShot.off += len;
+    }
+    if (gShot.off >= gShot.total) gShot.active = false;
+    IOLockUnlock(gTxLock);
+    return;
+  }
   enum : uint32_t { kTotal = 24, kPrefix = 128, kPrefixBytes = 16384, kTail = 128 + 16384, kTailBytes = 65536, kChunk = 1400 };
   IOLockLock(gTxLock);
   for (unsigned n = 0; n < 4 && gTxPosted - gTxDone < kNumTx / 2; ++n) {
@@ -1135,6 +1182,8 @@ bool ctlFrame(const uint8_t *f, uint32_t len) {
     // commands other than hello only from the peer
   } else if (t[0] == 'L') {
     IOLockLock(gTxLock); gPeer.sent = 0; IOLockUnlock(gTxLock);
+  } else if (t[0] == 'S') {
+    shotStart(static_cast<uint16_t>((l4[0] << 8) | l4[1]), tl > 1 && t[1] >= '1' && t[1] <= '4' ? static_cast<unsigned>(t[1] - '0') : 2);
   } else if (t[0] == 'K' && tl > 1 && tl < 12) {   // K<number>: an akita_acpm command (sysctl kern.akita_acpm) without userland
     uint32_t v = 0;
     for (uint32_t i = 1; i < tl && t[i] >= '0' && t[i] <= '9'; ++i) v = v * 10 + static_cast<uint32_t>(t[i] - '0');

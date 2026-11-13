@@ -1,0 +1,41 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -666,6 +666,38 @@
+     }
+     int selected = fLandscape ? nativeGopScanoutLayer(geometry, mask, fVideo.v_height, fVideo.v_width)
+                               : nativeGopScanoutLayer(geometry, mask, fVideo.v_width, fVideo.v_height);
++    // akita (Generated-by: LLM): where does the swap record keep the cursor layer's rectangle? Words that change between
++    // cursor swaps, when both values look like a coordinate (small integers, or floats from 1 to 2^14), for the first swaps.
++    if ((mask & 2) && surfaces[1]) {
++        static uint32_t prev[688];
++        static bool have;
++        static unsigned reports;
++        const uint32_t *w = reinterpret_cast<const uint32_t *>(swap);
++        if (have && reports < 15) {
++            char line[600];
++            size_t at = 0;
++            unsigned n = 0;
++            for (unsigned i = 0; i < 688 && n < 16; i++) {
++                if (w[i] == prev[i])
++                    continue;
++                auto plausible = [](uint32_t v) {
++                    uint32_t e = (v >> 23) & 0xff;
++                    return v < 0x10000 || (!(v >> 31) && e >= 127 && e <= 141);
++                };
++                if (!plausible(w[i]) || !plausible(prev[i]))
++                    continue;
++                at += snprintf(line + at, sizeof(line) - at, " +%u:%x>%x", i * 4, prev[i], w[i]);
++                n++;
++            }
++            if (n) {
++                reports++;
++                IOLog("NativeGOPDisplay: cursor swap mask %#x layer1 %llux%llu fmt %#x:%s\n", mask, geometry[1].width,
++                      geometry[1].height, geometry[1].format, line);
++            }
++        }
++        memcpy(prev, w, sizeof(prev));
++        have = true;
++    }
+     if (layerTraceOpen()) {   // akita bring-up: each distinct swap shape during a scripted test
+         static unsigned traced;
+         static uint64_t lastKey;

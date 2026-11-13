@@ -26,6 +26,7 @@
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern "C" int akita_acpm_command(unsigned what);
+extern "C" int akita_usbhost_command(unsigned n);   // akita: AkitaTypec.inc
 extern "C" int akita_acpm_get_khz(unsigned domain, uint32_t *khz);
 
 namespace {
@@ -448,7 +449,15 @@ extern "C" int akita_acpm_command(unsigned what) {
     return 0;
   }
   if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);
-  if (what >= 5000010 && what < 5000100) return typec::command(what - 5000000);   // akita: USB PD (AkitaTypec.inc)
+  if (what >= 5000010 && what < 5000100) return typec::command(what - 5000000);
+  if (what > 6000000 && what < 6000100) return akita_usbhost_command(what - 6000000);   // akita: USB host experiments (input driver)
+  if (what >= 7000000 && what < 7256256) {   // akita: read one I2C register on HSI2C 11: 7000000 + device * 1000 + register (AkitaI2c.inc)
+    const unsigned dev = (what - 7000000) / 1000, reg = (what - 7000000) % 1000;
+    if (dev > 0x7f || reg > 0xff) return -1;
+    char name[24]; snprintf(name, sizeof name, "peek %02x/%02x", dev, reg);
+    i2c::dump(name, static_cast<uint8_t>(dev), static_cast<uint8_t>(reg), 1);
+    return 0;
+  }   // akita: USB PD (AkitaTypec.inc)
   if (what > 5000000 && what < 5000100) return i2c::command(what - 5000000);   // akita: MAX77759 bus (AkitaI2c.inc)   // akita: Wi-Fi PCIe stages (AkitaPcie.inc)
   if (what == 3000000 || what == 3000001) {   // akita: the PMIC RTC: 3000000 writes the kernel's calendar time (UTC) into it, 3000001 reads it
     uint64_t t = 0;

@@ -12,10 +12,13 @@
 // Linux typec/altmodes/displayport.c and include/linux/usb/typec_dp.h (DP configure VDO).
 namespace i2c {
 bool writeAllowed(uint8_t dev, uint8_t reg, const uint8_t *d, unsigned n) {
+  // the eUSB2 repeater: its port-1 enable (I2C_GLOBAL_CONFIG) and the tuning Android writes (akita DT eusb_repeater_tune)
+  if (dev == 0x3E) return n == 1 && (reg == 0xB2 || reg == 0x50 || reg == 0x70 || reg == 0x71 || reg == 0x73 || reg == 0x79);
   if (dev != 0x25) return false;
   if (reg == 0x10 && n <= 2) return true;                                // ALERT: write 1 to clear
   if (reg == 0x2E && n == 1) return true;                                // MESSAGE_HEADER_INFO
   if (reg == 0x19 && n == 1) return true;                                // TCPC_CONTROL (only the orientation bit is changed)
+  if (reg == 0x93 && n == 1) return d[0] == 0x09 || d[0] == 0x00;         // vendor USBSW_CTRL: D+/D- to the AP (0x09) or off
   if (reg == 0x2F && n == 1) return true;                                // RECEIVE_DETECT
   if (reg == 0x50 && n == 1) return true;                                // TRANSMIT
   if (reg == 0x51 && n >= 3 && n <= 31) return true;                     // TX byte count, header, data objects
@@ -139,6 +142,18 @@ void vdmNext() {
   }
 }
 
+// MAX77759 vendor USBSW_CTRL (0x93): the switch between the connector's D+/D- and the AP. 0x09 = connected (the Pixel 8 Pro
+// Linux port reads 0x09 with USB working). After a charger detection on attach it may stay off: nobody on our side turns it
+// back on (Google's tcpci_max77759 enables the data path once attached).
+int dataPath(bool on) {
+  uint8_t before = 0xff, after = 0xff;
+  rd8(0x93, before);
+  const int r = wr8(0x93, on ? 0x09 : 0x00);
+  rd8(0x93, after);
+  printf("typec: USB data path %s: USBSW_CTRL %02x -> %02x (%d)\n", on ? "on" : "off", before, after, r);
+  return r;
+}
+
 void onContract() {
   gS.contract = true;
   if (!gS.sinking) {
@@ -206,6 +221,7 @@ void handleMessage(const uint8_t *b, unsigned cnt) {
         if (sendCtrl(C_ACCEPT) == 0) {
           gS.dfp = !gS.dfp; headerInfo();
           printf("typec: data role swapped: the phone is now %s\n", gS.dfp ? "the host (DFP)" : "a device (UFP)");
+          if (gS.dfp) dataPath(true);
           if (gS.dfp && gS.vdmStep == 0) { gS.vdmStep = 1; vdmNext(); }
         }
         break;
@@ -284,12 +300,9 @@ void thread(void *, wait_result_t) {
   while (gS.run) {
     poll();
     const uint64_t t = nowMs();
-    // with a contract and still a device, ask for the host role once a second, a few times
-    if (gS.contract && !gS.dfp) {
-      if (!contractAt) contractAt = t;
-      static unsigned asked;
-      if (t - contractAt > 500 && asked < 3 && t - contractAt > 500 + 1000ull * asked) { ++asked; sendCtrl(C_DR_SWAP); }
-    } else contractAt = 0;
+    // The host role is only taken when the partner asks (DR_Swap from a hub, fullos237): never asked for, so a Mac on the other
+    // end keeps the phone a device and the USB gadget link works.
+    (void)contractAt;
     // a VDM request with no answer in 1 s: send it again (up to the step's limit of the hub's patience)
     if (gS.dfp && gS.vdmStep && gS.vdmStep < 7 && t - gS.vdmAt > 1000) vdmNext();
     IOSleep(2);
@@ -357,7 +370,21 @@ int command(uint32_t stage) {
   }
   if (stage == 13) return sendCtrl(C_GET_SRC_CAP);
   if (stage == 14) return hardReset();
+  if (stage == 15) return dataPath(true);
+  if (stage == 16) {   // the repeater tuning Android writes (akita DT eusb_repeater_tune): 0x50 0x0a, 0x70 0x5f, 0x71 0x2e, 0x73 0x80, 0x79 0x40
+    static const uint8_t t[][2] = {{0x50, 0x0a}, {0x70, 0x5f}, {0x71, 0x2e}, {0x73, 0x80}, {0x79, 0x40}};
+    for (auto &e : t) { const int r = i2c::writeRegs(0x3E, e[0], &e[1], 1); uint8_t v = 0; i2c::readRegs(0x3E, e[0], &v, 1); printf("typec: repeater %02x <- %02x: %d, reads %02x\n", e[0], e[1], r, v); }
+    return 0;
+  }
   return -1;
 }
 
 }  // namespace typec
+
+// akita (Generated-by: LLM): for the USB host in the input driver (AkitaUsbHost.h): the phone is the host with a PD contract
+extern "C" int akita_typec_host(void) { return typec::gS.run && typec::gS.contract && typec::gS.dfp; }
+
+// akita (Generated-by: LLM): run-time experiments in the USB host (input driver), kern.akita_acpm = 6000000 + n
+static int (*volatile gUsbHostHook)(unsigned);
+extern "C" void akita_usbhost_set_hook(int (*hook)(unsigned)) { gUsbHostHook = hook; }
+extern "C" int akita_usbhost_command(unsigned n) { return gUsbHostHook ? gUsbHostHook(n) : -1; }

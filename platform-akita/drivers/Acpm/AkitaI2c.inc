@@ -182,7 +182,22 @@ int command(uint32_t stage) {
     printf("i2c: battery %d %%, %d mV, %d mA (+ charging), %d C\n", soc, mv, ma, temp);
     return 0;
   }
-  printf("i2c: stage %u unknown (1 state, 2 chip IDs, 3 TCPC state, 4 battery)\n", stage);
+  if (stage == 5) {   // eUSB2 repeater (0x3E): mode/config, tuning, interrupts, revision, global config, BC
+    dump("repeater 0x50 0x60", 0x3E, 0x50, 1); dump("repeater 0x60", 0x3E, 0x60, 1);
+    dump("repeater 0x70-0x79", 0x3E, 0x70, 10); dump("repeater int 0xA3-0xA4", 0x3E, 0xA3, 2);
+    dump("repeater rev, -, global, int_en 0xB0-0xB7", 0x3E, 0xB0, 8);
+    return 0;
+  }
+  if (stage == 6) {   // repeater port 1 off and on again (I2C_GLOBAL_CONFIG 0xB2 bit 6), as Google's eusb_repeater_ctrl
+    uint8_t g = 0;
+    if (readRegs(0x3E, 0xB2, &g, 1)) { printf("i2c: repeater not answering\n"); return 1; }
+    const uint8_t off = static_cast<uint8_t>(g | 0x40), on = static_cast<uint8_t>(g & ~0x40);
+    const int a = writeRegs(0x3E, 0xB2, &off, 1); IOSleep(5);
+    const int b = writeRegs(0x3E, 0xB2, &on, 1); IOSleep(3);
+    printf("i2c: repeater port 1 cycled (global %02x): %d %d\n", g, a, b);
+    return 0;
+  }
+  printf("i2c: stage %u unknown (1 state, 2 chip IDs, 3 TCPC state, 4 battery, 5 repeater, 6 repeater port cycle)\n", stage);
   return -1;
 }
 

@@ -1,0 +1,102 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -645,8 +645,60 @@
+     uint64_t now;
+     absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+     return now >= after * 1000000000ULL;
++}
++
++// akita (Generated-by: LLM): the cursor. WindowServer hands it over as layer 1 of a swap (a 128x128 BGRA surface, premultiplied
++// alpha); this driver used to show layer 0 only, so a USB mouse moved an invisible pointer. The layer's position is at +96 (x)
++// and +100 (y) of the swap record, in 1/256 pixels of the main surface (found by diffing cursor-only swaps, fullos245). The
++// cursor is blended into each surface row as it is read (landscape path), so the changed-pixel logic erases the old one.
++static uint32_t gCursorPix[128 * 128];
++static int32_t gCursorX, gCursorY;
++static uint32_t gCursorW, gCursorH;
++static bool gCursorOn;
++
++static void cursorLoad(IOSurface *surface)
++{
++    const uint64_t w = ioSurfaceWidth(surface), h = ioSurfaceHeight(surface), rowBytes = ioSurfaceBytesPerRow(surface);
++    const uint64_t base = ioSurfaceBaseOffset(surface);
++    IOMemoryDescriptor *memory = ioSurfaceMemory(surface);
++    if (!memory || ioSurfacePixelFormat(surface) != 0x42475241u || !w || !h || w > 128 || h > 128 || rowBytes < w * 4 ||
++        base + (h - 1) * rowBytes + w * 4 > memory->getLength())
++        return;
++    if (memory->prepare() != kIOReturnSuccess)
++        return;
++    for (uint64_t y = 0; y < h; y++)
++        memory->readBytes(base + y * rowBytes, gCursorPix + y * w, w * 4);
++    memory->complete();
++    gCursorW = static_cast<uint32_t>(w);
++    gCursorH = static_cast<uint32_t>(h);
+ }
+ 
++// Blend the cursor into one surface row (y) of the given width; returns the row to use (the converted buffer when touched).
++static const uint32_t *cursorRow(const uint32_t *row, uint32_t *scratch, uint64_t y, uint64_t width)
++{
++    if (!gCursorOn || static_cast<int64_t>(y) < gCursorY || static_cast<int64_t>(y) >= gCursorY + static_cast<int64_t>(gCursorH))
++        return row;
++    if (row != scratch)
++        memcpy(scratch, row, width * 4);
++    const uint32_t *c = gCursorPix + (static_cast<int64_t>(y) - gCursorY) * gCursorW;
++    for (uint32_t i = 0; i < gCursorW; i++) {
++        const int64_t x = gCursorX + static_cast<int64_t>(i);
++        const uint32_t p = c[i], a = p >> 24;
++        if (x < 0 || x >= static_cast<int64_t>(width) || !a)
++            continue;
++        if (a == 255) {
++            scratch[x] = p;
++            continue;
++        }
++        const uint32_t d = scratch[x], k = 255 - a;
++        const uint32_t r = ((p >> 16) & 0xff) + (((d >> 16) & 0xff) * k + 127) / 255;
++        const uint32_t g = ((p >> 8) & 0xff) + (((d >> 8) & 0xff) * k + 127) / 255;
++        const uint32_t b = (p & 0xff) + ((d & 0xff) * k + 127) / 255;
++        scratch[x] = 0xff000000u | (r > 255 ? 255 : r) << 16 | (g > 255 ? 255 : g) << 8 | (b > 255 ? 255 : b);
++    }
++    return scratch;
++}
++
+ void NativeGOPDisplay::program_hardware_gated()
+ {
+     IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kCurrentSwap);
+@@ -726,6 +778,30 @@
+                 IOLog("NativeGOPDisplay: rec+%u: %x %x %x %x %x %x %x %x\n", 560 + row * 32,
+                       words[row * 8], words[row * 8 + 1], words[row * 8 + 2], words[row * 8 + 3],
+                       words[row * 8 + 4], words[row * 8 + 5], words[row * 8 + 6], words[row * 8 + 7]);
++        }
++    }
++    bool cursorMoved = false;
++    if (mask & 2) {   // akita: the cursor layer: its image and position
++        if (surfaces[1]) {
++            const int32_t nx = static_cast<int32_t>(at<uint32_t>(swap, 96)) >> 8, ny = static_cast<int32_t>(at<uint32_t>(swap, 100)) >> 8;
++            cursorLoad(surfaces[1]);
++            cursorMoved = !gCursorOn || nx != gCursorX || ny != gCursorY || true;   // the image may have changed too
++            gCursorX = nx;
++            gCursorY = ny;
++            gCursorOn = gCursorW != 0;
++        } else if (gCursorOn) {
++            gCursorOn = false;
++            cursorMoved = true;
++        }
++    }
++    if (selected < 0 && cursorMoved && fLastSurface) {   // a cursor-only swap: the last frame again, with the cursor where it is now
++        if (fEarlyDefer) {
++            if (!fPending) {
++                reinterpret_cast<OSObject *>(fLastSurface)->retain();
++                fPending = fLastSurface;
++            }
++        } else {
++            fpsCopy(fLastSurface);
+         }
+     }
+     if (selected >= 0 && fEarlyDefer) {   // akita: early completion: the copy waits for the surface's GPU work
+@@ -957,6 +1033,7 @@
+             } else {
+                 row = reinterpret_cast<const uint32_t *>(fRow);
+             }
++            row = cursorRow(row, fConverted, sy, width);   // akita: the cursor, blended into the rows it covers
+             uint32_t *shown = fTurned + sy * width;
+             uint64_t first = width, last = 0;
+             if (fresh) {

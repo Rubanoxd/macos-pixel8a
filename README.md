@@ -39,7 +39,7 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | **RAM: macOS sees 5.98 GiB** (was 4 GiB; UEFI heap moved, all 8 GiB declared, integrity-tested) | ✅ |
 | **Boot: `fastboot boot` → desktop in ~2 min** (was ~6.5): no 30 s log pages in DarwinBoot, RELEASE UEFI, rc.server 55 → 19 s (`docs/boot-time.md`) | ✅ |
 | **Persistent shader cache** (`/private/var/folders` on the persistent container): WindowServer's pipelines 33 s → 154 ms per boot | ✅ |
-| **USB host**: keyboard and mouse through a USB-C hub (our xHCI driver, HID boot protocol) | ✅ full/high speed; low-speed devices pending |
+| **USB host**: keyboard and mouse through a USB-C hub (our xHCI driver, HID boot protocol) | ✅ plug the hub in and they work in ~20 s (the PD engine starts by itself once the Mac link is gone); mouse cursor drawn; scrolling works; low-speed devices pending; going back to the Mac's USB needs a reboot |
 | Stability: hour-long soaks with Wi-Fi/USB checks, 10-minute drag test, critical memory pressure (13.8 GB swap) | ✅ (the "hangs" after 1 h were the watchdog boot-arg `akita-wdt-pet-seconds=3600`: now pets for good) |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
 | Wi-Fi (BCM4383 on PCIe): **joins WPA2 at boot, DHCP, internet (DNS, HTTPS)**; kernel log, shell and fastboot reset over Wi-Fi; no Wi-Fi menu yet (`en1` is not an IOKit interface) | ✅ works, `docs/wifi-bringup.md` |

@@ -639,6 +639,9 @@ bool gNoScan, gScanOnly;
 char gWatchSsid[33];   // the network in network.conf: its security (RSN AKMs, PMF) is printed by the scan
 // akita (Generated-by: LLM): what the scan saw of that network, for the Apple80211 answers (Wi-Fi menu): BSSID, channel, RSSI
 uint8_t gCurBssid[6]; uint8_t gCurChannel; int16_t gCurRssi = -60; bool gHaveBss;
+// every network the last scans saw (by BSSID), for Apple80211 scan results; never logged
+struct ScanBss { uint8_t bssid[6]; char ssid[33]; uint8_t ssidLen, channel; int16_t rssi; uint16_t cap, beacon, ieLen; uint8_t ie[256]; };
+ScanBss gBss[40]; unsigned gBssN, gBssCursor; bool gAppleScanPending; uint32_t gEscanVer;
 volatile int gIoctlResult = -1;   // filled by whoever drains the control ring (ioctl() or the polling thread)
 uint8_t *gIoctlOut; uint32_t gIoctlOutMax;
 extern bool gPolling;
@@ -669,7 +672,11 @@ void onEvent(const uint8_t *pkt, uint16_t len) {
     static uint64_t counts[160]; if (type < 160 && ++counts[type] == 1000) printf("pcie: event %u seen 1000 times\n", type);
     onLink(); return;
   }
-  if (status != 8 || dlen < 12) { printf("pcie: scan done (status %u), %u networks seen\n", status, gScanSeen); return; }
+  if (status != 8 || dlen < 12) {
+    printf("pcie: scan done (status %u), %u networks seen\n", status, gScanSeen);
+    if (gAppleScanPending) { gAppleScanPending = false; post80211(10); }   // APPLE80211_M_SCAN_DONE
+    return;
+  }
   const uint8_t *r = pkt + 72;   // wl_escan_result: buflen, version, sync_id, bss_count, bss_info[]
   uint16_t count; memcpy(&count, r + 10, 2);
   const uint8_t *b = r + 12;
@@ -679,6 +686,17 @@ void onEvent(const uint8_t *pkt, uint16_t len) {
     int16_t rssi; memcpy(&rssi, b + 78, 2);
     printf("pcie: wifi: \"%s\" %02x:%02x:%02x:%02x:%02x:%02x channel %u RSSI %d dBm\n", sl ? ssid : "(hidden)", b[8], b[9], b[10], b[11], b[12], b[13], b[88], rssi);
     if (gWatchSsid[0] && !strcmp(ssid, gWatchSsid)) { memcpy(gCurBssid, b + 8, 6); gCurChannel = b[88]; gCurRssi = rssi; gHaveBss = true; }
+    {   // wl_bss_info: bssid +8, beacon period +14, capability +16, SSID length +18, SSID +19, RSSI +78, channel +88
+      unsigned k = 0; while (k < gBssN && memcmp(gBss[k].bssid, b + 8, 6)) ++k;
+      if (k == gBssN && gBssN < sizeof gBss / sizeof gBss[0]) ++gBssN;
+      if (k < gBssN) {
+        ScanBss &e = gBss[k]; memcpy(e.bssid, b + 8, 6); memcpy(e.ssid, ssid, sizeof e.ssid); e.ssidLen = static_cast<uint8_t>(sl);
+        e.channel = b[88]; e.rssi = rssi; memcpy(&e.beacon, b + 14, 2); memcpy(&e.cap, b + 16, 2);
+        uint16_t io; uint32_t il; memcpy(&io, b + 116, 2); memcpy(&il, b + 120, 4);   // the information elements (RSN, rates...)
+        if (b + io + il > pkt + len) il = 0;
+        e.ieLen = static_cast<uint16_t>(il > sizeof e.ie ? sizeof e.ie : il); memcpy(e.ie, b + io, e.ieLen);
+      }
+    }
     if (gWatchSsid[0] && !strcmp(ssid, gWatchSsid)) {   // RSN IE (48): AKM suites (2 PSK, 6 PSK-SHA256, 8 SAE), capabilities (bit 6 MFPR, bit 7 MFPC)
       uint16_t ieOff; uint32_t ieLen; memcpy(&ieOff, b + 116, 2); memcpy(&ieLen, b + 120, 4);
       const uint8_t *ie = b + ieOff, *end = ie + ieLen;
@@ -862,6 +880,7 @@ scan:
     const int32_t def = -1; for (unsigned k = 0; k < 4; ++k) memcpy(pp + first + k * 4, &def, 4);
     er = iovarSet("escan", e, 8u + plen);
     printf("pcie: stage 21: escan v%u: %d\n", ver, er);
+    if (er == 0) gEscanVer = ver;
   }
   for (unsigned ms = 0; ms < 8000; ms += 10) { IOSleep(10); if (!gPolling) drain(nullptr, 0); }
   printf("pcie: stage 21: %u networks in 8 s\n", gScanSeen);
@@ -872,6 +891,30 @@ scan:
 // /Users/akita/.akita/wifi/network.conf, written by the user: "ssid=<name>" and "psk=<passphrase>" lines. ----
 extern bool gPolling;
 void onLink();
+// akita (Generated-by: LLM): one escan with the parameters version the firmware took in stage 21, from a thread call
+// (Apple80211 scan requests come in an ioctl; the firmware call waits for its completion)
+thread_call_t gEscanCall;
+void escanNow(thread_call_param_t, thread_call_param_t) {
+  int er = -1;
+  for (uint32_t ver = gEscanVer ? gEscanVer : 4; ver >= 2 && er != 0; --ver) {
+  uint8_t e[8 + 80] = {};
+  const uint16_t act = 1, sync = 0x1235; memcpy(e, &ver, 4); memcpy(e + 4, &act, 2); memcpy(e + 6, &sync, 2);
+  uint8_t *pp = e + 8;
+  const uint16_t pv = static_cast<uint16_t>(ver), plen = ver == 4 ? 76 : 72;
+  memcpy(pp, &pv, 2); memcpy(pp + 2, &plen, 2);
+  memset(pp + 40, 0xff, 6); pp[46] = 2;
+  const unsigned first = ver == 4 ? 56 : 52;
+  const int32_t def = -1; for (unsigned k = 0; k < 4; ++k) memcpy(pp + first + k * 4, &def, 4);
+  er = iovarSet("escan", e, 8u + plen);
+  if (er == 0) gEscanVer = ver;
+  }
+  if (er) { printf("pcie: apple80211 scan: escan %d\n", er); if (gAppleScanPending) { gAppleScanPending = false; post80211(10); } }
+}
+void startEscan() {
+  if (!gEscanCall) gEscanCall = thread_call_allocate(escanNow, nullptr);
+  if (gEscanCall) thread_call_enter(gEscanCall);
+}
+
 int wifiJoin() {
   if (!gDma.va) { printf("pcie: stage 22: run stages 8 and 21 first\n"); return 1; }
   char conf[512] = {};
@@ -1041,6 +1084,30 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
           put32(0, 1); put32(4, 1); put32(8, 1); outLen = 24; rc = 0; break;
         case 13:     // STATE: in req_val; 4 = RUN (associated), 0 = INIT
           val = gLinkUp ? 4 : 0; rc = 0; break;
+        case 11:     // SCAN_RESULT: one network per call, 2272 bytes (IO80211 _addScanResultToList); EIO ends the list
+        case 103: {  // the current network, in the same layout
+          const ScanBss *pe = nullptr;
+          if (type == 11) {
+            if (gBssCursor >= gBssN) { gBssCursor = 0; rc = EIO; break; }
+            pe = &gBss[gBssCursor++];
+          } else {
+            for (unsigned k = 0; gLinkUp && gHaveBss && k < gBssN; ++k) if (!memcmp(gBss[k].bssid, gCurBssid, 6)) pe = &gBss[k];
+            if (!pe) { rc = ENXIO; break; }
+          }
+          const ScanBss &e = *pe;
+          uint8_t *r = static_cast<uint8_t *>(IOMallocZero(0x8e0));
+          if (!r) { rc = ENOMEM; break; }
+          auto w32 = [&](unsigned o, uint32_t v) { memcpy(r + o, &v, 4); };
+          auto w16 = [&](unsigned o, uint16_t v) { memcpy(r + o, &v, 2); };
+          w32(0, 1); w32(4, 1); w32(8, e.channel); w32(0xc, (e.channel <= 14 ? 0x8u : 0x10u) | 0x2u);
+          w16(0x12, static_cast<uint16_t>(-92)); w16(0x14, static_cast<uint16_t>(e.rssi + 92)); w16(0x16, static_cast<uint16_t>(e.rssi));
+          w16(0x18, e.beacon); w16(0x1a, e.cap); memcpy(r + 0x1c, e.bssid, 6);
+          r[0x60] = e.ssidLen; memcpy(r + 0x61, e.ssid, e.ssidLen);
+          w16(0x8a, e.ieLen); memcpy(r + 0x8c, e.ie, e.ieLen);
+          const int c = (ptr && len) ? copyout(r, ptr, len < 0x8e0u ? len : 0x8e0u) : EINVAL;
+          IOFree(r, 0x8e0);
+          rc = c; break;
+        }
         case 15:     // OP_MODE: version, mode (1 = station)
           put32(0, 1); put32(4, 1); outLen = 8; rc = 0; break;
         case 1: {    // SSID: the bytes, length back in req_len (never logged)
@@ -1079,6 +1146,8 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
       }
     } else if (type == 19 || type == 5) {   // POWER on/off, POWERSAVE: accepted (the radio stays as it is)
       rc = 0;
+    } else if (type == 10) {   // SCAN_REQ: an escan; SCAN_DONE goes out when the firmware finishes
+      gAppleScanPending = true; gBssCursor = 0; startEscan(); rc = 0;
     }
     int copied = 0;
     if (rc == 0 && outLen && ptr && len) {

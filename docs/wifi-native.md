@@ -67,3 +67,27 @@ Result:
 Still to do:
 - scanning (SET 10 scan request, GET 11 scan results; airportd also asks 103 and 207);
 - the pane's "Connected" state.
+
+## fullos288: scanning works
+
+- **Scan request (SET 10).** Accepted. It starts a firmware escan from a thread call; when the firmware reports the scan done,
+  `en1` posts `SCAN_DONE` (Apple80211 event 10).
+- **Scan results (GET 11).** One network per call, in the 2272-byte (0x8E0) layout IO80211's `_addScanResultToList` reads:
+
+  | Offset | Field |
+  |---|---|
+  | 0x08 / 0x0C | channel number and flags |
+  | 0x12 / 0x14 / 0x16 | noise, SNR, RSSI |
+  | 0x18 / 0x1A | beacon interval, capability |
+  | 0x1C | BSSID |
+  | 0x22 / 0x24 | rate count and rates |
+  | 0x60 / 0x61 | SSID length and SSID |
+  | 0x84 | age |
+  | 0x88 | flags |
+  | 0x8A / 0x8C | IE length and IEs |
+  | 0x8D0 | timestamp |
+
+  `EIO` ends the list (Apple80211Scan stops on errno 5).
+- **Result.** CoreWLAN's scan returns the networks around, and System Settings lists them with their lock and signal icons.
+  The driver keeps the networks by BSSID, with up to 256 bytes of IEs each; they are never logged.
+- **Next.** GET 103 (the current network, same layout) for the pane's "Connected"; GET 207.

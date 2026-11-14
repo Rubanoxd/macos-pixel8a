@@ -42,3 +42,28 @@ Next options, from cheapest:
   - airportd sends none.
 - airportd's power and state come through `IO80211APIUserClient`, which our IOKit classes do not provide. That user client is the
   next thing to reverse (IO80211.framework `Apple80211BindToInterface*`) before the ioctls are worth answering.
+
+## fullos283-286: macOS's own Wi-Fi UI comes up (boot-arg `akita-netif-wifi=1`)
+
+Three more things were needed:
+
+- **The Wi-Fi subfamily.** IO80211.framework `_getIfListCopy` keeps an interface only if `SIOCGIFTYPE` says type 6,
+  subfamily 3 (Wi-Fi), and its media is 802.11 (0x80) with no error. `en1` is now created with `IFNET_SUBFAMILY_WIFI`, and
+  the media ioctl no longer fails with EFAULT.
+- **The classic Apple80211 ioctls.** When `IOServiceOpen` fails, `Apple80211BindToInterfaceWithService` falls back to the
+  ioctl path. Its sanity check is GET type 12 (card capabilities). `en1` now answers:
+  - GET 12 card capabilities, 43 driver version, 19 power, 13 state, 15 op mode;
+  - GET 1 SSID, 9 BSSID (from the configured network's scan entry), 4 channel, 16 RSSI, 17 noise, 14 PHY mode, 8 rate,
+    51 country, 27 supported channels;
+  - SET 19 power and 5 powersave.
+- **Apple80211 kernel events.** Class `KEV_IEEE80211_CLASS`, subclass 1, codes 4/2/3 (link, SSID, BSSID) are posted when the
+  link changes, and once more on the first query, so airportd asks again.
+
+Result:
+- CoreWLAN lists `en1` (power on, service active, RSSI, channel, rate).
+- The menu bar shows the Wi-Fi icon (connected).
+- System Settings has a Wi-Fi pane with its power switch.
+
+Still to do:
+- scanning (SET 10 scan request, GET 11 scan results; airportd also asks 103 and 207);
+- the pane's "Connected" state.

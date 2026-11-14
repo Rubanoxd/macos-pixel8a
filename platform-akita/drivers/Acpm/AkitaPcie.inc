@@ -637,11 +637,14 @@ int console() {
 uint16_t gTrans = 2;
 bool gNoScan, gScanOnly;
 char gWatchSsid[33];   // the network in network.conf: its security (RSN AKMs, PMF) is printed by the scan
+// akita (Generated-by: LLM): what the scan saw of that network, for the Apple80211 answers (Wi-Fi menu): BSSID, channel, RSSI
+uint8_t gCurBssid[6]; uint8_t gCurChannel; int16_t gCurRssi = -60; bool gHaveBss;
 volatile int gIoctlResult = -1;   // filled by whoever drains the control ring (ioctl() or the polling thread)
 uint8_t *gIoctlOut; uint32_t gIoctlOutMax;
 extern bool gPolling;
 extern IOLock *gTxLock;
 bool gLinkUp, gKeyed;
+void post80211(uint32_t code);   // akita: Apple80211 kernel events
 void onLink();
 unsigned gScanSeen;
 uint32_t gRxOff;
@@ -675,6 +678,7 @@ void onEvent(const uint8_t *pkt, uint16_t len) {
     char ssid[33] = {}; const unsigned sl = b[18] > 32 ? 32 : b[18]; memcpy(ssid, b + 19, sl);
     int16_t rssi; memcpy(&rssi, b + 78, 2);
     printf("pcie: wifi: \"%s\" %02x:%02x:%02x:%02x:%02x:%02x channel %u RSSI %d dBm\n", sl ? ssid : "(hidden)", b[8], b[9], b[10], b[11], b[12], b[13], b[88], rssi);
+    if (gWatchSsid[0] && !strcmp(ssid, gWatchSsid)) { memcpy(gCurBssid, b + 8, 6); gCurChannel = b[88]; gCurRssi = rssi; gHaveBss = true; }
     if (gWatchSsid[0] && !strcmp(ssid, gWatchSsid)) {   // RSN IE (48): AKM suites (2 PSK, 6 PSK-SHA256, 8 SAE), capabilities (bit 6 MFPR, bit 7 MFPC)
       uint16_t ieOff; uint32_t ieLen; memcpy(&ieOff, b + 116, 2); memcpy(&ieLen, b + 120, 4);
       const uint8_t *ie = b + ieOff, *end = ie + ieLen;
@@ -1009,33 +1013,107 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
     const uint32_t type = *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 16);
     static uint8_t seen[2][256];
     const int set = (num & 0xff) == 200 ? 1 : 0;
+    uint8_t *req = static_cast<uint8_t *>(data);
+    static bool told;   // airportd's first questions come before the link: tell it once the link is there
+    if (!told && gLinkUp) { told = true; post80211(4); post80211(2); post80211(3); }
+    uint32_t &val = *reinterpret_cast<uint32_t *>(req + 20);
+    const uint32_t len = *reinterpret_cast<const uint32_t *>(req + 24);
+    const user_addr_t ptr = *reinterpret_cast<const uint64_t *>(req + 32);
+    int rc = EOPNOTSUPP;
+    // the replies, struct by struct as Apple80211 lays them out (version first); copied to the caller's req_data
+    uint8_t out[600] = {};
+    uint32_t outLen = 0;
+    auto put32 = [&](uint32_t off, uint32_t v) { memcpy(out + off, &v, 4); };
+    if (!set) {
+      switch (type) {
+        case 12: {   // CARD_CAPABILITIES: version, capability bitmap (WEP TKIP AES AES_CCM PMGT SHSLOT SHPREAMBLE TXPMGT WPA1 WPA2)
+          put32(0, 1);
+          static const uint8_t caps[] = {0, 1, 2, 3, 6, 9, 10, 12, 13, 14};
+          for (uint8_t cap : caps) out[4 + cap / 8] |= static_cast<uint8_t>(1u << (cap % 8));
+          outLen = 21; rc = 0; break;
+        }
+        case 43: {   // DRIVER_VERSION: version, string length (u16), string
+          static const char v[] = "AkitaBCM4383 1.0 (Pixel 8a)";
+          put32(0, 1); const uint16_t sl = sizeof v - 1; memcpy(out + 4, &sl, 2); memcpy(out + 6, v, sl);
+          outLen = 6 + sl; rc = 0; break;
+        }
+        case 19:     // POWER: version, number of radios, state per radio
+          put32(0, 1); put32(4, 1); put32(8, 1); outLen = 24; rc = 0; break;
+        case 13:     // STATE: in req_val; 4 = RUN (associated), 0 = INIT
+          val = gLinkUp ? 4 : 0; rc = 0; break;
+        case 15:     // OP_MODE: version, mode (1 = station)
+          put32(0, 1); put32(4, 1); outLen = 8; rc = 0; break;
+        case 1: {    // SSID: the bytes, length back in req_len (never logged)
+          const uint32_t sl = gLinkUp ? static_cast<uint32_t>(strnlen(gWatchSsid, 32)) : 0;
+          memcpy(out, gWatchSsid, sl); outLen = sl; *reinterpret_cast<uint32_t *>(req + 24) = sl; rc = gLinkUp ? 0 : ENXIO; break;
+        }
+        case 9:      // BSSID: six bytes
+          if (gLinkUp && gHaveBss) { memcpy(out, gCurBssid, 6); outLen = 6; rc = 0; } else rc = ENXIO;
+          break;
+        case 4: {    // CHANNEL: version, {version, channel, flags (2.4 GHz 0x8 / 5 GHz 0x10, 20 MHz 0x2, active 0x80)}
+          const uint32_t ch = gHaveBss ? gCurChannel : 6;
+          put32(0, 1); put32(4, 1); put32(8, ch); put32(12, (ch <= 14 ? 0x8u : 0x10u) | 0x2u | 0x80u); outLen = 16; rc = 0; break;
+        }
+        case 16: case 17: {   // RSSI / NOISE: version, radios, unit (dBm), per radio [4], aggregate, extended [4], aggregate
+          const int32_t v = type == 16 ? gCurRssi : -92;
+          put32(0, 1); put32(4, 1); put32(8, 0);
+          for (unsigned k = 0; k < 4; ++k) { put32(12 + 4 * k, k ? 0 : static_cast<uint32_t>(v)); put32(32 + 4 * k, k ? 0 : static_cast<uint32_t>(v)); }
+          put32(28, static_cast<uint32_t>(v)); put32(48, static_cast<uint32_t>(v)); outLen = 52; rc = 0; break;
+        }
+        case 14:     // PHY_MODE: version, supported (a b g n ac), active (n)
+          put32(0, 1); put32(4, 0x2 | 0x4 | 0x8 | 0x10 | 0x80); put32(8, 0x10); outLen = 12; rc = 0; break;
+        case 8:      // RATE: Mb/s in req_val
+          val = 144; rc = 0; break;
+        case 51:     // COUNTRY_CODE: two letters
+          memcpy(out, "ES", 2); outLen = 3; rc = 0; break;
+        case 27: {   // SUPPORTED_CHANNELS: version, count, {version, channel, flags} each
+          static const uint8_t chans[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 36, 40, 44, 48, 52, 56, 60, 64,
+                                          100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 149, 153, 157, 161, 165};
+          put32(0, 1); put32(4, sizeof chans);
+          for (unsigned k = 0; k < sizeof chans; ++k) {
+            put32(8 + 12 * k, 1); put32(12 + 12 * k, chans[k]); put32(16 + 12 * k, (chans[k] <= 14 ? 0x8u : 0x10u) | 0x2u);
+          }
+          outLen = 8 + 12 * sizeof chans; rc = 0; break;
+        }
+        default: break;
+      }
+    } else if (type == 19 || type == 5) {   // POWER on/off, POWERSAVE: accepted (the radio stays as it is)
+      rc = 0;
+    }
+    int copied = 0;
+    if (rc == 0 && outLen && ptr && len) {
+      copied = copyout(out, ptr, outLen < len ? outLen : len);
+      if (copied) rc = copied;
+    }
     if (type < 256 && !seen[set][type]) {
       seen[set][type] = 1;
       char who[32] = {}; proc_selfname(who, sizeof who);
-      printf("pcie: apple80211 %s type %u val %u len %u from %s\n", set ? "SET" : "GET", type,
-             *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 20),
-             *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 24), who);
+      printf("pcie: apple80211 %s type %u val %u len %u from %s -> %d%s\n", set ? "SET" : "GET", type, val, len, who, rc,
+             copied ? " (copyout failed)" : "");
     }
-    return EOPNOTSUPP;
+    return rc;
   }
   if ((num == (('i' << 8) | 56) || num == (('i' << 8) | 72)) && data) {
     struct MediaHead { char name[IFNAMSIZ]; int current, mask, status, active, count; };
     MediaHead *m = static_cast<MediaHead *>(data);
     // the media list (one entry) goes to the caller's ifm_ulist, a user pointer after the five ints: 4 bytes in the
     // 32-bit form, 8 (aligned at 40) in the 64-bit one; the ioctl's size field tells them apart (ifconfig: "no media types?")
+    // A failed copy must not fail the ioctl: IO80211.framework's _getIfListCopy skips an interface whose media ioctl
+    // errs, and ifconfig got EFAULT here (fullos270-281); then the list is reported empty.
     const int asked = m->count;
     const unsigned len = static_cast<unsigned>((cmd >> 16) & 0x1fff);
     const int media = (netif::gWifi ? IFM_IEEE80211 : IFM_ETHER) | IFM_AUTO;   // airportd lists only 802.11 media
+    int listed = 0;
     if (asked > 0) {
       user_addr_t list = 0;
       if (len >= 48) list = *reinterpret_cast<const uint64_t *>(static_cast<uint8_t *>(data) + 40);
       else if (len >= 40) list = *reinterpret_cast<const uint32_t *>(static_cast<uint8_t *>(data) + 36);
-      if (list && copyout(&media, list, sizeof media)) return EFAULT;
+      if (list && copyout(&media, list, sizeof media) == 0) listed = 1;
     }
     m->current = m->active = media;
     m->mask = 0;
     m->status = IFM_AVALID | (gLinkUp ? IFM_ACTIVE : 0);
-    m->count = 1;
+    m->count = asked > 0 ? listed : 1;
     // the boot-time link event went out before configd listened: say it again to the first one who asks
     static bool announced;
     if (!announced && gLinkUp) {
@@ -1047,6 +1125,18 @@ errno_t wifiIoctl(ifnet_t ifp, unsigned long cmd, void *data) {
   return EOPNOTSUPP;
 }
 void wifiDetach(ifnet_t) {}
+// akita (Generated-by: LLM): Apple80211 kernel events (class KEV_IEEE80211_CLASS, subclass 1, an interface's
+// net_event_data), which make airportd query the link again: 1 power, 2 SSID, 3 BSSID, 4 link changed
+extern "C" int akitaKevMsgPost(struct kev_msg *) __asm("_kev_msg_post");   // the header gives it C++ linkage
+void post80211(uint32_t code) {
+  if (!gIf || !netif::gWifi) return;
+  struct net_event_data d = {};
+  d.if_family = ifnet_family(gIf); d.if_unit = ifnet_unit(gIf); strlcpy(d.if_name, ifnet_name(gIf), sizeof d.if_name);
+  struct kev_msg m = {};
+  m.vendor_code = KEV_VENDOR_APPLE; m.kev_class = KEV_IEEE80211_CLASS; m.kev_subclass = 1; m.event_code = code;
+  m.dv[0].data_length = sizeof d; m.dv[0].data_ptr = &d;
+  akitaKevMsgPost(&m);
+}
 void onLink() {
   if (gIf) ifnet_set_flags(gIf, gLinkUp ? (IFF_UP | IFF_RUNNING) : IFF_UP, IFF_UP | IFF_RUNNING);
   // akita (Generated-by: LLM): tell SystemConfiguration when the link comes and goes (KEV_DL_LINK_ON/OFF)
@@ -1054,6 +1144,7 @@ void onLink() {
   if (gIf && reported != (gLinkUp ? 1 : 0)) {
     reported = gLinkUp ? 1 : 0;
     dlil_post_msg(reinterpret_cast<struct ifnet *>(gIf), KEV_DL_SUBCLASS, gLinkUp ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, nullptr, 0, FALSE);
+    post80211(4); post80211(2); post80211(3);
   }
 }
 // ---- akita (Generated-by: LLM): control channel over Wi-Fi, the same idea as AkitaUsbGadget.h's (5140/5141) for when the
@@ -1448,6 +1539,9 @@ int dataPath() {
     init.flags = IFNET_INIT_LEGACY | IFNET_INIT_NX_NOAUTO;
     init.output = wifiOutput; init.uniqueid = "akita-wifi-bcm4383"; init.uniqueid_len = 18;
     init.name = "en"; init.unit = 1; init.family = IFNET_FAMILY_ETHERNET; init.type = IFT_ETHER;
+    // akita (Generated-by: LLM): IO80211.framework's _getIfListCopy keeps an interface only with SIOCGIFTYPE type 6,
+    // subfamily 3 (Wi-Fi) and 802.11 media; in Wi-Fi mode (akita-netif-wifi=1) en1 is created so
+    { unsigned wifiMode = 0; PE_parse_boot_argn("akita-netif-wifi", &wifiMode, sizeof wifiMode); if (wifiMode) init.subfamily = IFNET_SUBFAMILY_WIFI; }
     init.demux = ether_demux; init.add_proto = ether_add_proto; init.del_proto = ether_del_proto;
     init.check_multi = ether_check_multi; init.framer_extended = ether_frameout_extended;
     init.ioctl = wifiIoctl; init.detach = wifiDetach;

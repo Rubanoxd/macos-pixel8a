@@ -38,6 +38,13 @@ class IO80211Interface : public IOEthernetInterface {
 };
 OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface)
 
+// airportd and CoreWiFi (CWFIO80211.m) look for IOSkywalkEthernetInterface services whose parent says
+// IOClassNameOverride = IO80211Controller (as Apple's Broadcom driver does); IOSkywalkFamily is not in this kernel either
+class IOSkywalkEthernetInterface : public IOEthernetInterface {
+  OSDeclareDefaultStructors(IOSkywalkEthernetInterface);
+};
+OSDefineMetaClassAndStructors(IOSkywalkEthernetInterface, IOEthernetInterface)
+
 namespace netif {
 
 bool gWifi = false;   // en1 published as Wi-Fi (its media then reads IEEE 802.11)
@@ -65,6 +72,7 @@ void publish(const uint8_t mac[6], unsigned unit) {
     return;
   }
   gController->setName("wlan");
+  if (wifi) gController->setProperty("IOClassNameOverride", "IO80211Controller");
   OSData *addr = OSData::withBytes(mac, 6);
   if (addr) { gController->setProperty("IOMACAddress", addr); addr->release(); }
   gController->setProperty("IOVendor", "Broadcom");
@@ -75,7 +83,7 @@ void publish(const uint8_t mac[6], unsigned unit) {
   setNumber(gController, "IOMaxPacketSize", 1518, 32);
   gController->registerService();
 
-  gInterface = wifi ? new IO80211Interface : new IOEthernetInterface;
+  gInterface = wifi ? static_cast<IOEthernetInterface *>(new IOSkywalkEthernetInterface) : new IOEthernetInterface;
   if (!gInterface || !gInterface->init() || !gInterface->attach(gController)) {
     printf("netif: could not make the interface\n");
     if (gInterface) { gInterface->release(); gInterface = nullptr; }

@@ -91,3 +91,17 @@ Still to do:
 - **Result.** CoreWLAN's scan returns the networks around, and System Settings lists them with their lock and signal icons.
   The driver keeps the networks by BSSID, with up to 256 bytes of IEs each; they are never logged.
 - **Next.** GET 103 (the current network, same layout) for the pane's "Connected"; GET 207.
+
+## fullos289: the pane says Connected
+
+- **GET 103.** The current network, in the same 2272-byte layout, from the configured network's scan entry. System Settings'
+  Wi-Fi pane now shows the network with "Connected", its lock and its signal.
+- **Still open: the address belongs to `DHCP-en1`.**
+  - The net keeper's `ipconfig set en1 DHCP` service holds the address, not the Wi-Fi network service.
+  - airportd publishes no `State:/Network/Interface/en1/AirPort` key, because it did not make the association itself.
+  - So IPConfiguration never starts the Wi-Fi service's DHCP (tried: no address in 40 s, then restored), and the menu bar
+    icon keeps its "!".
+- **Next.**
+  - Answer the remaining Apple80211 requests (2 auth type, 57, 96, 97, 207).
+  - Find what airportd needs to consider itself associated: ASSOC_DONE (event 9), association status, or its own join
+    through SET ASSOCIATE.

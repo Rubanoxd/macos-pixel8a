@@ -2,6 +2,8 @@
 
 Date: 2026-11-11. Research only: neither the phone nor the port's code was touched.
 
+> Update 2026-11-15: this works now. See [`displayport.md`](displayport.md) for what was built and what it took.
+
 ## Conclusion
 
 - **It is possible; the hardware is there.** The Pixel 8a (Tensor G3 "zuma") has its USB-C wired for **DisplayPort Alt Mode**.

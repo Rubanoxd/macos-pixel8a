@@ -1,0 +1,82 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -154,6 +154,11 @@
+     // akita (Generated-by: LLM): native-gop-landscape=1: WindowServer gets a landscape mode (the portrait one turned on its side)
+     // and every frame is turned a quarter turn onto the portrait panel: the phone is held with its top (the camera) on the left.
+     bool fLandscape = false;
++    // akita (Generated-by: LLM): akita-dp-monitor=1 ("monitor mode"): the desktop is drawn 1920x1080, unrotated, into the
++    // framebuffer that DECON1 + DPP L1 send to the USB-C monitor (AkitaDp.inc kMonitorFb), instead of the panel's.
++    bool fMonitor = false;
++    uint32_t *fCursorRow = nullptr;     // monitor mode: one 32-bit source row with the cursor blended in
++    uint64_t fCursorRowBytes = 0;
+     // akita (Generated-by: LLM): what the panel shows per second and what a copy costs, told every ~10 s (native-gop-fps=0: not told).
+     uint64_t fFpsFlushAbs = 0, fFpsLoadAbs = 0, fFpsWriteAbs = 0;   // akita: where a copy's time goes
+     uint64_t fFpsFrames = 0, fFpsCopies = 0, fFpsCopyAbs = 0, fFpsCopyMaxAbs = 0, fFpsSince = 0, fFpsChanged = 0;
+@@ -275,6 +280,16 @@
+         fVideo.v_baseAddr > UINT64_MAX - fVideo.v_rowBytes * fVideo.v_height) {
+         IOLog("NativeGOPDisplay: no 32-bit boot framebuffer (base %#lx depth %lu)\n", fVideo.v_baseAddr, fVideo.v_depth);
+         return false;
++    }
++    unsigned monitor = 0;
++    PE_parse_boot_argn("akita-dp-monitor", &monitor, sizeof(monitor));
++    if (monitor == 1) {   // akita: the monitor's framebuffer (low DRAM bank, BGRA, 1920x1080) instead of the panel's
++        fMonitor = true;
++        fVideo.v_baseAddr = 0xD1000000UL;
++        fVideo.v_width = 1920;
++        fVideo.v_height = 1080;
++        fVideo.v_rowBytes = 1920 * 4;
++        IOLog("NativeGOPDisplay: monitor mode: the desktop goes to the DisplayPort framebuffer %#lx (1920x1080)\n", fVideo.v_baseAddr);
+     }
+     IOMemoryDescriptor *memory = IOMemoryDescriptor::withPhysicalAddress(fVideo.v_baseAddr & ~3UL, fVideo.v_rowBytes * fVideo.v_height,
+                                                                          kIODirectionInOut);
+@@ -302,7 +317,7 @@
+     fFpsOn = fps != 0;
+     unsigned landscape = 0;
+     PE_parse_boot_argn("native-gop-landscape", &landscape, sizeof(landscape));
+-    if (landscape == 1) {
++    if (landscape == 1 && !fMonitor) {   // akita: the monitor is landscape already
+         fLandscape = true;
+         const uint32_t w = fModeWidth;
+         fModeWidth = fModeHeight;
+@@ -1114,15 +1129,37 @@
+             IOLog("NativeGOPDisplay: short source row read\n");
+             return;
+         }
++        const uint16_t *sourceRow = fRow;
++        const uint8_t *halfTable = format == kFormatRGhA ? fHalfToByte : nullptr;
++        if (fMonitor) {   // akita: monitor mode blends the cursor (layer 1) into the source row, as the landscape path does
++            if (fCursorRowBytes < width * 4) {
++                auto *replacement = static_cast<uint32_t *>(IOMalloc(width * 4));
++                if (!replacement) return;
++                if (fCursorRow) IOFree(fCursorRow, fCursorRowBytes);
++                fCursorRow = replacement;
++                fCursorRowBytes = width * 4;
++            }
++            const uint32_t *row32;
++            if (halfTable) {
++                for (uint64_t i = 0; i < width; i++) {
++                    const uint16_t *rgba = fRow + i * 4;
++                    fCursorRow[i] = 0xff000000u | static_cast<uint32_t>(halfTable[rgba[0]]) << 16 |
++                                    static_cast<uint32_t>(halfTable[rgba[1]]) << 8 | halfTable[rgba[2]];
++                }
++                row32 = fCursorRow;
++            } else {
++                row32 = reinterpret_cast<const uint32_t *>(fRow);
++            }
++            sourceRow = reinterpret_cast<const uint16_t *>(cursorRow(row32, fCursorRow, sourceY, width));
++            halfTable = nullptr;
++        }
+         uint64_t saved;
+         if (!sheng_fb_begin(SHENG_FB_GUI, &saved)) return;
+         auto *pixels = reinterpret_cast<volatile uint32_t *>(line);
+         if (!shadow) {
+-            nativeGopScanoutRow(pixels, copyWidth, fRow, width,
+-                               format == kFormatRGhA ? fHalfToByte : nullptr);
++            nativeGopScanoutRow(pixels, copyWidth, sourceRow, width, halfTable);
+         } else {
+-            nativeGopScanoutRow(reinterpret_cast<volatile uint32_t *>(fConverted), copyWidth, fRow, width,
+-                               format == kFormatRGhA ? fHalfToByte : nullptr);
++            nativeGopScanoutRow(reinterpret_cast<volatile uint32_t *>(fConverted), copyWidth, sourceRow, width, halfTable);
+             uint32_t *previous = shadow->pixels + y * copyWidth;
+             for (uint64_t x = 0; x < copyWidth; x++) {
+                 if (fresh || fConverted[x] != previous[x]) {

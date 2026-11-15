@@ -1,0 +1,78 @@
+--- a/cal_9865_dp_reg.c
++++ b/cal_9865_dp_reg.c
+@@ -179,6 +179,9 @@
+  */
+ 
+ /* USBDP PHY TCA Registers */
++extern int akita_tca_ignore_timeout;   /* akita: AkitaDp.inc stage 19 */
++extern unsigned akita_dp_req_mask;   /* akita: AkitaDp.inc stage 48 */
++extern int akita_dp_keep_acbyp;   /* akita: AkitaDp.inc stage 51 */
+ static int dpphytca_reg_wait_mode_change(enum lane_usage lane)
+ {
+ 	unsigned int cnt = 0;
+@@ -202,6 +205,7 @@
+ 			      TCA_REG_TCA_INTR_STS));
+ 
+ 		cal_log_err(0, "Fail to change mode from USB to DP%d\n", lane);
++		if (akita_tca_ignore_timeout) { cal_log_err(0, "akita: TCA timeout ignored, going on\n"); return 0; }
+ 		return -ETIME;
+ 	}
+ 
+@@ -279,12 +283,12 @@
+ 	dp_phy_write(SST1, PHY_CR_PARA_CON2, 0x0);
+ 	dp_phy_write(SST1, PHY_CR_PARA_CON0, 0x1);
+ 
+-	do {
++	{ int akita_n = 10000; do {
+ 		dpphy_reg_toggle_cr_clk(1, false);
+ 		if (dp_phy_read_mask(SST1, PHY_CR_PARA_CON0,
+ 				     PHY0_CR_PARA_ACK_MASK) == 0)
+ 			break;
+-	} while (1);
++	} while (--akita_n); if (!akita_n) cal_log_err(0, "cr ack stuck high\n"); } /* akita: bounded */
+ 
+ 	dp_phy_write_mask(SST1, PHY_CR_PARA_CON0, 0, PHY0_CR_PARA_CLK_MASK);
+ }
+@@ -529,7 +533,7 @@
+ 	u32 val = 0;
+ 
+ 	if (readl_poll_timeout_atomic(regs_dp[REGS_PHY][SST1].regs + DP_CONFIG12,
+-				      val, !DP_TX_ACK_GET(val), 10, 2000)) {
++				      val, !(DP_TX_ACK_GET(val) & akita_dp_req_mask), 10, 2000)) {
+ 		cal_log_err(0, "is timeout. Fail to ack DP TX.\n");
+ 		cal_log_err(0, "val(0x%08x) DP_CONFIG12 read:0x%08x\n", val,
+ 			    readl(regs_dp[REGS_PHY][SST1].regs + DP_CONFIG12));
+@@ -540,8 +544,8 @@
+ {
+ 	u32 val = 0;
+ 
+-	/* Set DP TX Request */
+-	dp_phy_write_mask(SST1, DP_CONFIG12, DP_TX_REQ_SET_4LANES, DP_TX_REQ_MASK);
++	/* Set DP TX Request (akita: only the lanes in akita_dp_req_mask; USB-owned lanes never answer in system mode) */
++	dp_phy_write_mask(SST1, DP_CONFIG12, (akita_dp_req_mask & 0xF) << 12, DP_TX_REQ_MASK);
+ 
+ 	/* Wait for DP TX Request Clear */
+ 	if (readl_poll_timeout_atomic(regs_dp[REGS_PHY][SST1].regs + DP_CONFIG12,
+@@ -928,7 +932,8 @@
+ 		 * Disable the bypassing AC capacitor for HBRx mode only.
+ 		 * RBR mode is using the bypassing AC capacitor as default.
+ 		 */
+-		dpphy_reg_set_config17_dcc_byp_ac_cap(0, num_lane);
++		if (!akita_dp_keep_acbyp)   /* akita: AkitaDp.inc stage 51 keeps the bypass at HBRx */
++			dpphy_reg_set_config17_dcc_byp_ac_cap(0, num_lane);
+ 	}
+ 
+ 	dpphy_reg_set_config13_tx_enable(1, num_lane);
+@@ -2992,4 +2997,12 @@
+ 		return res;
+ 	}
+ 	return res;
++}
++
++/* akita: leave BIST for the pixels from DPIF (Google's driver resets the whole link between the two modes) */
++void akita_dp_bist_off(void)
++{
++	dp_reg_set_video_bist_en(0);
++	dp_reg_set_cts_bist_en(0);
++	dp_reg_set_strm_valid_force(0);
+ }

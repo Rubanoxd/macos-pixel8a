@@ -1,0 +1,66 @@
+--- a/phy-exynos-snps-usbdp.c
++++ b/phy-exynos-snps-usbdp.c
+@@ -83,12 +83,12 @@
+ 	writel(reg, base + SNPS_USBDPPHY_REG_PHY_CR_PARA_CON0);
+ 
+ 	/* Check Ack to low */
+-	do {
++	{ int akita_n = 10000; do {
+ 		cr_clk_toggle(info, 1, false);
+ 		reg = readl(base + SNPS_USBDPPHY_REG_PHY_CR_PARA_CON0);
+ 		if (((SNPS_USBDPPHY_REG_PHY_CR_PARA_CON0_p)(&reg))->b.phy0_cr_para_ack == 0)
+ 			break;
+-	} while (1);
++	} while (--akita_n); if (!akita_n) pr_err("cr ack stuck high\n"); } /* akita: bounded */
+ 
+ 	((SNPS_USBDPPHY_REG_PHY_CR_PARA_CON0_p)(&reg))->b.phy0_cr_para_clk = 0;
+ 	writel(reg, base + SNPS_USBDPPHY_REG_PHY_CR_PARA_CON0);
+@@ -353,7 +353,7 @@
+ 	}
+ 	writel(reg, base + SNPS_USBDPPHY_REG_PHY_SRAM_CON);
+ 	/* When sharing a reference resistor amongst several PHYs,
+-	 * it may take up to 240 μs per PHY to sequentially calibrate each PHY.
++	 * it may take up to 240 Î¼s per PHY to sequentially calibrate each PHY.
+ 	 * additional delay for REXT calibration */
+ 	udelay(10);
+ 
+@@ -754,12 +754,14 @@
+ 	cr_clk_low(info);
+ 
+ 	/* Check init done signal is high */
++	int akita_n = 100000;   /* akita: bounded */
+ 	do {
+ 		/* need to toggle cr clk to update register value */
+ 		cr_clk_toggle(info, 8, false);
+ 
+ 		reg = readl(base + SNPS_USBDPPHY_REG_PHY_SRAM_CON);
+-	} while (((SNPS_USBDPPHY_REG_PHY_SRAM_CON_p)(&reg))->b.phy0_sram_init_done == 0);
++	} while (((SNPS_USBDPPHY_REG_PHY_SRAM_CON_p)(&reg))->b.phy0_sram_init_done == 0 && --akita_n);
++	if (!akita_n) pr_err("sram_init_done never came\n");
+ }
+ 
+ void phy_exynos_snps_usbdp_tune(struct exynos_usbphy_info *info)
+@@ -874,7 +876,8 @@
+ 	void __iomem *link_base;
+ 	u32 reg;
+ 
+-	if (!info) {
++	if (!info || !info->link_base) {   /* akita: no USB3 link mapped (USB 2 only): the de-emphasis is USB3 tuning */
++		pr_info("gen2 de-emphasis skipped (no link)\n");
+ 		return;
+ 	}
+ 
+@@ -963,9 +966,11 @@
+ 	/* Link TX Deemphasis Setting */
+ 	phy_exynos_snps_tx_gen2_deemp_set(info);
+ 
+-	/* Switch from NC to USB : Sync mode */
++	/* Switch from NC to USB : Sync mode
++	 * akita: after a DP session the TCA is in system configuration mode (AkitaDp.inc stage 18), where this controller-synced
++	 * request never acks; AkitaDp.inc sets the crossbar itself, so a timeout here is not fatal (fullos315 hot-plug). */
+ 	if (phy_exynos_snps_usbdp_nc2usb_mode(info, 1) != 0)
+-		return -1;
++		pr_info("TCA NC->USB handshake timed out: going on (system configuration mode)\n");
+ 
+ 	return 0;
+ }

@@ -46,7 +46,8 @@ Mali CSF driver in the kernel. The touchscreen works, with gestures.
 | Stability: hour-long soaks with Wi-Fi/USB checks, 10-minute drag test, critical memory pressure (13.8 GB swap) | ✅ (the "hangs" after 1 h were the watchdog boot-arg `akita-wdt-pet-seconds=3600`: now pets for good) |
 | 60 fps (WindowServer's main thread is CPU-bound in the Metal bridge) | 🔧 in progress |
 | Wi-Fi (BCM4383 on PCIe): **joins WPA2 at boot, DHCP, internet (DNS, HTTPS)**; kernel log, shell and fastboot reset over Wi-Fi; `en1` now listed in System Settings > Network (published in IOKit as an Ethernet-type interface); no Wi-Fi menu yet | ✅ works, `docs/wifi-bringup.md` |
-| USB-C: Power Delivery and DisplayPort alternate mode (MAX77759 TCPC) | ✅ PD contract, host role, DP mode configured with a USB-C HDMI hub; video output next, see `docs/research-hdmi-usbc.md` |
+| USB-C: Power Delivery and DisplayPort alternate mode (MAX77759 TCPC) | ✅ PD contract, host role, DP mode configured with a USB-C HDMI hub |
+| DisplayPort / HDMI out (monitor mode) | ✅ macOS desktop at 1920×1080 on an external monitor through a USB-C HDMI hub, link up on plug, clean teardown on unplug (opt-in: `akita-dp=1 akita-dp-monitor=1`), see `docs/displayport.md` |
 
 More photos in [`photos/`](photos/).
 

@@ -19,6 +19,7 @@ bool writeAllowed(uint8_t dev, uint8_t reg, const uint8_t *d, unsigned n) {
   if (reg == 0x2E && n == 1) return true;                                // MESSAGE_HEADER_INFO
   if (reg == 0x19 && n == 1) return true;                                // TCPC_CONTROL (only the orientation bit is changed)
   if (reg == 0x93 && n == 1) return d[0] == 0x09 || d[0] == 0x00;         // vendor USBSW_CTRL: D+/D- to the AP (0x09) or off
+  if (reg == 0x94 && n == 1) return d[0] == 0x09 || d[0] == 0x00;         // vendor SBUSW_CTRL: SBU to the DP AUX (0x09, path 1) or off
   if (reg == 0x2F && n == 1) return true;                                // RECEIVE_DETECT
   if (reg == 0x50 && n == 1) return true;                                // TRANSMIT
   if (reg == 0x51 && n >= 3 && n <= 31) return true;                     // TX byte count, header, data objects
@@ -288,7 +289,11 @@ void poll() {
     rd8(CC_STATUS, cc); rd8(POWER_STATUS, pw);
     printf("typec: CC_STATUS %02x POWER_STATUS %02x\n", cc, pw);
     if (pw & 4) orient();
-    if (!(pw & 4)) { gS.contract = gS.sinking = gS.dfp = false; gS.vdmStep = 0; gS.msgId = 0; headerInfo(); }   // VBUS gone: detached
+    if (!(pw & 4)) {   // VBUS gone: detached (fullos315: the DisplayPort state too, so AkitaDp.inc tears the link down)
+      gS.contract = gS.sinking = gS.dfp = false; gS.vdmStep = 0; gS.msgId = 0;
+      gS.dpEntered = gS.dpConfigured = gS.hpd = false; gS.dpStatus = 0;
+      headerInfo();
+    }
   }
   const uint16_t rest = a & static_cast<uint16_t>(~(A_TX_SUCCESS | A_TX_FAILED | A_TX_DISCARDED | A_RX));
   if (rest) clearAlert(rest);

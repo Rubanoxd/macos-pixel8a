@@ -1,0 +1,105 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -25,6 +25,9 @@
+ 
+ // akita (Generated-by: LLM): the GPU driver's fence for the display (Mali.cpp): which of the render server's jobs are still running,
+ // and whether they are done. Neither call blocks.
++extern "C" int akita_dp_flip(uint64_t addr);         // akita: AkitaDp.inc (-1 until the DisplayPort is up)
++extern "C" int akita_dp_flip_latched(void);
++extern "C" int akita_dp_ready(void);
+ extern "C" int mali_fence_available(void);
+ extern "C" int mali_fence_take(uint64_t *entries, unsigned cap);
+ extern "C" int mali_fence_done(const uint64_t *entries, unsigned count);
+@@ -159,6 +162,15 @@
+     bool fMonitor = false;
+     uint32_t *fCursorRow = nullptr;     // monitor mode: one 32-bit source row with the cursor blended in
+     uint64_t fCursorRowBytes = 0;
++    // akita (Generated-by: LLM, fullos314): monitor fast path. fMonShadow is the last frame shown (cached kernel memory); a
++    // changed row is marked dirty for both buffers (bit 0 = A at 0xD1000000, the panel-mode scanout; bit 1 = B at 0xD1800000)
++    // and only dirty rows are copied into the hidden buffer, which is then flipped in at the next DECON1 frame start.
++    uint32_t *fMonShadow = nullptr;
++    uint8_t *fMonDirty = nullptr;
++    uint8_t *fMonBuf[2] = {};
++    IOMemoryMap *fMonMapB = nullptr;
++    unsigned fMonFront = 0;
++    uint64_t fMonFlips = 0, fMonWaits = 0;
+     // akita (Generated-by: LLM): what the panel shows per second and what a copy costs, told every ~10 s (native-gop-fps=0: not told).
+     uint64_t fFpsFlushAbs = 0, fFpsLoadAbs = 0, fFpsWriteAbs = 0;   // akita: where a copy's time goes
+     uint64_t fFpsFrames = 0, fFpsCopies = 0, fFpsCopyAbs = 0, fFpsCopyMaxAbs = 0, fFpsSince = 0, fFpsChanged = 0;
+@@ -560,6 +572,9 @@
+               (maxNs / 100000) % 10, flushNs / 1000000, (flushNs / 100000) % 10, loadNs / 1000000, (loadNs / 100000) % 10,
+               writeNs / 1000000, (writeNs / 100000) % 10, fFpsChanged / fFpsCopies);
+         fFpsFlushAbs = fFpsLoadAbs = fFpsWriteAbs = 0;
++        if (fMonitor)
++            IOLog("NativeGOPDisplay: monitor: %llu flips, %llu waits of 100 us for a pending flip, front buffer %c\n", fMonFlips, fMonWaits,
++                  fMonFront ? 'B' : 'A');
+     }
+     fFpsSince = now;
+     fFpsFrames = fFpsCopies = fFpsCopyAbs = fFpsCopyMaxAbs = fFpsChanged = 0;
+@@ -1120,7 +1135,65 @@
+         fFpsWriteAbs += mach_absolute_time() - writeBegan;
+         sample = false;
+     }
+-    for (uint64_t y = 0; !fLandscape && y < copyHeight; y++) {
++    bool monitorDone = false;
++    if (fMonitor && format == kFormatBGRA && width == copyWidth && height == copyHeight && source) {
++        // akita: monitor fast path (see fMonShadow): memcmp/memcpy per row instead of a per-pixel convert and compare
++        const uint64_t W = width, H = height, stride = W * 4;
++        if (!fMonShadow) {
++            fMonShadow = static_cast<uint32_t *>(IOMalloc(stride * H));
++            fMonDirty = static_cast<uint8_t *>(IOMalloc(H));
++            IOMemoryDescriptor *b = IOMemoryDescriptor::withPhysicalAddress(0xD1800000UL, stride * H, kIODirectionInOut);
++            if (b) {
++                fMonMapB = b->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++                b->release();
++            }
++            fMonBuf[0] = fScanout;
++            fMonBuf[1] = fMonMapB ? reinterpret_cast<uint8_t *>(fMonMapB->getVirtualAddress()) : nullptr;
++            if (fMonDirty) memset(fMonDirty, 3, H);
++            IOLog("NativeGOPDisplay: monitor fast path: shadow %p, buffers %p %p\n", fMonShadow, fMonBuf[0], fMonBuf[1]);
++        }
++        if (fMonShadow && fMonDirty && fMonBuf[1]) {
++            if (fCursorRowBytes < stride) {
++                auto *replacement = static_cast<uint32_t *>(IOMalloc(stride));
++                if (!replacement) return;
++                if (fCursorRow) IOFree(fCursorRow, fCursorRowBytes);
++                fCursorRow = replacement;
++                fCursorRowBytes = stride;
++            }
++            for (uint64_t y = 0; y < H; y++) {
++                const uint32_t *row = cursorRow(reinterpret_cast<const uint32_t *>(source + y * rowBytes), fCursorRow, y, W);
++                uint32_t *shown = fMonShadow + y * W;
++                if (!fFrames || memcmp(shown, row, stride)) {   // the shadow is the last frame shown, whatever the surface
++                    memcpy(shown, row, stride);
++                    fMonDirty[y] = 3;
++                    changed += W;
++                }
++            }
++            // double buffering once the DisplayPort is up; before that buffer A (the one DPP L1 starts on) is written in place
++            unsigned target = 0;
++            bool flip = false;
++            if (akita_dp_ready()) {
++                for (unsigned spin = 0; spin < 200 && !akita_dp_flip_latched(); spin++) { IODelay(100); fMonWaits++; }   // <= 20 ms
++                target = fMonFront ^ 1;   // the previous flip has latched: the old front is hidden now
++                flip = true;
++            }
++            const uint8_t bit = static_cast<uint8_t>(1u << target);
++            uint8_t *dst = fMonBuf[target];
++            for (uint64_t y = 0; y < H; y++) {
++                if (fMonDirty[y] & bit) {
++                    memcpy(dst + y * stride, fMonShadow + y * W, stride);
++                    fMonDirty[y] &= static_cast<uint8_t>(~bit);
++                }
++            }
++            __asm__ volatile("dsb sy" ::: "memory");
++            if (flip && akita_dp_flip(target ? 0xD1800000ull : 0xD1000000ull) == 0) {
++                fMonFront = target;
++                fMonFlips++;
++            }
++            monitorDone = true;
++        }
++    }
++    for (uint64_t y = 0; !fLandscape && !monitorDone && y < copyHeight; y++) {
+         uint8_t *line = fScanout + y * fVideo.v_rowBytes;
+         const uint64_t sourceY = y * height / copyHeight;
+         if (source) {

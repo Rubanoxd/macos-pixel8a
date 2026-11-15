@@ -350,6 +350,7 @@ extern "C" void akita_acpm_boot_profile(void);
 extern "C" void akita_wifi_boot(void);   // akita: AkitaPcie.inc
 extern "C" void akita_battery_boot(void);   // akita: AkitaBattery.inc
 extern "C" void akita_backlight_boot(void);   // akita: AkitaBacklight.inc
+extern "C" void akita_dp_boot(void);   // akita: AkitaDp.inc
 extern "C" void akita_acpm_boot_profile(void) {
   printf("macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano\n");   // akita: the author's mark in every boot log
   unsigned allowed = 0, profile = 0;
@@ -371,6 +372,7 @@ extern "C" void akita_acpm_boot_profile(void) {
   if (allowed) akita_wifi_boot();   // akita: the Wi-Fi (AkitaPcie.inc), boot-arg akita-wifi=1
   if (allowed) akita_backlight_boot();   // akita: the brightness service macOS drives (AkitaBacklight.inc), akita-backlight=0 off
   if (allowed) akita_battery_boot();   // akita: the battery in the menu bar (AkitaBattery.inc), boot-arg akita-battery=0 off
+  if (allowed) akita_dp_boot();   // akita: DisplayPort to the dongle's monitor when it shows up (AkitaDp.inc), boot-arg akita-dp=1
   if (!allowed || profile != 1 || gProfileCall) return;
   if (!gAcpmLock) gAcpmLock = IOLockAlloc();
   if (!gAcpmLock) return;
@@ -425,10 +427,12 @@ extern "C" int dlil_post_msg(struct ifnet *, u_int32_t, u_int32_t, struct net_ev
 #include "AkitaTypec.inc"   // akita: USB Power Delivery on the MAX77759 TCPC (kern.akita_acpm = 5000010.., see the file)
 #include "AkitaBattery.inc"   // akita: the fuel gauge as an IOPMPowerSource (kern.akita_acpm = 8000000 prints it)
 #include "AkitaBacklight.inc"   // akita: panel brightness over DSIM0 (kern.akita_acpm = 9000000 state, 9100000 + level)
+#include "AkitaDp.inc"   // akita: DisplayPort/HDMI out over USB-C: link, DECON1, monitor mode, hot-plug (kern.akita_acpm = 10100000 + stage)
 extern "C" int akita_backlight_set(unsigned level) { return backlight::set(level); }
 extern "C" unsigned akita_backlight_level(void) { return backlight::level(); }
 extern "C" void akita_backlight_boot(void) { backlight::boot(); }
 extern "C" void akita_battery_boot(void) { battery::boot(); }
+extern "C" void akita_dp_boot(void) { dp::boot(); }
 
 extern "C" int akita_acpm_command(unsigned what) {
   static IOLock *made;
@@ -465,6 +469,7 @@ extern "C" int akita_acpm_command(unsigned what) {
   if (what > 4000000 && what < 4000100) return pcie::command(what - 4000000);
   if (what >= 5000010 && what < 5000100) return typec::command(what - 5000000);
   if (what > 6000000 && what < 6000100) return akita_usbhost_command(what - 6000000);   // akita: USB host experiments (input driver)
+  if (what > 10100000 && what < 10100100) return dp::command(what - 10100000);   // akita: AkitaDp.inc
   if (what == 9000000) { backlight::dump(); return 0; }   // akita: AkitaBacklight.inc
   if (what > 9100000 && what <= 9104095) { const int rc = backlight::set(what - 9100000); backlight::dump(); return rc; }
   if (what == 8000000) { battery::print(battery::read()); return 0; }   // akita: AkitaBattery.inc

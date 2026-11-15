@@ -1,0 +1,11 @@
+--- a/cal_9865_dpp_reg.c
++++ b/cal_9865_dpp_reg.c
+@@ -30,7 +30,7 @@
+ #include "regs-hdr.h"
+ 
+ #include "../exynos_drm_format.h"
+-#include "../exynos_drm_plane.h"
++/* akita: exynos_drm_plane.h (DRM plane objects) not needed by the register code */
+ 
+ #define DPP_SC_RATIO_MAX	((1 << 20) * 8 / 8)
+ #define DPP_SC_RATIO_7_8	((1 << 20) * 8 / 7)

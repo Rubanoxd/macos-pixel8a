@@ -2,8 +2,7 @@
 
 Status 2026-11-15: **macOS shows its desktop at 1920×1080 on an external monitor** through a USB-C hub with HDMI. The
 DisplayPort link comes up by itself when the hub is plugged in, the USB keyboard and mouse on the same hub keep working,
-and unplugging the hub shuts the link down cleanly. Plugging it in again without rebooting is being tested (the first
-attempt failed on a PHY handshake that is now non-fatal).
+and unplugging the hub shuts the link down cleanly; plugging it in again brings the desktop back without rebooting.
 
 Tested with: a USB-C hub with HDMI, USB-A ports and power pass-through (DP alt mode pin assignment D: 2 DP lanes + USB),
 and a 1920×1080 HDMI monitor.
@@ -24,8 +23,8 @@ The phone's own panel (DECON0, DPP L0, DSIM0) is left untouched.
 Boot-args (both needed today):
 
 - `akita-dp=1`: the DisplayPort side. A kernel thread waits for the USB-C PD engine (`AkitaTypec.inc`) to configure DP alt
-  mode with HPD high, then brings the link up; it tears it down when the hub or the monitor goes away and waits for the next
-  plug.
+  mode with HPD high, then brings the link up; it tears it down when the hub or the monitor goes away and brings it up again
+  on the next plug.
 - `akita-dp-monitor=1`: the macOS side. `NativeGOPDisplay` offers a 1920×1080 mode and draws into the monitor's framebuffer
   instead of the panel's. The phone's panel keeps the last boot frame while this is on.
 

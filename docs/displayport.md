@@ -92,3 +92,7 @@ so DECON1 takes window 0, channel 1 (DPP L1) and DPIF0.
 - Not tested: the other cable orientation (CC2), 4-lane hubs (pin C/E), audio over HDMI.
 
 See also `docs/research-hdmi-usbc.md` (the research before this work).
+
+---
+
+macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano

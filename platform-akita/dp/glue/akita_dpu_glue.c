@@ -1,4 +1,6 @@
-/* akita (Generated-by: LLM, local only): glue between AkitaDp.inc and Google's DECON/DPP CAL (cal_9865_decon_reg.c,
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano */
+/* akita (Generated-by: LLM): glue between AkitaDp.inc and Google's DECON/DPP CAL (cal_9865_decon_reg.c,
  * cal_9865_dpp_reg.c; GPL-2.0, built aside like the DP CAL). DECON1 drives the DP link through DPIF0 in video mode. */
 #include "akita_linux_shim.h"
 #include "cal_config.h"

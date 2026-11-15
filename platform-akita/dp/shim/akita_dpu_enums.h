@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano */
 /* akita: the colour enums of Google's exynos_drm_plane.h (the rest of that header is DRM plane objects) */
 #ifndef AKITA_DPU_ENUMS_H
 #define AKITA_DPU_ENUMS_H

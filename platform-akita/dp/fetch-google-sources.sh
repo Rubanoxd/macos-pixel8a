@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
+# macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano
 # akita (Generated-by: LLM): download the Google/AOSP sources the DisplayPort and DECON/DPP code is built from (GPL-2.0, not
 # kept in this repo), lay them out as build-dp-cal.sh expects and apply our patches (google-patches/).
 #   usage: fetch-google-sources.sh [work-dir]     (default: ./build-dp)

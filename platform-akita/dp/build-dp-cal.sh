@@ -1,5 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
+# macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano
 # akita (Generated-by: LLM): build Google's DP CAL + Synopsys USB/DP PHY + DECON/DPP CAL (as laid out by fetch-google-sources.sh)
 # and our glue into one relocatable object, AkitaDpCal.o, and optionally merge it into AkitaAcpm.o (the ACPM kernel module that
 # includes AkitaDp.inc). Compile AkitaAcpm.cpp first; merging twice is refused.

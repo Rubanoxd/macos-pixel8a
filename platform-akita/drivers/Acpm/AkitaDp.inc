@@ -1,4 +1,6 @@
-// akita (Generated-by: LLM, local only): DisplayPort over USB-C, step A: a read-only look at the blocks the video output needs.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano
+// akita (Generated-by: LLM): DisplayPort over USB-C, step A: a read-only look at the blocks the video output needs.
 // Nothing is written. Each stage is its own sysctl (kern.akita_acpm = 10100000 + stage) so the log flushes in between; a block
 // whose clock gate reads "manual, off" is not read (a read of an unclocked block hangs the phone), + 50 reads it anyway.
 //   1  CMU_HSI0 gates of the DP link and the USB/DP combo PHY, CMU_TOP's DP oscillator clock, the PMU's PHY isolation words
@@ -846,7 +848,8 @@ void autoTick(thread_call_param_t, thread_call_param_t) {
   int r = stageB(45);
   if (!r) r = stageB(63);
   if (!r) r = stageB(67);
-  printf("dp: auto: %s (%d)\n", r ? "FAILED" : "the monitor shows the framebuffer", r);
+  printf("dp: auto: %s (%d)%s\n", r ? "FAILED" : "the monitor shows the framebuffer", r,
+         r ? "" : " - DisplayPort on the Pixel 8a, port by @1421rubano");
   if (r) { teardown("bring-up failed"); ++gAutoFails; } else { gAutoState = 1; gAutoFails = 0; }
   clock_interval_to_deadline(r ? 3 : 1, NSEC_PER_SEC, &deadline);
   thread_call_enter_delayed(gAutoCall, deadline);

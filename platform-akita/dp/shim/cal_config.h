@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano */
 #ifndef AKITA_CAL_CONFIG_H
 #define AKITA_CAL_CONFIG_H
 #include "linux/types.h"

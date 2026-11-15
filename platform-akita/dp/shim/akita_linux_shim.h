@@ -1,4 +1,6 @@
-/* akita (Generated-by: LLM, local only): the few Linux kernel interfaces Google's DisplayPort CAL and Synopsys PHY code use,
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano */
+/* akita (Generated-by: LLM): the few Linux kernel interfaces Google's DisplayPort CAL and Synopsys PHY code use,
  * mapped onto xnu. Lets cal_9865_dp_reg.c and phy-exynos-snps-usbdp.c build unchanged as freestanding C for AkitaAcpm. */
 #ifndef AKITA_LINUX_SHIM_H
 #define AKITA_LINUX_SHIM_H

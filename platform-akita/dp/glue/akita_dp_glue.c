@@ -1,4 +1,6 @@
-/* akita (Generated-by: LLM, local only): glue between AkitaDp.inc (C++, AkitaAcpm) and Google's DisplayPort CAL and Synopsys
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* macOS 26.5 on the Pixel 8a (akita) - port by @1421rubano */
+/* akita (Generated-by: LLM): glue between AkitaDp.inc (C++, AkitaAcpm) and Google's DisplayPort CAL and Synopsys
  * USB/DP PHY code, built unchanged as C (GPL-2.0, kept out of the public repo). */
 #include "akita_linux_shim.h"
 #include "cal_config.h"
